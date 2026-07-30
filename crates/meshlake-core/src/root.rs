@@ -216,6 +216,35 @@ impl RootRegistration {
         }
         Ok(())
     }
+
+    /// Verifies the registration and requires every membership certificate to
+    /// be covered by a current controller-signed authorization manifest.
+    /// Roots and relays use this after the online-revocation rollout; the
+    /// compatibility [`Self::verify`] path remains available for state migration
+    /// and explicit legacy tooling.
+    pub fn verify_authorized(
+        &self,
+        trusted_controller_keys: &[Vec<u8>],
+        now_unix_seconds: u64,
+        maximum_clock_skew_seconds: u64,
+    ) -> Result<(), RootProtocolError> {
+        self.verify(
+            trusted_controller_keys,
+            now_unix_seconds,
+            maximum_clock_skew_seconds,
+        )?;
+        for certificate in &self.payload.certificates {
+            if !self
+                .payload
+                .authorization_manifests
+                .iter()
+                .any(|manifest| manifest.network_id == certificate.claims.network_id)
+            {
+                return Err(RootProtocolError::MissingAuthorization);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SignedRootResponse {
@@ -273,8 +302,31 @@ impl SignedRootResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MembershipClaims;
+    use crate::{AuthorizedMembership, MembershipClaims};
     use uuid::Uuid;
+
+    fn test_authorization(
+        controller: &SigningKey,
+        certificate: &MembershipCertificate,
+        now_unix_seconds: u64,
+    ) -> NetworkAuthorizationManifest {
+        NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: certificate.claims.device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            now_unix_seconds,
+            now_unix_seconds + 90,
+            controller,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn root_registration_binds_membership_to_node_key() {
@@ -306,6 +358,101 @@ mod tests {
         assert_eq!(
             registration.verify(&[controller.verifying_key().to_bytes().to_vec()], 100, 120),
             Ok(())
+        );
+        assert_eq!(
+            registration.verify_authorized(
+                &[controller.verifying_key().to_bytes().to_vec()],
+                100,
+                120
+            ),
+            Err(RootProtocolError::MissingAuthorization)
+        );
+    }
+
+    #[test]
+    fn strict_registration_requires_current_authorization() {
+        let controller = SigningKey::from_bytes(&[11_u8; 32]);
+        let node = SigningKey::from_bytes(&[12_u8; 32]);
+        let device_id = DeviceId(Uuid::from_u128(13));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: NetworkId(Uuid::from_u128(14)),
+                device_id,
+                device_public_key: node.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.14.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.14.0/24".into()],
+                issued_at_unix_seconds: 100,
+                expires_at_unix_seconds: Some(1_000),
+            },
+            Uuid::from_u128(15),
+            7,
+            &controller,
+        )
+        .unwrap();
+        let authorization = test_authorization(&controller, &certificate, 100);
+        let registration = RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate.clone()],
+            vec![authorization.clone()],
+            vec![],
+            100,
+            [16_u8; 16],
+            &node,
+        )
+        .unwrap();
+        let trusted = [controller.verifying_key().to_bytes().to_vec()];
+        assert_eq!(registration.verify_authorized(&trusted, 100, 120), Ok(()));
+
+        let revoked = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            2,
+            certificate.network_key_epoch,
+            vec![],
+            vec![certificate.certificate_id],
+            100,
+            190,
+            &controller,
+        )
+        .unwrap();
+        let revoked_registration = RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate.clone()],
+            vec![revoked],
+            vec![],
+            100,
+            [17_u8; 16],
+            &node,
+        )
+        .unwrap();
+        assert_eq!(
+            revoked_registration.verify_authorized(&trusted, 100, 120),
+            Err(RootProtocolError::RevokedMembership)
+        );
+
+        let old_epoch = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            3,
+            certificate.network_key_epoch + 1,
+            authorization.active_members,
+            vec![],
+            100,
+            190,
+            &controller,
+        )
+        .unwrap();
+        let old_epoch_registration = RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate],
+            vec![old_epoch],
+            vec![],
+            100,
+            [18_u8; 16],
+            &node,
+        )
+        .unwrap();
+        assert_eq!(
+            old_epoch_registration.verify_authorized(&trusted, 100, 120),
+            Err(RootProtocolError::RevokedMembership)
         );
     }
 

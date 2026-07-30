@@ -40,6 +40,7 @@ struct PeerRecord {
     endpoint: SocketAddr,
     assigned_addresses: Vec<IpAddr>,
     certificate: MembershipCertificate,
+    authorization_expires_at_unix_seconds: u64,
     last_seen: Instant,
 }
 
@@ -60,7 +61,11 @@ async fn main() -> Result<()> {
         if packet.len() < 5 || packet[..4] != RELAY_MAGIC {
             continue;
         }
-        peers.retain(|_, peer| peer.last_seen.elapsed() <= PEER_TTL);
+        let timestamp = now();
+        peers.retain(|_, peer| {
+            peer.last_seen.elapsed() <= PEER_TTL
+                && timestamp <= peer.authorization_expires_at_unix_seconds
+        });
         handle_packet(
             &socket,
             &trusted_key,
@@ -83,7 +88,7 @@ async fn handle_packet(
 ) -> Result<()> {
     match packet[4] {
         RELAY_REGISTER_SIGNED => {
-            if let Some((key, certificate, nonce)) =
+            if let Some((key, certificate, nonce, authorization_expires_at_unix_seconds)) =
                 parse_signed_registration(&packet[5..], trusted_key)
             {
                 seen_nonces.retain(|_, seen| seen.elapsed() <= REGISTRATION_NONCE_TTL);
@@ -115,6 +120,7 @@ async fn handle_packet(
                         endpoint: remote,
                         assigned_addresses: assigned_addresses.clone(),
                         certificate: certificate.clone(),
+                        authorization_expires_at_unix_seconds,
                         last_seen: Instant::now(),
                     },
                 );
@@ -304,21 +310,28 @@ fn decode_controller_key(encoded: &str) -> Result<Vec<u8>> {
 fn parse_signed_registration(
     bytes: &[u8],
     trusted_controller_key: &Vec<u8>,
-) -> Option<(PeerKey, MembershipCertificate, [u8; 16])> {
+) -> Option<(PeerKey, MembershipCertificate, [u8; 16], u64)> {
     let registration: RootRegistration = serde_json::from_slice(bytes).ok()?;
     registration
-        .verify(std::slice::from_ref(trusted_controller_key), now(), 120)
+        .verify_authorized(std::slice::from_ref(trusted_controller_key), now(), 120)
         .ok()?;
     if registration.payload.certificates.len() != 1 {
         return None;
     }
     let nonce = registration.payload.nonce;
     let certificate = registration.payload.certificates.into_iter().next()?;
+    let authorization_expires_at_unix_seconds = registration
+        .payload
+        .authorization_manifests
+        .iter()
+        .find(|authorization| authorization.network_id == certificate.claims.network_id)?
+        .expires_at_unix_seconds;
     let key = (certificate.claims.network_id, certificate.claims.device_id);
     (certificate.claims.device_id == registration.payload.device_id).then_some((
         key,
         certificate,
         nonce,
+        authorization_expires_at_unix_seconds,
     ))
 }
 
@@ -344,8 +357,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use meshlake_core::{
-        accept_pairwise_handshake, parse_peer_identity, relay_associated_data, InitiatorHandshake,
-        MembershipClaims, NetworkKey, ReplayWindow,
+        accept_pairwise_handshake, parse_peer_identity, relay_associated_data,
+        AuthorizedMembership, InitiatorHandshake, MembershipClaims, NetworkAuthorizationManifest,
+        NetworkKey, ReplayWindow,
     };
 
     fn test_certificate(
@@ -371,14 +385,33 @@ mod tests {
     }
 
     fn signed_registration_packet(
+        controller: &SigningKey,
         node: &SigningKey,
         certificate: MembershipCertificate,
     ) -> Vec<u8> {
-        let registration = RootRegistration::sign(
+        let timestamp = now();
+        let authorization = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: certificate.claims.device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            controller,
+        )
+        .unwrap();
+        let registration = RootRegistration::sign_authorized(
             certificate.claims.device_id,
             vec![certificate],
+            vec![authorization],
             vec![],
-            now(),
+            timestamp,
             *Uuid::new_v4().as_bytes(),
             node,
         )
@@ -407,17 +440,10 @@ mod tests {
         let network = NetworkId(Uuid::from_u128(1));
         let device = DeviceId(Uuid::from_u128(2));
         let certificate = test_certificate(&controller, &node, network, device, "100.64.0.2");
-        let registration = RootRegistration::sign(
-            device,
-            vec![certificate.clone()],
-            vec![],
-            now(),
-            [1_u8; 16],
-            &node,
-        )
-        .unwrap();
+        let packet = signed_registration_packet(&controller, &node, certificate.clone());
+        let registration: RootRegistration = serde_json::from_slice(&packet[5..]).unwrap();
         let raw = serde_json::to_vec(&registration).unwrap();
-        let (key, decoded, nonce) =
+        let (key, decoded, nonce, authorization_expires_at) =
             parse_signed_registration(&raw, &controller.verifying_key().to_bytes().to_vec())
                 .unwrap();
         assert_eq!(
@@ -425,12 +451,35 @@ mod tests {
             (certificate.claims.network_id, certificate.claims.device_id)
         );
         assert_eq!(decoded, certificate);
-        assert_eq!(nonce, [1_u8; 16]);
+        assert_eq!(nonce, registration.payload.nonce);
+        assert!(authorization_expires_at >= now());
+
+        let legacy = RootRegistration::sign(
+            device,
+            vec![decoded.clone()],
+            vec![],
+            now(),
+            [1_u8; 16],
+            &node,
+        )
+        .unwrap();
+        assert!(parse_signed_registration(
+            &serde_json::to_vec(&legacy).unwrap(),
+            &controller.verifying_key().to_bytes().to_vec(),
+        )
+        .is_none());
 
         let attacker = SigningKey::from_bytes(&[9; 32]);
-        let replay =
-            RootRegistration::sign(device, vec![decoded], vec![], now(), [2_u8; 16], &attacker)
-                .unwrap();
+        let replay = RootRegistration::sign_authorized(
+            device,
+            vec![decoded],
+            registration.payload.authorization_manifests,
+            vec![],
+            now(),
+            [2_u8; 16],
+            &attacker,
+        )
+        .unwrap();
         assert!(parse_signed_registration(
             &serde_json::to_vec(&replay).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
@@ -459,6 +508,7 @@ mod tests {
                         source.1,
                         "100.64.0.1",
                     ),
+                    authorization_expires_at_unix_seconds: now() + 90,
                     last_seen: Instant::now(),
                 },
             ),
@@ -474,6 +524,7 @@ mod tests {
                         other.1,
                         "100.64.0.2",
                     ),
+                    authorization_expires_at_unix_seconds: now() + 90,
                     last_seen: Instant::now(),
                 },
             ),
@@ -507,6 +558,7 @@ mod tests {
                     existing.1,
                     "100.64.31.2",
                 ),
+                authorization_expires_at_unix_seconds: now() + 90,
                 last_seen: Instant::now(),
             },
         )]);
@@ -553,7 +605,8 @@ mod tests {
         let replay_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut peers = HashMap::new();
         let mut seen_nonces = HashMap::new();
-        let registration_one = signed_registration_packet(&node_one, certificate_one.clone());
+        let registration_one =
+            signed_registration_packet(&controller, &node_one, certificate_one.clone());
 
         handle_packet(
             &relay_socket,
@@ -595,7 +648,7 @@ mod tests {
             &mut peers,
             &mut seen_nonces,
             client_two.local_addr().unwrap(),
-            &signed_registration_packet(&node_two, certificate_two.clone()),
+            &signed_registration_packet(&controller, &node_two, certificate_two.clone()),
         )
         .await
         .unwrap();

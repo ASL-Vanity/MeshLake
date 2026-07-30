@@ -16,13 +16,13 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
     accept_pairwise_handshake, parse_peer_identity, parse_session_routing_header,
     session_handshake_id, AgentStatus, DeviceId, EnrollmentResponse, InitiatorHandshake,
-    JoinedNetwork, MembershipCertificate, NetworkControlPlane, NetworkId, NetworkKey,
-    PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy,
-    ReplayWindow, RootRegistration, RootResponse, SignedRootResponse, TransportStatus,
-    UpsertNetworkRequest, VirtualNetwork, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
-    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
-    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
-    RELAY_SESSION_RESPONSE,
+    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
+    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey, PairwiseSessionKeys,
+    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
+    RootRegistration, RootResponse, SignedRootResponse, TransportStatus, UpsertNetworkRequest,
+    VirtualNetwork, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES,
+    RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK,
+    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -51,6 +51,8 @@ const HANDSHAKE_RETRY: Duration = Duration::from_secs(1);
 const HANDSHAKE_CLOCK_SKEW_SECONDS: u64 = 120;
 const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(300);
 const MAX_HANDSHAKE_REPLAY_ENTRIES: usize = 16_384;
+const AUTHORIZATION_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+const CERTIFICATE_REFRESH_MARGIN_SECONDS: u64 = 300;
 
 #[derive(Parser)]
 #[command(
@@ -179,6 +181,7 @@ struct Agent {
     adapter: adapter::AdapterController,
     relay_running: AtomicBool,
     transport_supervisor_running: AtomicBool,
+    authorization_supervisor_running: AtomicBool,
     transport_revision: AtomicU64,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
@@ -199,6 +202,32 @@ struct TransportConfiguration {
     root_servers: Vec<PlanetRoot>,
     stun_servers: Vec<String>,
     upnp_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizationRefreshTarget {
+    network_id: NetworkId,
+    controller_url: String,
+    pinned_controller_public_key: Vec<u8>,
+    certificate: MembershipCertificate,
+    authorization_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RegistrationMembership {
+    certificate: MembershipCertificate,
+    authorization: NetworkAuthorizationManifest,
+}
+
+#[derive(Debug)]
+enum AuthorizationRefreshAction {
+    Update {
+        certificate: MembershipCertificate,
+        network_key: Vec<u8>,
+        authorization: NetworkAuthorizationManifest,
+    },
+    UpdateManifest(NetworkAuthorizationManifest),
+    Revoke,
 }
 
 impl TransportConfiguration {
@@ -271,6 +300,7 @@ impl Agent {
             adapter: adapter::AdapterController::new(wintun_dll),
             relay_running: AtomicBool::new(false),
             transport_supervisor_running: AtomicBool::new(false),
+            authorization_supervisor_running: AtomicBool::new(false),
             transport_revision: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
@@ -470,14 +500,176 @@ impl Agent {
 
     async fn root_registration_material(
         &self,
-    ) -> Result<(DeviceId, SigningKey, Vec<MembershipCertificate>)> {
+    ) -> Result<(DeviceId, SigningKey, Vec<RegistrationMembership>)> {
         let state = self.state.read().await;
-        let certificates = state
+        let memberships = state
             .networks
             .iter()
-            .filter_map(|network| network.certificate.clone())
+            .filter_map(|network| {
+                let certificate = network.certificate.clone()?;
+                let authorization = verified_authorization_manifest(network, now())?.clone();
+                authorization
+                    .authorizes(&certificate)
+                    .then_some(RegistrationMembership {
+                        certificate,
+                        authorization,
+                    })
+            })
             .collect();
-        Ok((state.device_id, identity_signing_key(&state)?, certificates))
+        Ok((state.device_id, identity_signing_key(&state)?, memberships))
+    }
+
+    async fn authorization_refresh_material(
+        &self,
+    ) -> Result<(DeviceId, SigningKey, Vec<AuthorizationRefreshTarget>)> {
+        let state = self.state.read().await;
+        let targets = state
+            .networks
+            .iter()
+            .filter_map(|network| {
+                Some(AuthorizationRefreshTarget {
+                    network_id: network.network.id,
+                    controller_url: network.control_plane.controller_url.clone()?,
+                    pinned_controller_public_key: (!network
+                        .control_plane
+                        .pinned_controller_public_key
+                        .is_empty())
+                    .then(|| network.control_plane.pinned_controller_public_key.clone())?,
+                    certificate: network.certificate.clone()?,
+                    authorization_epoch: network
+                        .control_plane
+                        .authorization_manifest
+                        .as_ref()
+                        .map(|authorization| authorization.authorization_epoch),
+                })
+            })
+            .collect();
+        Ok((state.device_id, identity_signing_key(&state)?, targets))
+    }
+
+    async fn apply_authorization_action(
+        &self,
+        target: &AuthorizationRefreshTarget,
+        action: AuthorizationRefreshAction,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        let Some(index) = state
+            .networks
+            .iter()
+            .position(|network| network.network.id == target.network_id)
+        else {
+            return Ok(());
+        };
+        let current_certificate_id = state.networks[index]
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.certificate_id);
+        if current_certificate_id != Some(target.certificate.certificate_id) {
+            return Ok(());
+        }
+
+        let reload_transport;
+        let mut removed_network = None;
+        match action {
+            AuthorizationRefreshAction::UpdateManifest(authorization) => {
+                let previous = state.networks[index]
+                    .control_plane
+                    .authorization_manifest
+                    .as_ref();
+                reload_transport = previous.is_none_or(|previous| {
+                    previous.authorization_epoch != authorization.authorization_epoch
+                        || previous.network_key_epoch != authorization.network_key_epoch
+                });
+                state.networks[index].control_plane.authorization_manifest = Some(authorization);
+            }
+            AuthorizationRefreshAction::Update {
+                certificate,
+                network_key,
+                authorization,
+            } => {
+                let joined = &mut state.networks[index];
+                joined.assigned_addresses = certificate.claims.assigned_addresses.clone();
+                joined.certificate = Some(certificate);
+                joined.network_key = network_key;
+                joined.control_plane.authorization_manifest = Some(authorization);
+                reload_transport = true;
+            }
+            AuthorizationRefreshAction::Revoke => {
+                removed_network = Some(state.networks.remove(index));
+                reload_transport = true;
+            }
+        }
+        write_state(&self.path, &state)?;
+        drop(state);
+
+        if reload_transport {
+            // Security state changes must invalidate the old peer/session worker
+            // even if best-effort operating-system adapter cleanup fails.
+            self.request_transport_reload();
+        }
+        if let Some(removed_network) = removed_network {
+            self.adapter.remove_network(&removed_network)?;
+            eprintln!(
+                "MeshLake network {} was revoked by its controller and has been disabled",
+                removed_network.network.id.0
+            );
+        } else if reload_transport && self.adapter.is_active() {
+            let networks = self.state.read().await.networks.clone();
+            self.adapter.configure_networks(&networks)?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_authorizations_once(&self, client: &reqwest::Client) -> Result<()> {
+        let (device_id, identity, targets) = self.authorization_refresh_material().await?;
+        for target in targets {
+            match fetch_authorization_action(client, device_id, &identity, &target).await {
+                Ok(action) => {
+                    if let Err(error) = self.apply_authorization_action(&target, action).await {
+                        eprintln!(
+                            "MeshLake could not apply authorization update for network {}: {error:#}",
+                            target.network_id.0
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "MeshLake could not refresh authorization for network {}: {error:#}",
+                    target.network_id.0
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_authorization_supervisor(self: &Arc<Self>) -> Result<()> {
+        if self
+            .authorization_supervisor_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()?;
+        let agent = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                if agent.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Err(error) = agent.refresh_authorizations_once(&client).await {
+                    eprintln!("MeshLake authorization supervisor failed: {error:#}");
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(AUTHORIZATION_REFRESH_INTERVAL) => {}
+                    _ = agent.shutdown.notified() => break,
+                }
+            }
+            agent
+                .authorization_supervisor_running
+                .store(false, Ordering::Release);
+        });
+        Ok(())
     }
 
     async fn start_relay_worker(self: &Arc<Self>) -> Result<()> {
@@ -790,6 +982,182 @@ fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError
         )));
     }
     Ok(value.to_owned())
+}
+
+fn pinned_controller_key(network: &JoinedNetwork) -> &[u8] {
+    if !network
+        .control_plane
+        .pinned_controller_public_key
+        .is_empty()
+    {
+        &network.control_plane.pinned_controller_public_key
+    } else {
+        network
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.controller_public_key.as_slice())
+            .unwrap_or_default()
+    }
+}
+
+fn verified_authorization_manifest(
+    network: &JoinedNetwork,
+    now_unix_seconds: u64,
+) -> Option<&NetworkAuthorizationManifest> {
+    let authorization = network.control_plane.authorization_manifest.as_ref()?;
+    authorization
+        .verify_from_controller(pinned_controller_key(network), now_unix_seconds)
+        .ok()?;
+    Some(authorization)
+}
+
+fn local_network_is_authorized(network: &JoinedNetwork, now_unix_seconds: u64) -> bool {
+    let Some(certificate) = network.certificate.as_ref() else {
+        return false;
+    };
+    verified_authorization_manifest(network, now_unix_seconds)
+        .is_some_and(|authorization| authorization.authorizes(certificate))
+}
+
+fn peer_certificate_is_authorized(
+    network: &JoinedNetwork,
+    certificate: &MembershipCertificate,
+    now_unix_seconds: u64,
+) -> bool {
+    verified_authorization_manifest(network, now_unix_seconds)
+        .is_some_and(|authorization| authorization.authorizes(certificate))
+}
+
+async fn fetch_authorization_action(
+    client: &reqwest::Client,
+    device_id: DeviceId,
+    identity: &SigningKey,
+    target: &AuthorizationRefreshTarget,
+) -> Result<AuthorizationRefreshAction> {
+    let authorization_url = format!(
+        "{}/v1/networks/{}/authorization",
+        target.controller_url.trim_end_matches('/'),
+        target.network_id.0
+    );
+    let response = client
+        .get(&authorization_url)
+        .send()
+        .await
+        .with_context(|| format!("cannot contact controller at {authorization_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "controller authorization request returned {}",
+            response.status()
+        );
+    }
+    let authorization: NetworkAuthorizationManifest = response
+        .json()
+        .await
+        .context("controller returned an invalid authorization manifest")?;
+    authorization
+        .verify_from_controller(&target.pinned_controller_public_key, now())
+        .context("controller authorization signature is invalid")?;
+    if authorization.network_id != target.network_id {
+        anyhow::bail!("controller returned authorization for another network");
+    }
+    if target
+        .authorization_epoch
+        .is_some_and(|current| authorization.authorization_epoch < current)
+    {
+        anyhow::bail!("controller returned an older authorization epoch");
+    }
+
+    let active_member = authorization
+        .active_members
+        .iter()
+        .find(|member| member.device_id == device_id);
+    let Some(active_member) = active_member else {
+        return Ok(AuthorizationRefreshAction::Revoke);
+    };
+    if active_member.device_public_key != identity.verifying_key().to_bytes()
+        || active_member.certificate_id != target.certificate.certificate_id
+    {
+        return Ok(AuthorizationRefreshAction::Revoke);
+    }
+    let certificate_expires_soon = target
+        .certificate
+        .claims
+        .expires_at_unix_seconds
+        .is_some_and(|expiry| expiry <= now().saturating_add(CERTIFICATE_REFRESH_MARGIN_SECONDS));
+    if authorization.authorizes(&target.certificate) && !certificate_expires_soon {
+        return Ok(AuthorizationRefreshAction::UpdateManifest(authorization));
+    }
+
+    let refresh = MembershipRefreshRequest::sign(
+        target.network_id,
+        device_id,
+        target.certificate.certificate_id,
+        now(),
+        new_root_nonce(),
+        identity,
+    )?;
+    let refresh_url = format!(
+        "{}/v1/membership/refresh",
+        target.controller_url.trim_end_matches('/')
+    );
+    let response = client
+        .post(&refresh_url)
+        .json(&refresh)
+        .send()
+        .await
+        .with_context(|| format!("cannot refresh membership at {refresh_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "controller membership refresh returned {}",
+            response.status()
+        );
+    }
+    let response: MembershipRefreshResponse = response
+        .json()
+        .await
+        .context("controller returned an invalid membership refresh response")?;
+    response
+        .authorization
+        .verify_from_controller(&target.pinned_controller_public_key, now())
+        .context("refreshed authorization signature is invalid")?;
+    if response.authorization.network_id != target.network_id {
+        anyhow::bail!("refreshed authorization belongs to another network");
+    }
+    if response.authorization.authorization_epoch < authorization.authorization_epoch {
+        anyhow::bail!("membership refresh returned an older authorization epoch");
+    }
+    if response.revoked {
+        let signed_revocation = !response.authorization.active_members.iter().any(|member| {
+            member.device_id == device_id
+                && member.certificate_id == target.certificate.certificate_id
+                && member.device_public_key == identity.verifying_key().to_bytes()
+        });
+        if signed_revocation {
+            return Ok(AuthorizationRefreshAction::Revoke);
+        }
+        anyhow::bail!("membership refresh revocation is not supported by the signed authorization");
+    }
+    let certificate = response
+        .certificate
+        .context("controller refresh response contains no certificate")?;
+    certificate
+        .verify_from_controller(&target.pinned_controller_public_key, now())
+        .context("refreshed membership certificate is invalid")?;
+    if certificate.claims.network_id != target.network_id
+        || certificate.claims.device_id != device_id
+        || certificate.claims.device_public_key != identity.verifying_key().to_bytes()
+        || certificate.certificate_id != target.certificate.certificate_id
+        || !response.authorization.authorizes(&certificate)
+    {
+        anyhow::bail!("controller refresh response does not authorize this device");
+    }
+    NetworkKey::from_slice(&response.network_key)
+        .context("controller refresh response contains an invalid network key")?;
+    Ok(AuthorizationRefreshAction::Update {
+        certificate,
+        network_key: response.network_key,
+        authorization: response.authorization,
+    })
 }
 
 fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
@@ -1136,6 +1504,7 @@ async fn main() -> Result<()> {
             );
         }
     }
+    agent.start_authorization_supervisor().await?;
     agent.start_relay_worker().await?;
     let app = Router::new()
         .route("/v1/status", get(get_status))
@@ -2030,6 +2399,19 @@ async fn run_relay_worker(
                         tokio::time::Instant::now() + Duration::from_secs(1_800);
                 }
                 let (device_id, networks) = agent.relay_snapshot().await;
+                let authorization_time = now();
+                peers.retain(|(network_id, _), _| {
+                    networks.iter().any(|network| {
+                        network.network.id == *network_id
+                            && local_network_is_authorized(network, authorization_time)
+                    })
+                });
+                sessions.retain(|(network_id, _), _| {
+                    networks.iter().any(|network| {
+                        network.network.id == *network_id
+                            && local_network_is_authorized(network, authorization_time)
+                    })
+                });
                 if tokio::time::Instant::now() >= next_handshake_retry {
                     let retry_time = Instant::now();
                     let retries = sessions
@@ -2051,7 +2433,10 @@ async fn run_relay_worker(
                     for ((network_id, target_device), handshake) in retries {
                         let Some(network) = networks
                             .iter()
-                            .find(|network| network.network.id == network_id)
+                            .find(|network| {
+                                network.network.id == network_id
+                                    && local_network_is_authorized(network, authorization_time)
+                            })
                         else {
                             continue;
                         };
@@ -2102,12 +2487,14 @@ async fn run_relay_worker(
                         tokio::time::Instant::now() + Duration::from_secs(5);
                 }
                 if tokio::time::Instant::now() >= next_registration {
-                    let (root_device, identity, certificates) =
+                    let (root_device, identity, memberships) =
                         agent.root_registration_material().await?;
-                    for certificate in &certificates {
-                        let signed = RootRegistration::sign(
+                    for membership in &memberships {
+                        let certificate = &membership.certificate;
+                        let signed = RootRegistration::sign_authorized(
                             root_device,
                             vec![certificate.clone()],
+                            vec![membership.authorization.clone()],
                             advertised_candidates.clone(),
                             now(),
                             new_root_nonce(),
@@ -2130,9 +2517,10 @@ async fn run_relay_worker(
                         {
                             for root_endpoint in root.endpoints.iter().copied() {
                                 let nonce = new_root_nonce();
-                                let registration = RootRegistration::sign(
+                                let registration = RootRegistration::sign_authorized(
                                     root_device,
                                     vec![certificate.clone()],
+                                    vec![membership.authorization.clone()],
                                     advertised_candidates.clone(),
                                     now(),
                                     nonce,
@@ -2182,7 +2570,9 @@ async fn run_relay_worker(
                 }
                 for _ in 0..32 {
                     let Some(packet) = agent.adapter.try_read_packet()? else { break; };
-                    let Some(network) = network_for_ip_packet(&networks, &packet) else { continue; };
+                    let Some(network) = network_for_ip_packet(&networks, &packet)
+                        .filter(|network| local_network_is_authorized(network, now()))
+                    else { continue; };
                     let targets = peer_targets_for_packet(&peers, network, &packet);
                     if targets.is_empty() {
                         trace_transport(format!(
@@ -2308,17 +2698,16 @@ async fn receive_udp_packet(
             let network = certificate.claims.network_id;
             let device = certificate.claims.device_id;
             let (self_id, networks) = agent.relay_snapshot().await;
-            let Some(local_membership) = networks
-                .iter()
-                .find(|joined| joined.network.id == network)
-                .and_then(|joined| joined.certificate.as_ref())
+            let Some(local_network) = networks.iter().find(|joined| joined.network.id == network)
             else {
                 return Ok(());
             };
             if certificate
-                .verify_from_controller(&local_membership.controller_public_key, now())
+                .verify_from_controller(pinned_controller_key(local_network), now())
                 .is_err()
                 || certificate.claims.device_public_key.len() != 32
+                || !local_network_is_authorized(local_network, now())
+                || !peer_certificate_is_authorized(local_network, &certificate, now())
             {
                 trace_transport(format!(
                     "rejected untrusted peer membership for member {} on network {}",
@@ -2348,7 +2737,11 @@ async fn receive_udp_packet(
                 return Ok(());
             };
             let (self_id, networks) = agent.relay_snapshot().await;
-            if device == self_id || !networks.iter().any(|entry| entry.network.id == network) {
+            let Some(local_network) = networks.iter().find(|entry| entry.network.id == network)
+            else {
+                return Ok(());
+            };
+            if device == self_id || !local_network_is_authorized(local_network, now()) {
                 return Ok(());
             }
             if !sockets.supports(peer_endpoint) {
@@ -2373,7 +2766,11 @@ async fn receive_udp_packet(
                 return Ok(());
             };
             let (self_id, networks) = agent.relay_snapshot().await;
-            if device == self_id || !networks.iter().any(|entry| entry.network.id == network) {
+            let Some(local_network) = networks.iter().find(|entry| entry.network.id == network)
+            else {
+                return Ok(());
+            };
+            if device == self_id || !local_network_is_authorized(local_network, now()) {
                 return Ok(());
             }
             let Some(route) = peers.get_mut(&(network, device)) else {
@@ -2478,10 +2875,9 @@ async fn handle_root_response(
                     ));
                     continue;
                 };
-                let Some(local_membership) = networks
+                let Some(local_network) = networks
                     .iter()
                     .find(|joined| joined.network.id == peer.network_id)
-                    .and_then(|joined| joined.certificate.as_ref())
                 else {
                     continue;
                 };
@@ -2489,8 +2885,10 @@ async fn handle_root_response(
                     || certificate.claims.device_id != peer.device_id
                     || certificate.claims.assigned_addresses != peer.assigned_addresses
                     || certificate
-                        .verify_from_controller(&local_membership.controller_public_key, now())
+                        .verify_from_controller(pinned_controller_key(local_network), now())
                         .is_err()
+                    || !local_network_is_authorized(local_network, now())
+                    || !peer_certificate_is_authorized(local_network, &certificate, now())
                 {
                     trace_transport(format!(
                         "rejected unauthenticated root directory for member {} on network {}",
@@ -2565,6 +2963,9 @@ async fn receive_session_init(
     else {
         return Ok(());
     };
+    if !local_network_is_authorized(network, now()) {
+        return Ok(());
+    }
     let peer_key = (network_id, source);
     let Some(peer_public_key) = peers
         .get(&peer_key)
@@ -2690,6 +3091,9 @@ async fn receive_session_response(
     else {
         return Ok(());
     };
+    if !local_network_is_authorized(network, now()) {
+        return Ok(());
+    }
     let Ok(network_key) = NetworkKey::from_slice(&network.network_key) else {
         return Ok(());
     };
@@ -2792,6 +3196,9 @@ async fn receive_session_data(
     else {
         return Ok(());
     };
+    if !local_network_is_authorized(network, now()) {
+        return Ok(());
+    }
     let Some(source_route) = peers.get(&peer_key) else {
         trace_transport(format!(
             "dropped packet from member {} because no authenticated address directory is available",
@@ -3164,6 +3571,135 @@ mod tests {
     use meshlake_core::{
         AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy,
     };
+
+    async fn spawn_json_server(
+        responses: Vec<Vec<u8>>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 2048];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                requests.push(request);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        (address, server)
+    }
+
+    fn joined_network_with_authorization(
+        controller: &SigningKey,
+        identity: &SigningKey,
+        device_id: DeviceId,
+        network_id: NetworkId,
+        certificate_id: Uuid,
+        network_key_epoch: u64,
+        authorization_epoch: u64,
+        controller_url: String,
+    ) -> JoinedNetwork {
+        let timestamp = now();
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id,
+                device_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.90.1".parse().unwrap()],
+                allowed_routes: vec!["100.64.90.0/24".into()],
+                issued_at_unix_seconds: timestamp,
+                expires_at_unix_seconds: Some(timestamp + 86_400),
+            },
+            certificate_id,
+            network_key_epoch,
+            controller,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            authorization_epoch,
+            network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id,
+                certificate_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            controller,
+        )
+        .unwrap();
+        JoinedNetwork {
+            network: VirtualNetwork {
+                id: network_id,
+                name: "authorization-test".into(),
+                ipv4_prefix: "100.64.90.0/24".into(),
+                ipv6_prefix: None,
+                relay_policy: RelayPolicy::Preferred,
+            },
+            assigned_addresses: certificate.claims.assigned_addresses.clone(),
+            certificate: Some(certificate),
+            network_key: vec![network_key_epoch as u8; 32],
+            control_plane: NetworkControlPlane {
+                controller_url: Some(controller_url),
+                pinned_controller_public_key: controller.verifying_key().to_bytes().to_vec(),
+                authorization_manifest: Some(authorization),
+                ..NetworkControlPlane::default()
+            },
+        }
+    }
+
+    fn refresh_target(network: &JoinedNetwork) -> AuthorizationRefreshTarget {
+        AuthorizationRefreshTarget {
+            network_id: network.network.id,
+            controller_url: network.control_plane.controller_url.clone().unwrap(),
+            pinned_controller_public_key: network
+                .control_plane
+                .pinned_controller_public_key
+                .clone(),
+            certificate: network.certificate.clone().unwrap(),
+            authorization_epoch: network
+                .control_plane
+                .authorization_manifest
+                .as_ref()
+                .map(|authorization| authorization.authorization_epoch),
+        }
+    }
 
     fn test_joined_network() -> JoinedNetwork {
         JoinedNetwork {
@@ -3761,6 +4297,313 @@ mod tests {
             control_plane.authorization_manifest.as_ref(),
             Some(&authorization)
         );
+    }
+
+    #[test]
+    fn authorization_guards_fail_closed_for_expiry_and_unknown_peers() {
+        let controller = SigningKey::from_bytes(&[41_u8; 32]);
+        let local_identity = SigningKey::from_bytes(&[42_u8; 32]);
+        let peer_identity = SigningKey::from_bytes(&[43_u8; 32]);
+        let network_id = NetworkId(Uuid::from_u128(410));
+        let network = joined_network_with_authorization(
+            &controller,
+            &local_identity,
+            DeviceId(Uuid::from_u128(411)),
+            network_id,
+            Uuid::from_u128(412),
+            1,
+            1,
+            "http://controller.invalid".into(),
+        );
+        let authorization = network
+            .control_plane
+            .authorization_manifest
+            .as_ref()
+            .unwrap();
+        assert!(local_network_is_authorized(
+            &network,
+            authorization.issued_at_unix_seconds
+        ));
+        assert!(!local_network_is_authorized(
+            &network,
+            authorization.expires_at_unix_seconds + 1
+        ));
+
+        let unknown_peer = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id,
+                device_id: DeviceId(Uuid::from_u128(413)),
+                device_public_key: peer_identity.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.90.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.90.0/24".into()],
+                issued_at_unix_seconds: authorization.issued_at_unix_seconds,
+                expires_at_unix_seconds: Some(authorization.expires_at_unix_seconds + 600),
+            },
+            Uuid::from_u128(414),
+            1,
+            &controller,
+        )
+        .unwrap();
+        assert!(!peer_certificate_is_authorized(
+            &network,
+            &unknown_peer,
+            authorization.issued_at_unix_seconds
+        ));
+    }
+
+    #[tokio::test]
+    async fn current_authorization_only_updates_the_manifest() {
+        let controller = SigningKey::from_bytes(&[44_u8; 32]);
+        let identity = SigningKey::from_bytes(&[45_u8; 32]);
+        let device_id = DeviceId(Uuid::from_u128(450));
+        let network_id = NetworkId(Uuid::from_u128(451));
+        let certificate_id = Uuid::from_u128(452);
+        let mut network = joined_network_with_authorization(
+            &controller,
+            &identity,
+            device_id,
+            network_id,
+            certificate_id,
+            1,
+            1,
+            String::new(),
+        );
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            2,
+            1,
+            vec![AuthorizedMembership {
+                device_id,
+                certificate_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                network_key_epoch: 1,
+            }],
+            vec![],
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+        let (address, server) =
+            spawn_json_server(vec![serde_json::to_vec(&authorization).unwrap()]).await;
+        network.control_plane.controller_url = Some(format!("http://{address}"));
+        let action = fetch_authorization_action(
+            &reqwest::Client::new(),
+            device_id,
+            &identity,
+            &refresh_target(&network),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            action,
+            AuthorizationRefreshAction::UpdateManifest(ref manifest)
+                if manifest.authorization_epoch == 2
+        ));
+        let requests = server.await.unwrap();
+        assert!(String::from_utf8_lossy(&requests[0])
+            .starts_with(&format!("GET /v1/networks/{}/authorization ", network_id.0)));
+    }
+
+    #[tokio::test]
+    async fn network_key_epoch_change_refreshes_certificate_and_key() {
+        let controller = SigningKey::from_bytes(&[46_u8; 32]);
+        let identity = SigningKey::from_bytes(&[47_u8; 32]);
+        let device_id = DeviceId(Uuid::from_u128(470));
+        let network_id = NetworkId(Uuid::from_u128(471));
+        let certificate_id = Uuid::from_u128(472);
+        let mut network = joined_network_with_authorization(
+            &controller,
+            &identity,
+            device_id,
+            network_id,
+            certificate_id,
+            1,
+            1,
+            String::new(),
+        );
+        let timestamp = now();
+        let new_certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id,
+                device_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.90.1".parse().unwrap()],
+                allowed_routes: vec!["100.64.90.0/24".into()],
+                issued_at_unix_seconds: timestamp,
+                expires_at_unix_seconds: Some(timestamp + 86_400),
+            },
+            certificate_id,
+            2,
+            &controller,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            2,
+            2,
+            vec![AuthorizedMembership {
+                device_id,
+                certificate_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                network_key_epoch: 2,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let refresh_response = MembershipRefreshResponse {
+            revoked: false,
+            authorization: authorization.clone(),
+            certificate: Some(new_certificate.clone()),
+            network_key: vec![9_u8; 32],
+        };
+        let (address, server) = spawn_json_server(vec![
+            serde_json::to_vec(&authorization).unwrap(),
+            serde_json::to_vec(&refresh_response).unwrap(),
+        ])
+        .await;
+        network.control_plane.controller_url = Some(format!("http://{address}"));
+        let action = fetch_authorization_action(
+            &reqwest::Client::new(),
+            device_id,
+            &identity,
+            &refresh_target(&network),
+        )
+        .await
+        .unwrap();
+        match action {
+            AuthorizationRefreshAction::Update {
+                certificate,
+                network_key,
+                authorization,
+            } => {
+                assert_eq!(certificate, new_certificate);
+                assert_eq!(network_key, vec![9_u8; 32]);
+                assert_eq!(authorization.network_key_epoch, 2);
+            }
+            _ => panic!("expected a certificate and network-key refresh"),
+        }
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(String::from_utf8_lossy(&requests[1]).starts_with("POST /v1/membership/refresh "));
+        let body_start = requests[1]
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let refresh: MembershipRefreshRequest =
+            serde_json::from_slice(&requests[1][body_start..]).unwrap();
+        assert_eq!(refresh.payload.network_id, network_id);
+        assert_eq!(refresh.payload.device_id, device_id);
+        refresh
+            .verify(&identity.verifying_key().to_bytes(), now(), 120)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_member_removal_revokes_network_and_reloads_transport() {
+        let directory = env::temp_dir().join(format!("meshlake-revoke-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let (device_id, identity) = {
+            let state = agent.state.read().await;
+            (state.device_id, identity_signing_key(&state).unwrap())
+        };
+        let controller = SigningKey::from_bytes(&[48_u8; 32]);
+        let network_id = NetworkId(Uuid::from_u128(480));
+        let certificate_id = Uuid::from_u128(481);
+        let timestamp = now();
+        let revoked = NetworkAuthorizationManifest::sign(
+            network_id,
+            2,
+            2,
+            vec![],
+            vec![certificate_id],
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let (address, server) =
+            spawn_json_server(vec![serde_json::to_vec(&revoked).unwrap()]).await;
+        let network = joined_network_with_authorization(
+            &controller,
+            &identity,
+            device_id,
+            network_id,
+            certificate_id,
+            1,
+            1,
+            format!("http://{address}"),
+        );
+        {
+            let mut state = agent.state.write().await;
+            state.networks.push(network);
+        }
+        let previous_revision = agent.transport_revision.load(Ordering::Acquire);
+        agent
+            .refresh_authorizations_once(&reqwest::Client::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert!(agent.state.read().await.networks.is_empty());
+        assert!(agent.transport_revision.load(Ordering::Acquire) > previous_revision);
+        let persisted: PersistedState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(persisted.networks.is_empty());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_epoch_cannot_roll_back() {
+        let controller = SigningKey::from_bytes(&[49_u8; 32]);
+        let identity = SigningKey::from_bytes(&[50_u8; 32]);
+        let device_id = DeviceId(Uuid::from_u128(490));
+        let network_id = NetworkId(Uuid::from_u128(491));
+        let certificate_id = Uuid::from_u128(492);
+        let mut network = joined_network_with_authorization(
+            &controller,
+            &identity,
+            device_id,
+            network_id,
+            certificate_id,
+            1,
+            5,
+            String::new(),
+        );
+        let stale = NetworkAuthorizationManifest::sign(
+            network_id,
+            4,
+            1,
+            vec![AuthorizedMembership {
+                device_id,
+                certificate_id,
+                device_public_key: identity.verifying_key().to_bytes().to_vec(),
+                network_key_epoch: 1,
+            }],
+            vec![],
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+        let (address, server) = spawn_json_server(vec![serde_json::to_vec(&stale).unwrap()]).await;
+        network.control_plane.controller_url = Some(format!("http://{address}"));
+        let error = fetch_authorization_action(
+            &reqwest::Client::new(),
+            device_id,
+            &identity,
+            &refresh_target(&network),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("older authorization epoch"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

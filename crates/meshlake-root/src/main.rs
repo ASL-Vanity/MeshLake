@@ -112,6 +112,7 @@ struct PeerRecord {
     candidates: Vec<SocketAddr>,
     assigned_addresses: Vec<IpAddr>,
     certificate: MembershipCertificate,
+    authorization_expires_at_unix_seconds: u64,
     last_seen: Instant,
 }
 
@@ -216,7 +217,7 @@ fn process_registration(
         bail!("registration contains too many memberships");
     }
     registration
-        .verify(trusted_controller_keys, now(), maximum_clock_skew_seconds)
+        .verify_authorized(trusted_controller_keys, now(), maximum_clock_skew_seconds)
         .context("registration authentication failed")?;
     seen_nonces.retain(|_, seen| seen.elapsed() <= REGISTRATION_NONCE_TTL);
     if seen_nonces
@@ -225,7 +226,11 @@ fn process_registration(
     {
         bail!("registration nonce was already used");
     }
-    peers.retain(|_, peer| peer.last_seen.elapsed() <= peer_ttl);
+    let timestamp = now();
+    peers.retain(|_, peer| {
+        peer.last_seen.elapsed() <= peer_ttl
+            && timestamp <= peer.authorization_expires_at_unix_seconds
+    });
 
     let mut candidates = Vec::with_capacity(MAX_CANDIDATES_PER_PEER);
     candidates.push(observed_endpoint);
@@ -241,7 +246,7 @@ fn process_registration(
     candidates.dedup();
     candidates.truncate(MAX_CANDIDATES_PER_PEER);
 
-    let mut memberships = HashMap::<NetworkId, (Vec<IpAddr>, MembershipCertificate)>::new();
+    let mut memberships = HashMap::<NetworkId, (Vec<IpAddr>, MembershipCertificate, u64)>::new();
     for certificate in &registration.payload.certificates {
         if certificate.claims.assigned_addresses.len() > MAX_ADDRESSES_PER_PEER {
             bail!("membership contains too many virtual addresses");
@@ -263,17 +268,28 @@ fn process_registration(
             .collect::<Vec<_>>();
         addresses.sort_unstable();
         addresses.dedup();
+        let authorization_expires_at_unix_seconds = registration
+            .payload
+            .authorization_manifests
+            .iter()
+            .find(|authorization| authorization.network_id == certificate.claims.network_id)
+            .context("verified registration is missing its authorization manifest")?
+            .expires_at_unix_seconds;
         if memberships
             .insert(
                 certificate.claims.network_id,
-                (addresses, certificate.clone()),
+                (
+                    addresses,
+                    certificate.clone(),
+                    authorization_expires_at_unix_seconds,
+                ),
             )
             .is_some()
         {
             bail!("registration contains duplicate memberships for one network");
         }
     }
-    for (network_id, (addresses, _)) in &memberships {
+    for (network_id, (addresses, _, _)) in &memberships {
         let conflict = peers.iter().any(|((peer_network, peer_device), peer)| {
             *peer_network == *network_id
                 && *peer_device != registration.payload.device_id
@@ -302,13 +318,16 @@ fn process_registration(
         .collect::<Vec<_>>();
     discovered.sort_by_key(|peer| (peer.network_id.0, peer.device_id.0));
 
-    for (network_id, (assigned_addresses, certificate)) in memberships {
+    for (network_id, (assigned_addresses, certificate, authorization_expires_at_unix_seconds)) in
+        memberships
+    {
         peers.insert(
             (network_id, registration.payload.device_id),
             PeerRecord {
                 candidates: candidates.clone(),
                 assigned_addresses,
                 certificate,
+                authorization_expires_at_unix_seconds,
                 last_seen: Instant::now(),
             },
         );
@@ -567,7 +586,9 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use meshlake_core::{MembershipCertificate, MembershipClaims};
+    use meshlake_core::{
+        AuthorizedMembership, MembershipCertificate, MembershipClaims, NetworkAuthorizationManifest,
+    };
     use uuid::Uuid;
 
     fn test_certificate(
@@ -592,6 +613,42 @@ mod tests {
         .unwrap()
     }
 
+    fn authorized_registration(
+        controller: &SigningKey,
+        node: &SigningKey,
+        certificate: MembershipCertificate,
+        candidates: Vec<SocketAddr>,
+        nonce: [u8; 16],
+    ) -> RootRegistration {
+        let timestamp = now();
+        let authorization = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: certificate.claims.device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            controller,
+        )
+        .unwrap();
+        RootRegistration::sign_authorized(
+            certificate.claims.device_id,
+            vec![certificate],
+            vec![authorization],
+            candidates,
+            timestamp,
+            nonce,
+            node,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn registration_returns_existing_peer_on_the_same_network() {
         let controller = SigningKey::from_bytes(&[1_u8; 32]);
@@ -612,6 +669,7 @@ mod tests {
                 candidates: vec!["198.51.100.1:40000".parse().unwrap()],
                 assigned_addresses: vec!["100.64.0.1".parse().unwrap()],
                 certificate: existing_certificate.clone(),
+                authorization_expires_at_unix_seconds: now() + 90,
                 last_seen: Instant::now(),
             },
         );
@@ -630,15 +688,13 @@ mod tests {
             &controller,
         )
         .unwrap();
-        let registration = RootRegistration::sign(
-            device,
-            vec![certificate],
-            vec!["192.168.1.2:30000".parse().unwrap()],
-            now(),
-            [7_u8; 16],
+        let registration = authorized_registration(
+            &controller,
             &node,
-        )
-        .unwrap();
+            certificate,
+            vec!["192.168.1.2:30000".parse().unwrap()],
+            [7_u8; 16],
+        );
         let mut seen_nonces = HashMap::new();
         let response = process_registration(
             registration,
@@ -686,6 +742,7 @@ mod tests {
                     existing_device,
                     "100.64.19.2",
                 ),
+                authorization_expires_at_unix_seconds: now() + 90,
                 last_seen: Instant::now(),
             },
         )]);
@@ -705,8 +762,7 @@ mod tests {
         )
         .unwrap();
         let registration =
-            RootRegistration::sign(device, vec![certificate], vec![], now(), [8_u8; 16], &node)
-                .unwrap();
+            authorized_registration(&controller, &node, certificate, vec![], [8_u8; 16]);
         let mut seen_nonces = HashMap::new();
         assert!(process_registration(
             registration,
@@ -740,8 +796,7 @@ mod tests {
         )
         .unwrap();
         let registration =
-            RootRegistration::sign(device, vec![certificate], vec![], now(), [9_u8; 16], &node)
-                .unwrap();
+            authorized_registration(&controller, &node, certificate, vec![], [9_u8; 16]);
         let trusted_keys = [controller.verifying_key().to_bytes().to_vec()];
         let mut peers = HashMap::new();
         let mut seen_nonces = HashMap::new();
@@ -770,5 +825,27 @@ mod tests {
             peers.get(&(network, device)).unwrap().candidates[0],
             "203.0.113.30:41000".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn registration_without_authorization_is_rejected() {
+        let controller = SigningKey::from_bytes(&[31_u8; 32]);
+        let node = SigningKey::from_bytes(&[32_u8; 32]);
+        let network = NetworkId(Uuid::from_u128(33));
+        let device = DeviceId(Uuid::from_u128(34));
+        let certificate = test_certificate(&controller, &node, network, device, "100.64.33.2");
+        let registration =
+            RootRegistration::sign(device, vec![certificate], vec![], now(), [35_u8; 16], &node)
+                .unwrap();
+        assert!(process_registration(
+            registration,
+            "203.0.113.34:41000".parse().unwrap(),
+            &[controller.verifying_key().to_bytes().to_vec()],
+            120,
+            Duration::from_secs(90),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .is_err());
     }
 }
