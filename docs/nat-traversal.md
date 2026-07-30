@@ -40,7 +40,7 @@ meshlake relay set --endpoint relay.example.com:51820 `
 meshlake relay set --endpoint relay.example.com:51820 --disable-port-mapping
 ```
 
-保存后重启 `meshlaked`。STUN 仅用于提高直连成功率；它不是中继，也不能穿透所有对称 NAT/CGNAT。
+保存后 `meshlaked` 会自动重建 UDP 传输线程。STUN 仅用于提高直连成功率；它不是中继，也不能穿透所有对称 NAT/CGNAT。
 
 ## Windows 防火墙
 

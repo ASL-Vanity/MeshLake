@@ -27,7 +27,9 @@ meshlake-cli.exe controller invite `
 meshlake-cli.exe network join-link --link '<管理员发来的完整链接>'
 ```
 
-客户端会先从链接固定的公钥验证 Planet 清单，自动保存控制器、UDP 中继和 STUN 配置，再向控制器兑换一次性成员资格。首次配置 Planet 后重启 `meshlaked.exe`，后台代理便会启动 UDP 直连与中继回退。
+客户端向控制器兑换成员资格后，会把邀请链接中的 Planet 地址和钉扎公钥与入网响应一起交给 `meshlaked`。后台代理亲自下载并验签清单，再把控制器、根节点、UDP 中继、STUN 和授权清单原子保存到该网络的记录中。传输线程会自动热重载，不需要重启 `meshlaked.exe`。
+
+每个网络拥有自己的 Planet 来源和钉扎控制器公钥，因此一台设备可以同时加入来自不同 Planet 的多个网络。向根节点和中继注册时只发送属于对应网络的成员证书，避免跨控制器注册互相影响。
 
 客户端必须同时提供该控制器的 Base64 公钥。代理会验证清单签名和公钥钉扎后才保存配置，网页返回的自称公钥不能作为信任依据。
 
@@ -53,4 +55,4 @@ meshlake-cli.exe planet set `
   --controller-public-key-base64 <管理员可信渠道提供的公钥>
 ```
 
-保存后重启 `meshlaked.exe`。这会自动应用 Planet 提供的中继与 STUN 配置；加入网络时仍使用管理员生成的一次性邀请链接。
+保存后后台代理会自动应用 Planet 提供的中继与 STUN 配置。该手动命令主要保留给旧版或开发配置；正常加入网络仍推荐使用管理员生成的一次性邀请链接，让 Planet 信息直接绑定到对应网络。

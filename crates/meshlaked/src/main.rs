@@ -16,12 +16,13 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
     accept_pairwise_handshake, parse_peer_identity, parse_session_routing_header,
     session_handshake_id, AgentStatus, DeviceId, EnrollmentResponse, InitiatorHandshake,
-    JoinedNetwork, MembershipCertificate, NetworkId, NetworkKey, PairwiseSessionKeys,
-    PeerPathStatus, PlanetManifest, PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration,
-    RootResponse, SignedRootResponse, TransportStatus, UpsertNetworkRequest, VirtualNetwork,
-    RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER,
-    RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED,
-    RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    JoinedNetwork, MembershipCertificate, NetworkControlPlane, NetworkId, NetworkKey,
+    PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy,
+    ReplayWindow, RootRegistration, RootResponse, SignedRootResponse, TransportStatus,
+    UpsertNetworkRequest, VirtualNetwork, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
+    RELAY_SESSION_RESPONSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -31,7 +32,7 @@ use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -118,6 +119,15 @@ struct PersistedState {
 struct TrustedEnrollment {
     enrollment: EnrollmentResponse,
     controller_public_key: Vec<u8>,
+    #[serde(default)]
+    control_plane: Option<EnrollmentControlPlane>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EnrollmentControlPlane {
+    controller_url: String,
+    #[serde(default)]
+    planet_manifest_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +158,7 @@ impl PersistedState {
         getrandom::fill(&mut identity_secret_key)
             .expect("operating-system randomness is required for node identity");
         Self {
-            schema_version: 2,
+            schema_version: 3,
             device_id: DeviceId(Uuid::new_v4()),
             identity_secret_key: identity_secret_key.to_vec(),
             networks: Vec::new(),
@@ -168,9 +178,47 @@ struct Agent {
     state: RwLock<PersistedState>,
     adapter: adapter::AdapterController,
     relay_running: AtomicBool,
+    transport_supervisor_running: AtomicBool,
+    transport_revision: AtomicU64,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
+    transport_reload: Notify,
     shutdown: Notify,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkTransportConfiguration {
+    relay_endpoints: Vec<SocketAddr>,
+    root_servers: Vec<PlanetRoot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransportConfiguration {
+    networks: HashMap<NetworkId, NetworkTransportConfiguration>,
+    relay_endpoints: Vec<SocketAddr>,
+    root_servers: Vec<PlanetRoot>,
+    stun_servers: Vec<String>,
+    upnp_enabled: bool,
+}
+
+impl TransportConfiguration {
+    fn is_empty(&self) -> bool {
+        self.relay_endpoints.is_empty() && self.root_servers.is_empty()
+    }
+
+    fn relay_endpoints_for(&self, network_id: NetworkId) -> &[SocketAddr] {
+        self.networks
+            .get(&network_id)
+            .map(|network| network.relay_endpoints.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn root_servers_for(&self, network_id: NetworkId) -> &[PlanetRoot] {
+        self.networks
+            .get(&network_id)
+            .map(|network| network.root_servers.as_slice())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
@@ -193,27 +241,40 @@ impl Agent {
             write_state(&path, &state)?;
             state
         };
+        let mut state_changed = false;
         if state.identity_secret_key.len() != 32 {
             let mut identity_secret_key = [0_u8; 32];
             getrandom::fill(&mut identity_secret_key)
                 .map_err(|error| anyhow::anyhow!("cannot generate node identity: {error:?}"))?;
             state.identity_secret_key = identity_secret_key.to_vec();
-            state.schema_version = 2;
-            write_state(&path, &state)?;
+            state_changed = true;
         }
         if state.relay_endpoints.is_empty() {
             if let Some(endpoint) = state.relay_endpoint {
                 state.relay_endpoints.push(endpoint);
-                write_state(&path, &state)?;
+                state_changed = true;
             }
+        }
+        if migrate_legacy_network_control_planes(&mut state) {
+            state_changed = true;
+        }
+        if state.schema_version < 3 {
+            state.schema_version = 3;
+            state_changed = true;
+        }
+        if state_changed {
+            write_state(&path, &state)?;
         }
         Ok(Self {
             path,
             state: RwLock::new(state),
             adapter: adapter::AdapterController::new(wintun_dll),
             relay_running: AtomicBool::new(false),
+            transport_supervisor_running: AtomicBool::new(false),
+            transport_revision: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
+            transport_reload: Notify::new(),
             shutdown: Notify::new(),
         })
     }
@@ -225,14 +286,15 @@ impl Agent {
             .unwrap_or_default();
         let device_id = state.device_id;
         let networks = state.networks.clone();
-        let mut configured_roots = state
+        let transport_configuration = transport_configuration_from_state(&state);
+        let mut configured_roots = transport_configuration
             .root_servers
             .iter()
             .flat_map(|root| root.endpoints.iter().copied())
             .collect::<Vec<_>>();
         configured_roots.sort_unstable();
         configured_roots.dedup();
-        let mut configured_relays = state.relay_endpoints.clone();
+        let mut configured_relays = transport_configuration.relay_endpoints;
         configured_relays.sort_unstable();
         configured_relays.dedup();
         drop(state);
@@ -306,11 +368,6 @@ impl Agent {
     }
 
     async fn configure_relay(&self, config: RelayConfig) -> Result<(), ApiError> {
-        if self.relay_running.load(Ordering::Acquire) {
-            return Err(ApiError::conflict(
-                "relay is running; restart meshlaked to change its endpoint",
-            ));
-        }
         let mut state = self.state.write().await;
         state.relay_endpoint = Some(config.endpoint);
         state.relay_endpoints = vec![config.endpoint];
@@ -322,15 +379,13 @@ impl Agent {
             .filter(|server| !server.is_empty())
             .take(8)
             .collect();
-        write_state(&self.path, &state).map_err(ApiError::internal)
+        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        drop(state);
+        self.request_transport_reload();
+        Ok(())
     }
 
     async fn configure_planet(&self, config: PlanetConfig) -> Result<(), ApiError> {
-        if self.relay_running.load(Ordering::Acquire) {
-            return Err(ApiError::conflict(
-                "relay is running; restart meshlaked to apply Planet settings",
-            ));
-        }
         let manifest_url = config.manifest_url.trim().to_owned();
         if !(manifest_url.starts_with("https://") || manifest_url.starts_with("http://")) {
             return Err(ApiError::bad_request(
@@ -392,17 +447,20 @@ impl Agent {
             controller_url: manifest.controller_url,
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
         });
-        write_state(&self.path, &state).map_err(ApiError::internal)
+        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        drop(state);
+        self.request_transport_reload();
+        Ok(())
     }
 
-    async fn relay_settings(&self) -> (Vec<SocketAddr>, bool, Vec<String>, Vec<PlanetRoot>) {
+    async fn transport_configuration(&self) -> TransportConfiguration {
         let state = self.state.read().await;
-        (
-            state.relay_endpoints.clone(),
-            state.upnp_enabled,
-            state.stun_servers.clone(),
-            state.root_servers.clone(),
-        )
+        transport_configuration_from_state(&state)
+    }
+
+    fn request_transport_reload(&self) {
+        self.transport_revision.fetch_add(1, Ordering::AcqRel);
+        self.transport_reload.notify_one();
     }
 
     async fn relay_snapshot(&self) -> (DeviceId, Vec<JoinedNetwork>) {
@@ -423,28 +481,36 @@ impl Agent {
     }
 
     async fn start_relay_worker(self: &Arc<Self>) -> Result<()> {
-        let (relay_endpoints, upnp_enabled, stun_servers, root_servers) =
-            self.relay_settings().await;
-        if relay_endpoints.is_empty() && root_servers.is_empty() {
-            return Ok(());
-        }
-        if self.relay_running.swap(true, Ordering::AcqRel) {
+        if self
+            .transport_supervisor_running
+            .swap(true, Ordering::AcqRel)
+        {
             return Ok(());
         }
         let agent = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let result = run_relay_worker(
-                    Arc::clone(&agent),
-                    relay_endpoints.clone(),
-                    upnp_enabled,
-                    stun_servers.clone(),
-                    root_servers.clone(),
-                )
-                .await;
-                *agent.transport_health.write().await = TransportHealth::default();
-                if result.is_ok() || agent.shutting_down.load(Ordering::Acquire) {
+                if agent.shutting_down.load(Ordering::Acquire) {
                     break;
+                }
+                let revision = agent.transport_revision.load(Ordering::Acquire);
+                let configuration = agent.transport_configuration().await;
+                if configuration.is_empty() {
+                    agent.relay_running.store(false, Ordering::Release);
+                    tokio::select! {
+                        _ = agent.transport_reload.notified() => continue,
+                        _ = agent.shutdown.notified() => break,
+                    }
+                }
+                agent.relay_running.store(true, Ordering::Release);
+                let result = run_relay_worker(Arc::clone(&agent), configuration, revision).await;
+                agent.relay_running.store(false, Ordering::Release);
+                *agent.transport_health.write().await = TransportHealth::default();
+                if agent.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
+                if agent.transport_revision.load(Ordering::Acquire) != revision {
+                    continue;
                 }
                 if let Err(error) = result {
                     eprintln!(
@@ -453,10 +519,14 @@ impl Agent {
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = agent.transport_reload.notified() => {}
                     _ = agent.shutdown.notified() => break,
                 }
             }
             agent.relay_running.store(false, Ordering::Release);
+            agent
+                .transport_supervisor_running
+                .store(false, Ordering::Release);
             *agent.transport_health.write().await = TransportHealth::default();
         });
         Ok(())
@@ -482,6 +552,7 @@ impl Agent {
             assigned_addresses: Vec::new(),
             certificate: None,
             network_key: Vec::new(),
+            control_plane: NetworkControlPlane::default(),
         };
         state.networks.push(joined.clone());
         write_state(&self.path, &state).map_err(ApiError::internal)?;
@@ -501,21 +572,28 @@ impl Agent {
             .map_err(ApiError::internal)?;
         state.networks.retain(|entry| entry.network.id != id);
         state.authorizations.remove(&id);
-        write_state(&self.path, &state).map_err(ApiError::internal)
+        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        drop(state);
+        self.request_transport_reload();
+        Ok(())
     }
 
     async fn enroll_network(
         &self,
         trusted_enrollment: TrustedEnrollment,
     ) -> Result<JoinedNetwork, ApiError> {
-        let enrollment = trusted_enrollment.enrollment;
+        let TrustedEnrollment {
+            enrollment,
+            controller_public_key,
+            control_plane,
+        } = trusted_enrollment;
         enrollment
             .certificate
-            .verify_from_controller(&trusted_enrollment.controller_public_key, now())
+            .verify_from_controller(&controller_public_key, now())
             .map_err(ApiError::bad_request)?;
         enrollment
             .authorization
-            .verify_from_controller(&trusted_enrollment.controller_public_key, now())
+            .verify_from_controller(&controller_public_key, now())
             .map_err(ApiError::bad_request)?;
         if !enrollment.authorization.authorizes(&enrollment.certificate) {
             return Err(ApiError::bad_request(
@@ -528,16 +606,13 @@ impl Agent {
                 "certificate network id does not match enrollment",
             ));
         }
+        let persisted_control_plane = resolve_enrollment_control_plane(
+            control_plane,
+            &controller_public_key,
+            enrollment.authorization.clone(),
+        )
+        .await?;
         let mut state = self.state.write().await;
-        if state
-            .networks
-            .iter()
-            .any(|entry| entry.network.id == enrollment.network.id)
-        {
-            return Err(ApiError::conflict(
-                "this device already belongs to that network",
-            ));
-        }
         if enrollment.certificate.claims.device_id != state.device_id {
             return Err(ApiError::bad_request(
                 "certificate belongs to another device",
@@ -557,18 +632,58 @@ impl Agent {
             assigned_addresses: enrollment.certificate.claims.assigned_addresses.clone(),
             certificate: Some(enrollment.certificate),
             network_key: enrollment.network_key,
+            control_plane: persisted_control_plane,
         };
-        state.networks.push(joined.clone());
-        state
-            .authorizations
-            .insert(joined.network.id, enrollment.authorization);
+        let previous = if let Some(index) = state
+            .networks
+            .iter()
+            .position(|entry| entry.network.id == joined.network.id)
+        {
+            let existing = &state.networks[index];
+            let existing_controller_key = if !existing
+                .control_plane
+                .pinned_controller_public_key
+                .is_empty()
+            {
+                existing
+                    .control_plane
+                    .pinned_controller_public_key
+                    .as_slice()
+            } else {
+                existing
+                    .certificate
+                    .as_ref()
+                    .map(|certificate| certificate.controller_public_key.as_slice())
+                    .unwrap_or_default()
+            };
+            if !existing_controller_key.is_empty()
+                && existing_controller_key != controller_public_key.as_slice()
+            {
+                return Err(ApiError::conflict(
+                    "this network id is already pinned to a different controller",
+                ));
+            }
+            Some(std::mem::replace(
+                &mut state.networks[index],
+                joined.clone(),
+            ))
+        } else {
+            state.networks.push(joined.clone());
+            None
+        };
         write_state(&self.path, &state).map_err(ApiError::internal)?;
         drop(state);
         if self.adapter.is_active() {
+            if let Some(previous) = &previous {
+                self.adapter
+                    .remove_network(previous)
+                    .map_err(ApiError::internal)?;
+            }
             self.adapter
                 .configure_networks(std::slice::from_ref(&joined))
                 .map_err(ApiError::internal)?;
         }
+        self.request_transport_reload();
         Ok(joined)
     }
 
@@ -588,6 +703,248 @@ fn identity_signing_key(state: &PersistedState) -> Result<SigningKey> {
         .try_into()
         .context("node identity secret key is invalid")?;
     Ok(SigningKey::from_bytes(&bytes))
+}
+
+async fn resolve_enrollment_control_plane(
+    configured: Option<EnrollmentControlPlane>,
+    pinned_controller_public_key: &[u8],
+    authorization_manifest: meshlake_core::NetworkAuthorizationManifest,
+) -> Result<NetworkControlPlane, ApiError> {
+    let mut control_plane = NetworkControlPlane {
+        pinned_controller_public_key: pinned_controller_public_key.to_vec(),
+        authorization_manifest: Some(authorization_manifest),
+        ..NetworkControlPlane::default()
+    };
+    let Some(configured) = configured else {
+        return Ok(control_plane);
+    };
+    let controller_url = normalize_http_url(&configured.controller_url, "controller URL")?;
+    control_plane.controller_url = Some(controller_url.clone());
+
+    let Some(manifest_url) = configured
+        .planet_manifest_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(control_plane);
+    };
+    let manifest_url = normalize_http_url(manifest_url, "Planet manifest URL")?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(ApiError::internal)?
+        .get(&manifest_url)
+        .send()
+        .await
+        .map_err(ApiError::bad_request)?;
+    if !response.status().is_success() {
+        return Err(ApiError::bad_request(format!(
+            "Planet manifest request returned {}",
+            response.status()
+        )));
+    }
+    let manifest: PlanetManifest = response.json().await.map_err(ApiError::bad_request)?;
+    manifest
+        .verify_from_controller(pinned_controller_public_key, now())
+        .map_err(ApiError::bad_request)?;
+    let manifest_controller_url =
+        normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
+    if manifest_controller_url != controller_url {
+        return Err(ApiError::bad_request(
+            "Planet controller URL does not match the invitation controller URL",
+        ));
+    }
+
+    let mut roots = manifest.roots;
+    roots.sort_by_key(|root| root.priority);
+    let mut relays = manifest.relays;
+    relays.sort_by_key(|relay| relay.priority);
+    if relays.is_empty() {
+        relays.push(PlanetRelay {
+            endpoint: manifest.relay_endpoint,
+            priority: 0,
+        });
+    }
+    let mut stun_servers = manifest
+        .stun_servers
+        .into_iter()
+        .map(|server| server.trim().to_owned())
+        .filter(|server| !server.is_empty())
+        .take(8)
+        .collect::<Vec<_>>();
+    stun_servers.sort();
+    stun_servers.dedup();
+    control_plane.planet_manifest_url = Some(manifest_url);
+    control_plane.verified_roots = roots;
+    control_plane.verified_relays = relays;
+    control_plane.verified_stun_servers = stun_servers;
+    Ok(control_plane)
+}
+
+fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() || !(value.starts_with("https://") || value.starts_with("http://")) {
+        return Err(ApiError::bad_request(format!(
+            "{description} must start with https:// or http://"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
+    let legacy_controller_key = state
+        .planet
+        .as_ref()
+        .and_then(|planet| {
+            STANDARD
+                .decode(planet.controller_public_key_base64.trim())
+                .ok()
+        })
+        .filter(|key| key.len() == 32);
+    let legacy_relays = state
+        .relay_endpoints
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(priority, endpoint)| PlanetRelay {
+            endpoint,
+            priority: priority.min(u16::MAX as usize) as u16,
+        })
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for joined in &mut state.networks {
+        let control_plane = &mut joined.control_plane;
+        if control_plane.controller_url.is_none() {
+            if let Some(planet) = &state.planet {
+                control_plane.controller_url = Some(planet.controller_url.clone());
+                changed = true;
+            }
+        }
+        if control_plane.pinned_controller_public_key.is_empty() {
+            let key = joined
+                .certificate
+                .as_ref()
+                .map(|certificate| certificate.controller_public_key.clone())
+                .filter(|key| key.len() == 32)
+                .or_else(|| legacy_controller_key.clone());
+            if let Some(key) = key {
+                control_plane.pinned_controller_public_key = key;
+                changed = true;
+            }
+        }
+        if control_plane.planet_manifest_url.is_none() {
+            if let Some(planet) = &state.planet {
+                control_plane.planet_manifest_url = Some(planet.manifest_url.clone());
+                changed = true;
+            }
+        }
+        if control_plane.verified_roots.is_empty() && !state.root_servers.is_empty() {
+            control_plane.verified_roots = state.root_servers.clone();
+            changed = true;
+        }
+        if control_plane.verified_relays.is_empty() && !legacy_relays.is_empty() {
+            control_plane.verified_relays = legacy_relays.clone();
+            changed = true;
+        }
+        if control_plane.verified_stun_servers.is_empty() && !state.stun_servers.is_empty() {
+            control_plane.verified_stun_servers = state.stun_servers.clone();
+            changed = true;
+        }
+        if control_plane.authorization_manifest.is_none() {
+            if let Some(authorization) = state.authorizations.get(&joined.network.id).cloned() {
+                control_plane.authorization_manifest = Some(authorization);
+                changed = true;
+            }
+        }
+    }
+    if !state.authorizations.is_empty()
+        && state.networks.iter().all(|joined| {
+            !state.authorizations.contains_key(&joined.network.id)
+                || joined.control_plane.authorization_manifest.is_some()
+        })
+    {
+        state.authorizations.clear();
+        changed = true;
+    }
+    changed
+}
+
+fn transport_configuration_from_state(state: &PersistedState) -> TransportConfiguration {
+    let mut legacy_relays = state.relay_endpoints.clone();
+    if legacy_relays.is_empty() {
+        legacy_relays.extend(state.relay_endpoint);
+    }
+    legacy_relays.dedup();
+
+    let mut configuration = TransportConfiguration {
+        upnp_enabled: state.upnp_enabled,
+        stun_servers: state
+            .stun_servers
+            .iter()
+            .map(|server| server.trim().to_owned())
+            .filter(|server| !server.is_empty())
+            .collect(),
+        ..TransportConfiguration::default()
+    };
+
+    for joined in &state.networks {
+        let mut relays = joined.control_plane.verified_relays.clone();
+        relays.sort_by_key(|relay| relay.priority);
+        let mut relay_endpoints = relays
+            .into_iter()
+            .map(|relay| relay.endpoint)
+            .collect::<Vec<_>>();
+        if relay_endpoints.is_empty() {
+            relay_endpoints = legacy_relays.clone();
+        }
+        relay_endpoints.dedup();
+
+        let mut root_servers = joined.control_plane.verified_roots.clone();
+        root_servers.sort_by_key(|root| root.priority);
+        if root_servers.is_empty() {
+            root_servers = state.root_servers.clone();
+            root_servers.sort_by_key(|root| root.priority);
+        }
+
+        for endpoint in &relay_endpoints {
+            if !configuration.relay_endpoints.contains(endpoint) {
+                configuration.relay_endpoints.push(*endpoint);
+            }
+        }
+        for root in &root_servers {
+            if !configuration.root_servers.contains(root) {
+                configuration.root_servers.push(root.clone());
+            }
+        }
+        for server in &joined.control_plane.verified_stun_servers {
+            let server = server.trim();
+            if !server.is_empty()
+                && !configuration
+                    .stun_servers
+                    .iter()
+                    .any(|configured| configured == server)
+            {
+                configuration.stun_servers.push(server.to_owned());
+            }
+        }
+        configuration.networks.insert(
+            joined.network.id,
+            NetworkTransportConfiguration {
+                relay_endpoints,
+                root_servers,
+            },
+        );
+    }
+
+    if state.networks.is_empty() {
+        configuration.relay_endpoints = legacy_relays;
+        configuration.root_servers = state.root_servers.clone();
+        configuration.root_servers.sort_by_key(|root| root.priority);
+    }
+    configuration.stun_servers.sort();
+    configuration.stun_servers.dedup();
+    configuration
 }
 
 fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
@@ -1509,17 +1866,21 @@ async fn receive_optional(
 
 async fn run_relay_worker(
     agent: Arc<Agent>,
-    configured_relay_endpoints: Vec<SocketAddr>,
-    upnp_enabled: bool,
-    configured_stun_servers: Vec<String>,
-    root_servers: Vec<PlanetRoot>,
+    mut configuration: TransportConfiguration,
+    configuration_revision: u64,
 ) -> Result<()> {
     let sockets = TransportSockets::bind().await?;
     let (_, identity, _) = agent.root_registration_material().await?;
-    let relay_endpoints = configured_relay_endpoints
-        .into_iter()
-        .filter(|endpoint| sockets.supports(*endpoint))
-        .collect::<Vec<_>>();
+    configuration
+        .relay_endpoints
+        .retain(|endpoint| sockets.supports(*endpoint));
+    for network in configuration.networks.values_mut() {
+        network
+            .relay_endpoints
+            .retain(|endpoint| sockets.supports(*endpoint));
+    }
+    let relay_endpoints = configuration.relay_endpoints.clone();
+    let root_servers = configuration.root_servers.clone();
     trace_transport(format!(
         "IPv4 UDP transport bound at {} for {} relay endpoint(s)",
         sockets.ipv4.local_addr()?,
@@ -1543,7 +1904,7 @@ async fn run_relay_worker(
                 .flat_map(|root| root.endpoints.iter().copied())
                 .find(SocketAddr::is_ipv4)
         });
-    let mut port_mapping = if upnp_enabled {
+    let mut port_mapping = if configuration.upnp_enabled {
         if let Some(probe_endpoint) = ipv4_probe_endpoint {
             match port_mapping::Mapping::establish(
                 probe_endpoint,
@@ -1569,7 +1930,7 @@ async fn run_relay_worker(
     } else {
         None
     };
-    let mut stun_servers = resolve_stun_servers(&configured_stun_servers).await;
+    let mut stun_servers = resolve_stun_servers(&configuration.stun_servers).await;
     stun_servers.retain(|server| sockets.supports(*server));
     if !stun_servers.is_empty() {
         trace_transport(format!(
@@ -1604,7 +1965,7 @@ async fn run_relay_worker(
                 receive_udp_packet(
                     &agent,
                     &sockets,
-                    &relay_endpoints,
+                    &configuration,
                     remote,
                     &incoming_ipv4[..size],
                     &mut peers,
@@ -1612,7 +1973,6 @@ async fn run_relay_worker(
                     &mut seen_handshakes,
                     &identity,
                     &mut stun_transactions,
-                    &root_servers,
                     &mut root_transactions,
                     &mut advertised_candidates,
                     &mut relay_health,
@@ -1623,7 +1983,7 @@ async fn run_relay_worker(
                 receive_udp_packet(
                     &agent,
                     &sockets,
-                    &relay_endpoints,
+                    &configuration,
                     remote,
                     &incoming_ipv6[..size],
                     &mut peers,
@@ -1631,13 +1991,18 @@ async fn run_relay_worker(
                     &mut seen_handshakes,
                     &identity,
                     &mut stun_transactions,
-                    &root_servers,
                     &mut root_transactions,
                     &mut advertised_candidates,
                     &mut relay_health,
                 ).await?;
             }
             _ = tick.tick() => {
+                if agent.transport_revision.load(Ordering::Acquire)
+                    != configuration_revision
+                {
+                    trace_transport("transport configuration changed; rebuilding UDP sockets");
+                    break;
+                }
                 if tokio::time::Instant::now() >= next_port_mapping_refresh {
                     if let Some(mapping) = port_mapping.as_mut() {
                         match mapping.renew() {
@@ -1695,7 +2060,7 @@ async fn run_relay_worker(
                         };
                         send_peer_routed_packet(
                             &sockets,
-                            &relay_endpoints,
+                            configuration.relay_endpoints_for(network_id),
                             &relay_health,
                             network,
                             route,
@@ -1751,36 +2116,23 @@ async fn run_relay_worker(
                         let mut registration = Vec::from(RELAY_MAGIC);
                         registration.push(RELAY_REGISTER_SIGNED);
                         registration.extend_from_slice(&serde_json::to_vec(&signed)?);
-                        for relay_endpoint in &relay_endpoints {
+                        for relay_endpoint in configuration
+                            .relay_endpoints_for(certificate.claims.network_id)
+                        {
                             sockets.send_to(&registration, *relay_endpoint).await;
                         }
                         trace_transport(format!(
                             "sent signed relay registration for network {}",
                             certificate.claims.network_id.0
                         ));
-                    }
-                    for server in &stun_servers {
-                        let transaction_id = new_stun_transaction_id();
-                        if sockets
-                            .send_to(&stun_binding_request(transaction_id), *server)
-                            .await
+                        for root in
+                            configuration.root_servers_for(certificate.claims.network_id)
                         {
-                            stun_transactions.insert(
-                                transaction_id,
-                                StunTransaction {
-                                    server: *server,
-                                    issued_at: Instant::now(),
-                                },
-                            );
-                        }
-                    }
-                    if !certificates.is_empty() {
-                        for root in &root_servers {
                             for root_endpoint in root.endpoints.iter().copied() {
                                 let nonce = new_root_nonce();
                                 let registration = RootRegistration::sign(
                                     root_device,
-                                    certificates.clone(),
+                                    vec![certificate.clone()],
                                     advertised_candidates.clone(),
                                     now(),
                                     nonce,
@@ -1800,6 +2152,21 @@ async fn run_relay_worker(
                                     );
                                 }
                             }
+                        }
+                    }
+                    for server in &stun_servers {
+                        let transaction_id = new_stun_transaction_id();
+                        if sockets
+                            .send_to(&stun_binding_request(transaction_id), *server)
+                            .await
+                        {
+                            stun_transactions.insert(
+                                transaction_id,
+                                StunTransaction {
+                                    server: *server,
+                                    issued_at: Instant::now(),
+                                },
+                            );
                         }
                     }
                     stun_transactions.retain(|_, transaction| {
@@ -1842,7 +2209,7 @@ async fn run_relay_worker(
                         };
                         send_peer_routed_packet(
                             &sockets,
-                            &relay_endpoints,
+                            configuration.relay_endpoints_for(network.network.id),
                             &relay_health,
                             network,
                             &route,
@@ -1862,7 +2229,7 @@ async fn run_relay_worker(
 async fn receive_udp_packet(
     agent: &Agent,
     sockets: &TransportSockets,
-    relay_endpoints: &[SocketAddr],
+    configuration: &TransportConfiguration,
     remote: SocketAddr,
     packet: &[u8],
     peers: &mut HashMap<PeerKey, PeerRoute>,
@@ -1870,11 +2237,12 @@ async fn receive_udp_packet(
     seen_handshakes: &mut HashMap<(PeerKey, [u8; 16]), Instant>,
     identity: &SigningKey,
     stun_transactions: &mut HashMap<[u8; 12], StunTransaction>,
-    root_servers: &[PlanetRoot],
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
     relay_health: &mut HashMap<SocketAddr, RelayHealth>,
 ) -> Result<()> {
+    let relay_endpoints = configuration.relay_endpoints.as_slice();
+    let root_servers = configuration.root_servers.as_slice();
     if let Some((transaction_id, candidate)) = parse_stun_binding_success(packet) {
         if let Some(transaction) = stun_transactions.remove(&transaction_id) {
             if transaction.server == remote
@@ -1888,7 +2256,8 @@ async fn receive_udp_packet(
                     if network.certificate.is_some() {
                         let announcement =
                             candidate_announcement(network.network.id, device, candidate);
-                        for relay_endpoint in relay_endpoints {
+                        for relay_endpoint in configuration.relay_endpoints_for(network.network.id)
+                        {
                             sockets.send_to(&announcement, *relay_endpoint).await;
                         }
                     }
@@ -2792,7 +3161,9 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meshlake_core::{MembershipClaims, RelayPolicy};
+    use meshlake_core::{
+        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy,
+    };
 
     fn test_joined_network() -> JoinedNetwork {
         JoinedNetwork {
@@ -2809,6 +3180,7 @@ mod tests {
             ],
             certificate: None,
             network_key: vec![7; 32],
+            control_plane: NetworkControlPlane::default(),
         }
     }
 
@@ -3212,6 +3584,298 @@ mod tests {
     fn punch_ack_is_not_answered_again() {
         assert_eq!(punch_response_kind(RELAY_PUNCH), Some(RELAY_PUNCH_ACK));
         assert_eq!(punch_response_kind(RELAY_PUNCH_ACK), None);
+    }
+
+    #[test]
+    fn transport_configuration_keeps_planet_relays_scoped_per_network() {
+        let mut first = test_joined_network();
+        let first_id = first.network.id;
+        first.control_plane.verified_relays = vec![PlanetRelay {
+            endpoint: "203.0.113.10:51820".parse().unwrap(),
+            priority: 0,
+        }];
+        first.control_plane.verified_roots = vec![PlanetRoot {
+            public_key: vec![1; 32],
+            endpoints: vec!["203.0.113.10:51819".parse().unwrap()],
+            priority: 0,
+        }];
+        first.control_plane.verified_stun_servers = vec!["stun-a.example:3478".into()];
+
+        let mut second = test_joined_network();
+        second.network.id = NetworkId(Uuid::from_u128(91));
+        second.network.name = "planet-b".into();
+        second.control_plane.verified_relays = vec![PlanetRelay {
+            endpoint: "198.51.100.20:51820".parse().unwrap(),
+            priority: 0,
+        }];
+        second.control_plane.verified_roots = vec![PlanetRoot {
+            public_key: vec![2; 32],
+            endpoints: vec!["198.51.100.20:51819".parse().unwrap()],
+            priority: 0,
+        }];
+        second.control_plane.verified_stun_servers = vec!["stun-b.example:3478".into()];
+        let second_id = second.network.id;
+
+        let mut state = PersistedState::new();
+        state.relay_endpoints = vec!["192.0.2.50:51820".parse().unwrap()];
+        state.networks = vec![first, second];
+        let configuration = transport_configuration_from_state(&state);
+
+        assert_eq!(
+            configuration.relay_endpoints_for(first_id),
+            &["203.0.113.10:51820".parse().unwrap()]
+        );
+        assert_eq!(
+            configuration.relay_endpoints_for(second_id),
+            &["198.51.100.20:51820".parse().unwrap()]
+        );
+        assert_eq!(configuration.relay_endpoints.len(), 2);
+        assert_eq!(configuration.root_servers.len(), 2);
+        assert_eq!(
+            configuration.stun_servers,
+            vec!["stun-a.example:3478", "stun-b.example:3478"]
+        );
+    }
+
+    #[test]
+    fn legacy_global_planet_state_migrates_into_each_network() {
+        let controller = SigningKey::from_bytes(&[31_u8; 32]);
+        let mut state = PersistedState::new();
+        let joined = test_joined_network();
+        let network_id = joined.network.id;
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            3,
+            4,
+            Vec::new(),
+            Vec::new(),
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+        state.networks.push(joined);
+        state.relay_endpoints = vec!["203.0.113.30:51820".parse().unwrap()];
+        state.root_servers = vec![PlanetRoot {
+            public_key: vec![9; 32],
+            endpoints: vec!["203.0.113.30:51819".parse().unwrap()],
+            priority: 0,
+        }];
+        state.stun_servers = vec!["stun.example:3478".into()];
+        state.planet = Some(PersistedPlanet {
+            manifest_url: "https://planet.example/v1/planet".into(),
+            controller_url: "https://planet.example".into(),
+            controller_public_key_base64: STANDARD.encode(controller.verifying_key().to_bytes()),
+        });
+        state
+            .authorizations
+            .insert(network_id, authorization.clone());
+
+        assert!(migrate_legacy_network_control_planes(&mut state));
+        let control_plane = &state.networks[0].control_plane;
+        assert_eq!(
+            control_plane.controller_url.as_deref(),
+            Some("https://planet.example")
+        );
+        assert_eq!(
+            control_plane.planet_manifest_url.as_deref(),
+            Some("https://planet.example/v1/planet")
+        );
+        assert_eq!(control_plane.verified_relays.len(), 1);
+        assert_eq!(control_plane.verified_roots.len(), 1);
+        assert_eq!(
+            control_plane.authorization_manifest.as_ref(),
+            Some(&authorization)
+        );
+        assert!(state.authorizations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrollment_control_plane_fetches_and_pins_planet_manifest() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let controller = SigningKey::from_bytes(&[32_u8; 32]);
+        let network_id = NetworkId(Uuid::from_u128(320));
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            1,
+            1,
+            Vec::new(),
+            Vec::new(),
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+        let manifest = PlanetManifest::sign_v2(
+            "http://controller.example".into(),
+            vec![PlanetRoot {
+                public_key: vec![4; 32],
+                endpoints: vec!["203.0.113.40:51819".parse().unwrap()],
+                priority: 0,
+            }],
+            vec![PlanetRelay {
+                endpoint: "203.0.113.40:51820".parse().unwrap(),
+                priority: 0,
+            }],
+            vec!["stun.example:3478".into()],
+            now(),
+            Some(now() + 90),
+            &controller,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        let control_plane = resolve_enrollment_control_plane(
+            Some(EnrollmentControlPlane {
+                controller_url: "http://controller.example".into(),
+                planet_manifest_url: Some(format!("http://{address}/v1/planet")),
+            }),
+            &controller.verifying_key().to_bytes(),
+            authorization.clone(),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            control_plane.controller_url.as_deref(),
+            Some("http://controller.example")
+        );
+        assert_eq!(control_plane.verified_roots.len(), 1);
+        assert_eq!(control_plane.verified_relays.len(), 1);
+        assert_eq!(
+            control_plane.authorization_manifest.as_ref(),
+            Some(&authorization)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_enrollment_from_the_same_controller_is_idempotent() {
+        let directory = env::temp_dir().join(format!("meshlake-enroll-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let state = agent.state.read().await;
+        let device_id = state.device_id;
+        let device_public_key = identity_signing_key(&state)
+            .unwrap()
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        drop(state);
+
+        let controller = SigningKey::from_bytes(&[33_u8; 32]);
+        let network_id = NetworkId(Uuid::from_u128(330));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id,
+                device_id,
+                device_public_key: device_public_key.clone(),
+                assigned_addresses: vec!["100.64.33.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.33.0/24".into()],
+                issued_at_unix_seconds: now(),
+                expires_at_unix_seconds: Some(now() + 86_400),
+            },
+            Uuid::from_u128(331),
+            1,
+            &controller,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            1,
+            1,
+            vec![AuthorizedMembership {
+                device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key,
+                network_key_epoch: 1,
+            }],
+            Vec::new(),
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+        let trusted = TrustedEnrollment {
+            enrollment: EnrollmentResponse {
+                network: VirtualNetwork {
+                    id: network_id,
+                    name: "retry".into(),
+                    ipv4_prefix: "100.64.33.0/24".into(),
+                    ipv6_prefix: None,
+                    relay_policy: RelayPolicy::Preferred,
+                },
+                certificate,
+                network_key: vec![3; 32],
+                authorization,
+            },
+            controller_public_key: controller.verifying_key().to_bytes().to_vec(),
+            control_plane: Some(EnrollmentControlPlane {
+                controller_url: "https://controller.example".into(),
+                planet_manifest_url: None,
+            }),
+        };
+
+        agent.enroll_network(trusted.clone()).await.unwrap();
+        agent.enroll_network(trusted).await.unwrap();
+        let state = agent.state.read().await;
+        assert_eq!(state.networks.len(), 1);
+        assert_eq!(state.networks[0].network.id, network_id);
+        drop(state);
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_supervisor_hot_starts_after_configuration_change() {
+        let directory = env::temp_dir().join(format!("meshlake-reload-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Arc::new(Agent::open(path.clone(), adapter::default_wintun_path()).unwrap());
+        agent.start_relay_worker().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!agent.relay_running.load(Ordering::Acquire));
+
+        {
+            let mut state = agent.state.write().await;
+            state.upnp_enabled = false;
+            state.relay_endpoint = Some("127.0.0.1:9".parse().unwrap());
+            state.relay_endpoints = vec!["127.0.0.1:9".parse().unwrap()];
+        }
+        agent.request_transport_reload();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !agent.relay_running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport worker should hot-start after configuration changes");
+
+        agent.shutting_down.store(true, Ordering::Release);
+        agent.shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while agent.transport_supervisor_running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport supervisor should stop cleanly");
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
     }
 
     #[test]

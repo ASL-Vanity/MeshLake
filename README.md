@@ -22,6 +22,8 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - 已验证成员目录：根据控制器签名证书把虚拟 IPv4/IPv6 地址映射到设备 ID，普通数据只发送给目标设备；详见 [`docs/unicast-routing.md`](docs/unicast-routing.md)。
 - 成对加密会话：成员使用长期 Ed25519 设备身份签名一次性 X25519 握手，并为两个传输方向派生不同的临时密钥；详见 [`docs/pairwise-sessions.md`](docs/pairwise-sessions.md)。
 - 在线授权 P2 基础：证书已具有唯一 ID 和网络密钥版本；控制器可发布签名授权清单、验证设备签名刷新请求，并在移除成员时轮换网络密钥。后台自动刷新和即时断会话仍在开发；详见 [`docs/authorization-revocation.md`](docs/authorization-revocation.md)。
+- 每网络控制面：每个已加入网络分别保存控制器 URL、钉扎公钥、签名授权清单以及经验证的 Planet 根节点、中继和 STUN 配置；来自不同 Planet 的网络不再共用一份设备全局配置。旧状态会在启动时自动迁移。
+- 传输热重载：加入新网络或修改手动 Planet/中继配置后，后台代理会自动重建 UDP 传输线程，不再要求退出或重启 `meshlaked`。
 
 尚未实现，因此当前版本**不能作为正式虚拟局域网产品使用**：
 
@@ -39,7 +41,7 @@ meshlake-cli ─────────┼──> meshlaked ──> Wintun/TUN 
                       └──> controller（入网、地址与成员证书）
 ```
 
-每个逻辑网络都有独立的网络 ID、地址前缀、成员证书与中继策略。单台设备的一个后台代理可保存多个已加入网络；Windows 上的一个三层虚拟网卡承载这些逻辑网络，这也适配移动系统通常只允许一个 VPN 接口的限制。
+每个逻辑网络都有独立的网络 ID、地址前缀、成员证书、控制器信任、公网发现配置与中继策略。单台设备的一个后台代理可保存来自不同 Planet 的多个已加入网络；Windows 上的一个三层虚拟网卡承载这些逻辑网络，这也适配移动系统通常只允许一个 VPN 接口的限制。
 
 ## 安全模型（当前）
 
@@ -126,7 +128,7 @@ meshlake-cli.exe controller network list `
 cargo run -p meshlake-relay -- --controller-public-key-base64 <控制器公钥>
 ```
 
-在每台 Windows 设备上保存中继 UDP 地址，然后重启后台代理以连接中继：
+在每台 Windows 设备上保存中继 UDP 地址；后台代理会自动重载传输配置，无需重启：
 
 ```powershell
 meshlake relay set --endpoint <中继公网IP或域名:51820>
@@ -152,4 +154,4 @@ meshlake-cli network join `
 
 ## 下一步
 
-下一阶段将补足 TLS 控制面、在线证书吊销、DNS/自定义路由、生产级平台密钥保护、会话可观测状态及更完整的跨主机故障测试。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。
+下一阶段将优先补足在线授权清单自动刷新、成员即时吊销和网络密钥 epoch 更新，然后继续完成 TLS 控制面、DNS/自定义路由、生产级平台密钥保护、会话可观测状态及更完整的跨主机故障测试。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。

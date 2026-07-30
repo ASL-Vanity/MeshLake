@@ -41,6 +41,51 @@ pub struct Membership {
     pub allowed_routes: Vec<String>,
 }
 
+/// Verified control-plane data owned by one joined virtual network.
+///
+/// This deliberately lives with the network instead of in device-global
+/// state: one MeshLake agent may join networks that use different controllers
+/// and Planet deployments. Values in this structure are written only after
+/// their signed source data has been verified against the pinned controller
+/// public key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkControlPlane {
+    /// Controller URL used for enrollment and later authorization refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_url: Option<String>,
+    /// Raw 32-byte Ed25519 controller public key pinned during enrollment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_controller_public_key: Vec<u8>,
+    /// URL from which the currently verified Planet manifest was obtained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planet_manifest_url: Option<String>,
+    /// Roots copied from a verified Planet manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_roots: Vec<crate::crypto::PlanetRoot>,
+    /// Relays copied from a verified Planet manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_relays: Vec<crate::crypto::PlanetRelay>,
+    /// STUN server names copied from a verified Planet manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_stun_servers: Vec<String>,
+    /// Latest controller-signed authorization state for this network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_manifest: Option<crate::authorization::NetworkAuthorizationManifest>,
+}
+
+impl NetworkControlPlane {
+    /// Returns whether this contains no persisted control-plane information.
+    pub fn is_empty(&self) -> bool {
+        self.controller_url.is_none()
+            && self.pinned_controller_public_key.is_empty()
+            && self.planet_manifest_url.is_none()
+            && self.verified_roots.is_empty()
+            && self.verified_relays.is_empty()
+            && self.verified_stun_servers.is_empty()
+            && self.authorization_manifest.is_none()
+    }
+}
+
 /// A network currently enrolled on this device. It contains no enrollment secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinedNetwork {
@@ -52,6 +97,9 @@ pub struct JoinedNetwork {
     /// Persisted only by a device agent. It is never returned by the controller network list.
     #[serde(default)]
     pub network_key: Vec<u8>,
+    /// Per-network controller and Planet state. Older device records omit it.
+    #[serde(default, skip_serializing_if = "NetworkControlPlane::is_empty")]
+    pub control_plane: NetworkControlPlane,
 }
 
 /// JSON request accepted by the local MeshLake agent to create or join a network.
@@ -157,6 +205,7 @@ impl UpsertNetworkRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NetworkAuthorizationManifest, PlanetRelay, PlanetRoot};
 
     #[test]
     fn rejects_an_empty_network_name() {
@@ -209,5 +258,90 @@ mod tests {
         )
         .unwrap();
         assert!(status.peer_paths.is_empty());
+    }
+
+    #[test]
+    fn older_joined_network_defaults_control_plane_metadata() {
+        let joined: JoinedNetwork = serde_json::from_str(
+            r#"{
+                "network": {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "name": "legacy-network",
+                    "ipv4_prefix": "100.64.1.0/24",
+                    "ipv6_prefix": null,
+                    "relay_policy": "Preferred"
+                },
+                "assigned_addresses": ["100.64.1.2"],
+                "certificate": null,
+                "network_key": [1, 2, 3]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(joined.control_plane, NetworkControlPlane::default());
+        assert!(joined.control_plane.is_empty());
+
+        let serialized = serde_json::to_value(&joined).unwrap();
+        assert!(serialized.get("control_plane").is_none());
+    }
+
+    #[test]
+    fn control_plane_round_trips_verified_per_network_metadata() {
+        let joined = JoinedNetwork {
+            network: VirtualNetwork {
+                id: NetworkId(Uuid::from_u128(2)),
+                name: "planet-a".into(),
+                ipv4_prefix: "100.64.2.0/24".into(),
+                ipv6_prefix: Some("fd42:4d4c:2::/64".into()),
+                relay_policy: RelayPolicy::Preferred,
+            },
+            assigned_addresses: vec!["100.64.2.2".parse().unwrap()],
+            certificate: None,
+            network_key: vec![9; 32],
+            control_plane: NetworkControlPlane {
+                controller_url: Some("https://controller.example".into()),
+                pinned_controller_public_key: vec![7; 32],
+                planet_manifest_url: Some("https://planet.example/manifest.json".into()),
+                verified_roots: vec![PlanetRoot {
+                    public_key: vec![8; 32],
+                    endpoints: vec!["203.0.113.1:51819".parse().unwrap()],
+                    priority: 10,
+                }],
+                verified_relays: vec![PlanetRelay {
+                    endpoint: "203.0.113.2:51820".parse().unwrap(),
+                    priority: 20,
+                }],
+                verified_stun_servers: vec!["stun.example:3478".into()],
+                authorization_manifest: Some(NetworkAuthorizationManifest {
+                    version: 1,
+                    network_id: NetworkId(Uuid::from_u128(2)),
+                    authorization_epoch: 3,
+                    network_key_epoch: 4,
+                    active_members: Vec::new(),
+                    revoked_certificate_ids: Vec::new(),
+                    issued_at_unix_seconds: 100,
+                    expires_at_unix_seconds: 200,
+                    controller_public_key: vec![7; 32],
+                    signature: vec![6; 64],
+                }),
+            },
+        };
+
+        let serialized = serde_json::to_value(&joined).unwrap();
+        assert_eq!(
+            serialized["control_plane"]["controller_url"],
+            "https://controller.example"
+        );
+        assert_eq!(
+            serialized["control_plane"]["planet_manifest_url"],
+            "https://planet.example/manifest.json"
+        );
+        assert_eq!(
+            serialized["control_plane"]["authorization_manifest"]["authorization_epoch"],
+            3
+        );
+
+        let restored: JoinedNetwork = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, joined);
     }
 }

@@ -56,6 +56,7 @@ jobs:
           Copy-Item THIRD_PARTY_NOTICES.md $package
           Copy-Item SECURITY.md $package
           Copy-Item CONTRIBUTING.md $package
+          Copy-Item docs $package -Recurse
           Compress-Archive -Path "$package/*" -DestinationPath "ci-artifacts/MeshLake-Windows-x64.zip"
 
       - name: Upload Windows artifact
@@ -104,6 +105,7 @@ jobs:
           cp target/release/meshlake-root ci-artifacts/MeshLake-Linux-x64/
           cp target/release/meshlake-relay ci-artifacts/MeshLake-Linux-x64/
           cp LICENSE README.md THIRD_PARTY_NOTICES.md SECURITY.md CONTRIBUTING.md ci-artifacts/MeshLake-Linux-x64/
+          cp -r docs ci-artifacts/MeshLake-Linux-x64/
           tar -czf ci-artifacts/MeshLake-Linux-x64.tar.gz -C ci-artifacts MeshLake-Linux-x64
 
       - name: Upload Linux artifact

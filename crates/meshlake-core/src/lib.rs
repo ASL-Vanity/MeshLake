@@ -17,8 +17,8 @@ pub use crypto::{
     PlanetManifest, PlanetRelay, PlanetRoot, SealedPacket,
 };
 pub use model::{
-    AgentStatus, DeviceId, EnrollmentRequest, JoinedNetwork, Membership, NetworkId, PeerPathStatus,
-    RelayPolicy, TransportStatus, UpsertNetworkRequest, VirtualNetwork,
+    AgentStatus, DeviceId, EnrollmentRequest, JoinedNetwork, Membership, NetworkControlPlane,
+    NetworkId, PeerPathStatus, RelayPolicy, TransportStatus, UpsertNetworkRequest, VirtualNetwork,
 };
 pub use overlay::{open_relay_packet, seal_relay_packet};
 pub use relay::{

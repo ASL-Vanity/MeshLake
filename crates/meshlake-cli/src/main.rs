@@ -226,7 +226,7 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Relay endpoint saved. Restart meshlaked to connect: {endpoint}");
+            println!("Relay endpoint saved and applied: {endpoint}");
         }
         Command::Planet {
             command:
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Planet settings saved. Restart meshlaked to connect to the relay.");
+            println!("Planet settings verified, saved and applied.");
         }
         Command::Controller {
             command:
@@ -395,28 +395,17 @@ async fn main() -> Result<()> {
             command: NetworkCommand::JoinLink { link },
         } => {
             let invitation = InviteLink::parse(&link)?;
-            if let Some(planet) = invitation.planet.as_deref() {
-                ensure_success(
-                    client
-                        .post(format!("{LOCAL_API}/planet"))
-                        .json(&serde_json::json!({
-                            "manifest_url": planet,
-                            "controller_public_key_base64": invitation.controller_public_key_base64,
-                        }))
-                        .send()
-                        .await?,
-                )
-                .await?;
-            }
+            let control_plane = invitation.control_plane();
             join_network(
                 &client,
                 &invitation.controller,
                 invitation.network,
                 &invitation.token,
                 &invitation.controller_public_key_base64,
+                Some(control_plane),
             )
             .await?;
-            println!("Network joined. If this was the first Planet setup, restart meshlaked to start its UDP discovery and relay worker.");
+            println!("Network joined.");
         }
         Command::Network {
             command:
@@ -427,12 +416,17 @@ async fn main() -> Result<()> {
                     controller_public_key_base64,
                 },
         } => {
+            let control_plane = EnrollmentControlPlane {
+                controller_url: controller.clone(),
+                planet_manifest_url: None,
+            };
             join_network(
                 &client,
                 &controller,
                 network,
                 &token,
                 &controller_public_key_base64,
+                Some(control_plane),
             )
             .await?;
         }
@@ -457,7 +451,7 @@ struct InviteLink {
     network: Uuid,
     token: String,
     controller_public_key_base64: String,
-    planet: Option<String>,
+    planet_manifest_url: Option<String>,
 }
 
 impl InviteLink {
@@ -487,19 +481,75 @@ impl InviteLink {
         if decoded_key.len() != 32 {
             bail!("invitation public_key must contain exactly 32 bytes");
         }
-        let planet = url
+        let planet_manifest_url = url
             .query_pairs()
             .find(|(key, _)| key == "planet")
             .map(|(_, value)| value.into_owned())
-            .filter(|value| value.starts_with("https://") || value.starts_with("http://"));
+            .filter(|value| !value.is_empty());
+        if let Some(planet_manifest_url) = planet_manifest_url.as_deref() {
+            if !(planet_manifest_url.starts_with("https://")
+                || planet_manifest_url.starts_with("http://"))
+            {
+                bail!("invitation planet must use https:// or http://");
+            }
+        }
         Ok(Self {
             controller,
             network,
             token: parameter("token")?,
             controller_public_key_base64,
-            planet,
+            planet_manifest_url,
         })
     }
+
+    /// Converts the optional Planet part of a complete invitation into the
+    /// control-plane payload understood by recent local agents.  This keeps
+    /// the Planet update in the same local transaction as enrollment instead
+    /// of mutating the device-wide Planet setting before enrollment succeeds.
+    fn control_plane(&self) -> EnrollmentControlPlane {
+        EnrollmentControlPlane {
+            controller_url: self.controller.clone(),
+            planet_manifest_url: self.planet_manifest_url.clone(),
+        }
+    }
+}
+
+/// Optional signed discovery metadata carried by a complete invitation URL.
+/// The local agent fetches and verifies the manifest with the pinned public
+/// key only after it has verified the enrollment response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnrollmentControlPlane {
+    controller_url: String,
+    planet_manifest_url: Option<String>,
+}
+
+impl EnrollmentControlPlane {
+    fn into_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "controller_url": self.controller_url,
+            "planet_manifest_url": self.planet_manifest_url,
+        })
+    }
+}
+
+/// Creates the local agent request that atomically stores membership and its
+/// control-plane metadata. `control_plane` is omitted for legacy/manual joins.
+fn local_enrollment_request(
+    enrollment: serde_json::Value,
+    controller_public_key: Vec<u8>,
+    control_plane: Option<EnrollmentControlPlane>,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "enrollment": enrollment,
+        "controller_public_key": controller_public_key,
+    });
+    if let Some(control_plane) = control_plane {
+        request
+            .as_object_mut()
+            .expect("enrollment request must be a JSON object")
+            .insert("control_plane".to_owned(), control_plane.into_json());
+    }
+    request
 }
 
 async fn join_network(
@@ -508,6 +558,7 @@ async fn join_network(
     network: Uuid,
     token: &str,
     controller_public_key_base64: &str,
+    control_plane: Option<EnrollmentControlPlane>,
 ) -> Result<()> {
     let controller_public_key = STANDARD
         .decode(controller_public_key_base64)
@@ -536,13 +587,16 @@ async fn join_network(
     .await?
     .json()
     .await?;
+    let enrollment = serde_json::to_value(enrollment)
+        .context("could not serialize controller enrollment for the local agent")?;
     print_network(
         client
             .post(format!("{LOCAL_API}/networks/enroll"))
-            .json(&serde_json::json!({
-                "enrollment": enrollment,
-                "controller_public_key": controller_public_key,
-            }))
+            .json(&local_enrollment_request(
+                enrollment,
+                controller_public_key,
+                control_plane,
+            ))
             .send()
             .await?,
     )
@@ -671,8 +725,35 @@ mod tests {
         .expect("link should parse");
         assert_eq!(invite.controller, "https://planet.example.com");
         assert_eq!(
-            invite.planet.as_deref(),
+            invite.planet_manifest_url.as_deref(),
             Some("https://planet.example.com/v1/planet")
+        );
+        assert_eq!(
+            invite.control_plane(),
+            EnrollmentControlPlane {
+                controller_url: "https://planet.example.com".into(),
+                planet_manifest_url: Some("https://planet.example.com/v1/planet".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn local_enrollment_request_embeds_control_plane_atomically() {
+        let request = local_enrollment_request(
+            serde_json::json!({"network": {"name": "home"}}),
+            vec![7; 32],
+            Some(EnrollmentControlPlane {
+                controller_url: "https://controller.example".into(),
+                planet_manifest_url: Some("https://controller.example/v1/planet".into()),
+            }),
+        );
+        assert_eq!(
+            request["control_plane"]["controller_url"],
+            "https://controller.example"
+        );
+        assert_eq!(
+            request["control_plane"]["planet_manifest_url"],
+            "https://controller.example/v1/planet"
         );
     }
 

@@ -294,7 +294,7 @@ impl App {
         }
     }
 
-    fn join_network(&mut self) {
+    fn join_network(&mut self, planet_manifest_url: Option<String>) {
         ensure_local_controller_running();
         let network_id = match Uuid::parse_str(self.network_id.trim()) {
             Ok(id) => id,
@@ -329,7 +329,14 @@ impl App {
         match self
             .client
             .post(format!("{LOCAL_API}/networks/enroll"))
-            .json(&json!({"enrollment": enrollment, "controller_public_key": key}))
+            .json(&json!({
+                "enrollment": enrollment,
+                "controller_public_key": key,
+                "control_plane": {
+                    "controller_url": controller,
+                    "planet_manifest_url": planet_manifest_url,
+                }
+            }))
             .send()
         {
             Ok(response) if response.status().is_success() => {
@@ -384,11 +391,16 @@ impl App {
                 return;
             }
         };
+        let planet_manifest_url = link
+            .query_pairs()
+            .find(|(key, _)| key == "planet")
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| value.starts_with("https://") || value.starts_with("http://"));
         self.controller = controller;
         self.network_id = network_id;
         self.token = token;
         self.public_key = public_key;
-        self.join_network();
+        self.join_network(planet_manifest_url);
     }
 
     fn configure_relay(&mut self) {
@@ -403,7 +415,7 @@ impl App {
             .send()
         {
             Ok(response) if response.status().is_success() => {
-                self.message = "中继地址已保存。请重启 meshlaked 以建立 UDP 连接。".into();
+                self.message = "中继地址已保存并自动应用。".into();
             }
             Ok(response) => {
                 self.message = response
@@ -425,7 +437,7 @@ impl App {
             .send()
         {
             Ok(response) if response.status().is_success() => {
-                self.message = "行星服务器配置已验证并保存。请重启 meshlaked 以连接中继。".into();
+                self.message = "行星服务器配置已验证、保存并自动应用。".into();
             }
             Ok(response) => {
                 self.message = response
@@ -928,7 +940,7 @@ impl eframe::App for App {
                 ui.end_row();
             });
             if ui.button("安全加入网络").clicked() {
-                self.join_network();
+                self.join_network(None);
             }
             });
         });
