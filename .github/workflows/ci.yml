@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows:
+    name: Windows workspace
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+      - name: Run workspace tests
+        run: cargo +stable test --workspace --locked
+
+      - name: Build Windows release
+        run: cargo +stable build --workspace --release --locked
+
+      - name: Package Windows binaries
+        shell: pwsh
+        run: |
+          $package = "ci-artifacts/MeshLake-Windows-x64"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item target/release/MeshLake.exe $package
+          Copy-Item target/release/meshlaked.exe $package
+          Copy-Item target/release/meshlake-cli.exe $package
+          Copy-Item target/release/meshlake-controller.exe $package
+          Copy-Item target/release/meshlake-root.exe $package
+          Copy-Item target/release/meshlake-relay.exe $package
+          Copy-Item third_party/wintun/wintun.dll $package
+          Copy-Item third_party/wintun/LICENSE.txt "$package/WINTUN-LICENSE.txt"
+          Copy-Item LICENSE $package
+          Copy-Item README.md $package
+          Copy-Item THIRD_PARTY_NOTICES.md $package
+          Copy-Item SECURITY.md $package
+          Copy-Item CONTRIBUTING.md $package
+          Compress-Archive -Path "$package/*" -DestinationPath "ci-artifacts/MeshLake-Windows-x64.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshLake-Windows-x64
+          path: ci-artifacts/MeshLake-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux core and services
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Run Linux tests
+        run: >-
+          cargo +stable test --locked
+          -p meshlake-core
+          -p meshlake-cli
+          -p meshlake-controller
+          -p meshlake-relay
+          -p meshlake-root
+          -p meshlaked
+
+      - name: Build Linux release
+        run: >-
+          cargo +stable build --release --locked
+          -p meshlake-cli
+          -p meshlake-controller
+          -p meshlake-relay
+          -p meshlake-root
+          -p meshlaked
+
+      - name: Package Linux binaries
+        run: |
+          mkdir -p ci-artifacts/MeshLake-Linux-x64
+          cp target/release/meshlaked ci-artifacts/MeshLake-Linux-x64/
+          cp target/release/meshlake-cli ci-artifacts/MeshLake-Linux-x64/
+          cp target/release/meshlake-controller ci-artifacts/MeshLake-Linux-x64/
+          cp target/release/meshlake-root ci-artifacts/MeshLake-Linux-x64/
+          cp target/release/meshlake-relay ci-artifacts/MeshLake-Linux-x64/
+          cp LICENSE README.md THIRD_PARTY_NOTICES.md SECURITY.md CONTRIBUTING.md ci-artifacts/MeshLake-Linux-x64/
+          tar -czf ci-artifacts/MeshLake-Linux-x64.tar.gz -C ci-artifacts MeshLake-Linux-x64
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshLake-Linux-x64
+          path: ci-artifacts/MeshLake-Linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14

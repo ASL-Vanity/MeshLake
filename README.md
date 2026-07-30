@@ -1,5 +1,7 @@
 # MeshLake（连接万物的湖泊）
 
+[![CI](https://github.com/ASL-Vanity/MeshLake/actions/workflows/ci.yml/badge.svg)](https://github.com/ASL-Vanity/MeshLake/actions/workflows/ci.yml)
+
 MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备同时加入多个彼此隔离的虚拟网络，并为多层 NAT、运营商级 NAT（CGNAT）环境准备直连与公网中继能力。
 
 本项目以 Apache License 2.0 开源。仓库中的 Wintun 预编译文件适用 WireGuard LLC 的独立许可证，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。安全问题请阅读 [`SECURITY.md`](SECURITY.md)，贡献说明见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
