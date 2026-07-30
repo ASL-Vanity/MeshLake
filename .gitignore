@@ -1,0 +1,42 @@
+# Rust build output
+/target/
+/target-upnp/
+/%MESHLAKE_TARGET%/
+
+# Packaged releases and local staging
+/dist/
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# JetBrains and editor-local files
+/.idea/
+*.iml
+/.vscode/
+*.swp
+*.swo
+
+# MeshLake runtime state and credentials
+agent.json
+controller.json
+root-identity.json
+relay-config.json
+*.json.bak
+*.json.tmp
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Environment and logs
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+
+# Operating-system files
+Thumbs.db
+Desktop.ini
+.DS_Store

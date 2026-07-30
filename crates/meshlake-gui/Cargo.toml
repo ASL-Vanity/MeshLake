@@ -1,0 +1,21 @@
+[package]
+name = "meshlake-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "MeshLake"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+eframe.workspace = true
+meshlake-core = { path = "../meshlake-core" }
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+tray-icon.workspace = true
+url.workspace = true
+uuid.workspace = true
+windows-sys.workspace = true
