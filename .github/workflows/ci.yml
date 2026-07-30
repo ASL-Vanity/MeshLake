@@ -24,7 +24,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt
@@ -59,7 +59,7 @@ jobs:
           Compress-Archive -Path "$package/*" -DestinationPath "ci-artifacts/MeshLake-Windows-x64.zip"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MeshLake-Windows-x64
           path: ci-artifacts/MeshLake-Windows-x64.zip
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal
@@ -107,7 +107,7 @@ jobs:
           tar -czf ci-artifacts/MeshLake-Linux-x64.tar.gz -C ci-artifacts MeshLake-Linux-x64
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MeshLake-Linux-x64
           path: ci-artifacts/MeshLake-Linux-x64.tar.gz
