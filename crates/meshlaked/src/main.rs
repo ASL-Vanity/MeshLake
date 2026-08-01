@@ -14,21 +14,24 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
-    accept_pairwise_handshake, parse_peer_identity, parse_session_routing_header,
-    session_handshake_id, AgentStatus, DeviceId, EnrollmentResponse, InitiatorHandshake,
-    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
-    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey, PairwiseSessionKeys,
-    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
-    RootRegistration, RootResponse, SignedRootResponse, TransportStatus, UpsertNetworkRequest,
-    VirtualNetwork, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES,
-    RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK,
-    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state,
+    parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
+    restrict_state_file_permissions, session_handshake_id, write_protected_state_file, AgentStatus,
+    DeviceId, EnrollmentResponse, InitiatorHandshake, JoinedNetwork, MembershipCertificate,
+    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
+    NetworkControlPlane, NetworkId, NetworkKey, PairwiseSessionKeys, PeerPathStatus,
+    PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration,
+    RootResponse, SignedRootResponse, StateFileLock, TransportStatus, UpsertNetworkRequest,
+    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
+    RELAY_SESSION_RESPONSE,
 };
+use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     env, fs,
-    io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{
@@ -44,6 +47,7 @@ use tokio::{
 use uuid::Uuid;
 
 const LOCAL_API: &str = "127.0.0.1:51821";
+const AGENT_STATE_SCHEMA_VERSION: u32 = 3;
 const PEER_DIRECTORY_TTL: Duration = Duration::from_secs(120);
 const PAIRWISE_SESSION_TTL: Duration = Duration::from_secs(3_600);
 const HANDSHAKE_TTL: Duration = Duration::from_secs(10);
@@ -130,6 +134,8 @@ struct EnrollmentControlPlane {
     controller_url: String,
     #[serde(default)]
     planet_manifest_url: Option<String>,
+    #[serde(default)]
+    controller_tls_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,12 +152,16 @@ struct PersistedPlanet {
     manifest_url: String,
     controller_url: String,
     controller_public_key_base64: String,
+    #[serde(default)]
+    controller_tls_ca_pem: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanetConfig {
     manifest_url: String,
     controller_public_key_base64: String,
+    #[serde(default)]
+    tls_ca_certificate_pem: Option<String>,
 }
 
 impl PersistedState {
@@ -160,7 +170,7 @@ impl PersistedState {
         getrandom::fill(&mut identity_secret_key)
             .expect("operating-system randomness is required for node identity");
         Self {
-            schema_version: 3,
+            schema_version: AGENT_STATE_SCHEMA_VERSION,
             device_id: DeviceId(Uuid::new_v4()),
             identity_secret_key: identity_secret_key.to_vec(),
             networks: Vec::new(),
@@ -177,6 +187,7 @@ impl PersistedState {
 
 struct Agent {
     path: PathBuf,
+    _state_lock: StateFileLock,
     state: RwLock<PersistedState>,
     adapter: adapter::AdapterController,
     relay_running: AtomicBool,
@@ -208,6 +219,7 @@ struct TransportConfiguration {
 struct AuthorizationRefreshTarget {
     network_id: NetworkId,
     controller_url: String,
+    controller_tls_ca_pem: Option<String>,
     pinned_controller_public_key: Vec<u8>,
     certificate: MembershipCertificate,
     authorization_epoch: Option<u64>,
@@ -259,19 +271,35 @@ struct TransportHealth {
 
 impl Agent {
     fn open(path: PathBuf, wintun_dll: PathBuf) -> Result<Self> {
-        recover_state_file(&path)?;
-        let mut state = if path.exists() {
-            serde_json::from_slice(
-                &fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?,
-            )
-            .with_context(|| format!("invalid state file {}", path.display()))?
+        let state_lock = StateFileLock::acquire(&path)?;
+        recover_protected_state_file(&path)?;
+        if path.exists() {
+            restrict_state_file_permissions(&path)?;
+        }
+        let (mut state, mut state_changed) = if path.exists() {
+            let bytes =
+                fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+            let decoded = decode_protected_state(&bytes, AGENT_STATE_PROTECTION_PURPOSE)
+                .with_context(|| format!("invalid or unreadable state file {}", path.display()))?;
+            (decoded.value, decoded.needs_protection_upgrade)
         } else {
             let state = PersistedState::new();
             write_state(&path, &state)?;
-            state
+            (state, false)
         };
-        let mut state_changed = false;
+        if state.schema_version > AGENT_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "agent state schema {} is newer than supported schema {}",
+                state.schema_version,
+                AGENT_STATE_SCHEMA_VERSION
+            );
+        }
         if state.identity_secret_key.len() != 32 {
+            if state.schema_version >= AGENT_STATE_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "agent state contains an invalid node identity key; refusing automatic identity rotation"
+                );
+            }
             let mut identity_secret_key = [0_u8; 32];
             getrandom::fill(&mut identity_secret_key)
                 .map_err(|error| anyhow::anyhow!("cannot generate node identity: {error:?}"))?;
@@ -287,15 +315,17 @@ impl Agent {
         if migrate_legacy_network_control_planes(&mut state) {
             state_changed = true;
         }
-        if state.schema_version < 3 {
-            state.schema_version = 3;
+        if state.schema_version < AGENT_STATE_SCHEMA_VERSION {
+            state.schema_version = AGENT_STATE_SCHEMA_VERSION;
             state_changed = true;
         }
         if state_changed {
             write_state(&path, &state)?;
         }
+        cleanup_stale_state_backup(&path)?;
         Ok(Self {
             path,
+            _state_lock: state_lock,
             state: RwLock::new(state),
             adapter: adapter::AdapterController::new(wintun_dll),
             relay_running: AtomicBool::new(false),
@@ -416,12 +446,17 @@ impl Agent {
     }
 
     async fn configure_planet(&self, config: PlanetConfig) -> Result<(), ApiError> {
-        let manifest_url = config.manifest_url.trim().to_owned();
-        if !(manifest_url.starts_with("https://") || manifest_url.starts_with("http://")) {
+        let manifest_url = normalize_http_url(&config.manifest_url, "Planet manifest URL")?;
+        let tls_ca_requested = config
+            .tls_ca_certificate_pem
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if tls_ca_requested && !manifest_url.starts_with("https://") {
             return Err(ApiError::bad_request(
-                "Planet manifest URL must start with https:// or http://",
+                "a pinned TLS CA requires an https:// Planet manifest URL",
             ));
         }
+        let tls_ca_pem = normalize_tls_ca_pem(config.tls_ca_certificate_pem.as_deref())?;
         let pinned_key = STANDARD
             .decode(config.controller_public_key_base64.trim())
             .map_err(ApiError::bad_request)?;
@@ -430,9 +465,7 @@ impl Agent {
                 "Planet controller public key must contain exactly 32 bytes",
             ));
         }
-        let response = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .build()
+        let response = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
             .map_err(ApiError::internal)?
             .get(&manifest_url)
             .send()
@@ -448,11 +481,10 @@ impl Agent {
         manifest
             .verify_from_controller(&pinned_key, now())
             .map_err(ApiError::bad_request)?;
-        if !(manifest.controller_url.starts_with("https://")
-            || manifest.controller_url.starts_with("http://"))
-        {
+        let controller_url = normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
+        if tls_ca_pem.is_some() && !controller_url.starts_with("https://") {
             return Err(ApiError::bad_request(
-                "Planet manifest contains an invalid controller URL",
+                "a pinned TLS CA requires an https:// Planet controller URL",
             ));
         }
         let mut state = self.state.write().await;
@@ -474,8 +506,9 @@ impl Agent {
             .collect();
         state.planet = Some(PersistedPlanet {
             manifest_url,
-            controller_url: manifest.controller_url,
+            controller_url,
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
+            controller_tls_ca_pem: tls_ca_pem,
         });
         write_state(&self.path, &state).map_err(ApiError::internal)?;
         drop(state);
@@ -530,6 +563,7 @@ impl Agent {
                 Some(AuthorizationRefreshTarget {
                     network_id: network.network.id,
                     controller_url: network.control_plane.controller_url.clone()?,
+                    controller_tls_ca_pem: network.control_plane.controller_tls_ca_pem.clone(),
                     pinned_controller_public_key: (!network
                         .control_plane
                         .pinned_controller_public_key
@@ -623,6 +657,22 @@ impl Agent {
     async fn refresh_authorizations_once(&self, client: &reqwest::Client) -> Result<()> {
         let (device_id, identity, targets) = self.authorization_refresh_material().await?;
         for target in targets {
+            let pinned_client = match target.controller_tls_ca_pem.as_deref() {
+                Some(tls_ca_pem) => {
+                    match controller_http_client(Some(tls_ca_pem), Duration::from_secs(8)) {
+                        Ok(client) => Some(client),
+                        Err(error) => {
+                            eprintln!(
+                                "MeshLake could not configure pinned TLS for network {}: {error:#}",
+                                target.network_id.0
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            let client = pinned_client.as_ref().unwrap_or(client);
             match fetch_authorization_action(client, device_id, &identity, &target).await {
                 Ok(action) => {
                     if let Err(error) = self.apply_authorization_action(&target, action).await {
@@ -648,9 +698,7 @@ impl Agent {
         {
             return Ok(());
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .build()?;
+        let client = controller_http_client(None, Duration::from_secs(8))?;
         let agent = Arc::clone(self);
         tokio::spawn(async move {
             loop {
@@ -912,19 +960,37 @@ async fn resolve_enrollment_control_plane(
     };
     let controller_url = normalize_http_url(&configured.controller_url, "controller URL")?;
     control_plane.controller_url = Some(controller_url.clone());
-
-    let Some(manifest_url) = configured
+    let tls_ca_requested = configured
+        .controller_tls_ca_pem
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if tls_ca_requested && !controller_url.starts_with("https://") {
+        return Err(ApiError::bad_request(
+            "a pinned controller TLS CA requires an https:// controller URL",
+        ));
+    }
+    let manifest_url = configured
         .planet_manifest_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
+        .map(|url| normalize_http_url(url, "Planet manifest URL"))
+        .transpose()?;
+    if tls_ca_requested
+        && manifest_url
+            .as_deref()
+            .is_some_and(|url| !url.starts_with("https://"))
+    {
+        return Err(ApiError::bad_request(
+            "a pinned controller TLS CA requires an https:// Planet manifest URL",
+        ));
+    }
+    let tls_ca_pem = normalize_tls_ca_pem(configured.controller_tls_ca_pem.as_deref())?;
+    control_plane.controller_tls_ca_pem = tls_ca_pem.clone();
+    let Some(manifest_url) = manifest_url else {
         return Ok(control_plane);
     };
-    let manifest_url = normalize_http_url(manifest_url, "Planet manifest URL")?;
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
+    let response = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
         .map_err(ApiError::internal)?
         .get(&manifest_url)
         .send()
@@ -942,6 +1008,11 @@ async fn resolve_enrollment_control_plane(
         .map_err(ApiError::bad_request)?;
     let manifest_controller_url =
         normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
+    if tls_ca_pem.is_some() && !manifest_controller_url.starts_with("https://") {
+        return Err(ApiError::bad_request(
+            "a pinned controller TLS CA requires an https:// Planet controller URL",
+        ));
+    }
     if manifest_controller_url != controller_url {
         return Err(ApiError::bad_request(
             "Planet controller URL does not match the invitation controller URL",
@@ -975,13 +1046,95 @@ async fn resolve_enrollment_control_plane(
 }
 
 fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError> {
-    let value = value.trim().trim_end_matches('/');
-    if value.is_empty() || !(value.starts_with("https://") || value.starts_with("http://")) {
+    let value = value.trim();
+    let Some((raw_scheme, authority_and_path)) = value.split_once("://") else {
+        return Err(ApiError::bad_request(format!(
+            "{description} must start with https:// or http://"
+        )));
+    };
+    let raw_authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if !matches!(raw_scheme.to_ascii_lowercase().as_str(), "https" | "http")
+        || authority_and_path.is_empty()
+        || authority_and_path.starts_with('/')
+        || value.contains('\\')
+        || raw_authority.contains('@')
+    {
+        return Err(ApiError::bad_request(format!(
+            "{description} must include a valid HTTP authority"
+        )));
+    }
+    let mut url = Url::parse(value)
+        .map_err(|error| ApiError::bad_request(format!("{description} is invalid: {error}")))?;
+    if !matches!(url.scheme(), "https" | "http") {
         return Err(ApiError::bad_request(format!(
             "{description} must start with https:// or http://"
         )));
     }
-    Ok(value.to_owned())
+    if url.host_str().is_none() {
+        return Err(ApiError::bad_request(format!(
+            "{description} must include a host"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ApiError::bad_request(format!(
+            "{description} must not contain credentials"
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ApiError::bad_request(format!(
+            "{description} must not contain a query or fragment"
+        )));
+    }
+    if url.path().ends_with('/') && url.path() != "/" {
+        let path = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&path);
+    }
+    if url.path() == "/" {
+        url.set_path("");
+    }
+    Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn normalize_tls_ca_pem(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 64 * 1024 {
+        return Err(ApiError::bad_request(
+            "controller TLS CA PEM exceeds the 64 KiB limit",
+        ));
+    }
+    let certificates =
+        Certificate::from_pem_bundle(value.as_bytes()).map_err(ApiError::bad_request)?;
+    if certificates.is_empty() {
+        return Err(ApiError::bad_request(
+            "controller TLS CA PEM contains no certificates",
+        ));
+    }
+    Ok(Some(format!("{}\n", value.trim_end())))
+}
+
+fn controller_http_client(tls_ca_pem: Option<&str>, timeout: Duration) -> Result<Client> {
+    let mut builder = Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(tls_ca_pem) = tls_ca_pem {
+        let certificates = Certificate::from_pem_bundle(tls_ca_pem.as_bytes())
+            .context("controller TLS CA PEM bundle is invalid")?;
+        if certificates.is_empty() {
+            anyhow::bail!("controller TLS CA PEM bundle contains no certificates");
+        }
+        builder = builder.tls_built_in_root_certs(false);
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    builder
+        .build()
+        .context("cannot construct controller HTTPS client")
 }
 
 fn pinned_controller_key(network: &JoinedNetwork) -> &[u8] {
@@ -1161,6 +1314,12 @@ async fn fetch_authorization_action(
 }
 
 fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
+    let legacy_controller_url = state.planet.as_ref().and_then(|planet| {
+        normalize_http_url(&planet.controller_url, "legacy Planet controller URL").ok()
+    });
+    let legacy_manifest_url = state.planet.as_ref().and_then(|planet| {
+        normalize_http_url(&planet.manifest_url, "legacy Planet manifest URL").ok()
+    });
     let legacy_controller_key = state
         .planet
         .as_ref()
@@ -1170,6 +1329,17 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
                 .ok()
         })
         .filter(|key| key.len() == 32);
+    let legacy_tls_ca_pem = state
+        .planet
+        .as_ref()
+        .and_then(|planet| planet.controller_tls_ca_pem.clone())
+        .filter(|value| !value.trim().is_empty());
+    let legacy_tls_urls_are_https = legacy_controller_url
+        .as_deref()
+        .is_some_and(|url| url.starts_with("https://"))
+        && legacy_manifest_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"));
     let legacy_relays = state
         .relay_endpoints
         .iter()
@@ -1184,40 +1354,60 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
     for joined in &mut state.networks {
         let control_plane = &mut joined.control_plane;
         if control_plane.controller_url.is_none() {
-            if let Some(planet) = &state.planet {
-                control_plane.controller_url = Some(planet.controller_url.clone());
+            if let Some(controller_url) = &legacy_controller_url {
+                control_plane.controller_url = Some(controller_url.clone());
                 changed = true;
             }
         }
+        let uses_legacy_controller = control_plane
+            .controller_url
+            .as_deref()
+            .and_then(|url| normalize_http_url(url, "network controller URL").ok())
+            .zip(legacy_controller_url.as_deref())
+            .is_some_and(|(network, legacy)| network == legacy);
         if control_plane.pinned_controller_public_key.is_empty() {
             let key = joined
                 .certificate
                 .as_ref()
                 .map(|certificate| certificate.controller_public_key.clone())
                 .filter(|key| key.len() == 32)
-                .or_else(|| legacy_controller_key.clone());
+                .or_else(|| {
+                    uses_legacy_controller
+                        .then(|| legacy_controller_key.clone())
+                        .flatten()
+                });
             if let Some(key) = key {
                 control_plane.pinned_controller_public_key = key;
                 changed = true;
             }
         }
-        if control_plane.planet_manifest_url.is_none() {
-            if let Some(planet) = &state.planet {
-                control_plane.planet_manifest_url = Some(planet.manifest_url.clone());
+        if uses_legacy_controller {
+            if control_plane.controller_tls_ca_pem.is_none()
+                && (legacy_tls_ca_pem.is_none() || legacy_tls_urls_are_https)
+            {
+                if let Some(tls_ca_pem) = &legacy_tls_ca_pem {
+                    control_plane.controller_tls_ca_pem = Some(tls_ca_pem.clone());
+                    changed = true;
+                }
+            }
+            if control_plane.planet_manifest_url.is_none() {
+                if let Some(manifest_url) = &legacy_manifest_url {
+                    control_plane.planet_manifest_url = Some(manifest_url.clone());
+                    changed = true;
+                }
+            }
+            if control_plane.verified_roots.is_empty() && !state.root_servers.is_empty() {
+                control_plane.verified_roots = state.root_servers.clone();
                 changed = true;
             }
-        }
-        if control_plane.verified_roots.is_empty() && !state.root_servers.is_empty() {
-            control_plane.verified_roots = state.root_servers.clone();
-            changed = true;
-        }
-        if control_plane.verified_relays.is_empty() && !legacy_relays.is_empty() {
-            control_plane.verified_relays = legacy_relays.clone();
-            changed = true;
-        }
-        if control_plane.verified_stun_servers.is_empty() && !state.stun_servers.is_empty() {
-            control_plane.verified_stun_servers = state.stun_servers.clone();
-            changed = true;
+            if control_plane.verified_relays.is_empty() && !legacy_relays.is_empty() {
+                control_plane.verified_relays = legacy_relays.clone();
+                changed = true;
+            }
+            if control_plane.verified_stun_servers.is_empty() && !state.stun_servers.is_empty() {
+                control_plane.verified_stun_servers = state.stun_servers.clone();
+                changed = true;
+            }
         }
         if control_plane.authorization_manifest.is_none() {
             if let Some(authorization) = state.authorizations.get(&joined.network.id).cloned() {
@@ -1316,85 +1506,7 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
 }
 
 fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("state path has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)
-        .with_context(|| format!("cannot create {}", temporary.display()))?;
-    restrict_state_permissions(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(state)?)?;
-    file.sync_all()?;
-    drop(file);
-    replace_state_file(&temporary, path)?;
-    restrict_state_permissions(path)?;
-    Ok(())
-}
-
-fn recover_state_file(path: &FsPath) -> Result<()> {
-    let backup = path.with_extension("json.bak");
-    if !path.exists() && backup.exists() {
-        fs::rename(&backup, path)
-            .with_context(|| format!("cannot recover MeshLake state from {}", backup.display()))?;
-        restrict_state_permissions(path)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn replace_state_file(temporary: &FsPath, path: &FsPath) -> Result<()> {
-    fs::rename(temporary, path)
-        .with_context(|| format!("cannot atomically replace {}", path.display()))
-}
-
-#[cfg(windows)]
-fn replace_state_file(temporary: &FsPath, path: &FsPath) -> Result<()> {
-    if !path.exists() {
-        return fs::rename(temporary, path)
-            .with_context(|| format!("cannot install {}", path.display()));
-    }
-    let backup = path.with_extension("json.bak");
-    if backup.exists() {
-        fs::remove_file(&backup)
-            .with_context(|| format!("cannot remove stale {}", backup.display()))?;
-    }
-    fs::rename(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
-    match fs::rename(temporary, path) {
-        Ok(()) => {
-            fs::remove_file(&backup)
-                .with_context(|| format!("cannot remove {}", backup.display()))?;
-            Ok(())
-        }
-        Err(error) => {
-            let restore = fs::rename(&backup, path);
-            match restore {
-                Ok(()) => Err(error)
-                    .with_context(|| format!("cannot replace {}; backup restored", path.display())),
-                Err(restore_error) => anyhow::bail!(
-                    "cannot replace {} ({error}); backup remains at {} because restoration failed: {restore_error}",
-                    path.display(),
-                    backup.display()
-                ),
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn restrict_state_permissions(path: &FsPath) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict {} to mode 0600", path.display()))
-}
-
-#[cfg(windows)]
-fn restrict_state_permissions(_: &FsPath) -> Result<()> {
-    Ok(())
+    write_protected_state_file(path, state, AGENT_STATE_PROTECTION_PURPOSE).map_err(Into::into)
 }
 
 #[derive(Debug)]
@@ -1555,8 +1667,12 @@ fn manage_autostart(
     const TASK_NAME: &str = "MeshLake Agent";
     match command {
         AutostartCommand::Install => {
+            let _state_lock = StateFileLock::acquire(state_path)?;
+            recover_protected_state_file(state_path)?;
             if !state_path.exists() {
                 write_state(state_path, &PersistedState::new())?;
+            } else {
+                restrict_state_file_permissions(state_path)?;
             }
             let state_path = fs::canonicalize(state_path)
                 .with_context(|| format!("cannot resolve {}", state_path.display()))?;
@@ -3572,6 +3688,56 @@ mod tests {
         AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy,
     };
 
+    fn suffixed_state_path(path: &FsPath, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn cleanup_test_state(path: &FsPath, directory: &FsPath) {
+        for candidate in [
+            path.to_path_buf(),
+            suffixed_state_path(path, ".bak"),
+            suffixed_state_path(path, ".lock"),
+        ] {
+            if candidate.exists() {
+                fs::remove_file(&candidate).unwrap();
+            }
+        }
+        let temporary_prefix = format!(
+            "{}.tmp-",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&temporary_prefix)
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    fn has_temporary_state_file(path: &FsPath) -> bool {
+        let temporary_prefix = format!(
+            "{}.tmp-",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        path.parent()
+            .and_then(|parent| fs::read_dir(parent).ok())
+            .is_some_and(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&temporary_prefix)
+                })
+            })
+    }
+
     async fn spawn_json_server(
         responses: Vec<Vec<u8>>,
     ) -> (SocketAddr, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
@@ -3688,6 +3854,7 @@ mod tests {
         AuthorizationRefreshTarget {
             network_id: network.network.id,
             controller_url: network.control_plane.controller_url.clone().unwrap(),
+            controller_tls_ca_pem: network.control_plane.controller_tls_ca_pem.clone(),
             pinned_controller_public_key: network
                 .control_plane
                 .pinned_controller_public_key
@@ -4202,6 +4369,7 @@ mod tests {
             manifest_url: "https://planet.example/v1/planet".into(),
             controller_url: "https://planet.example".into(),
             controller_public_key_base64: STANDARD.encode(controller.verifying_key().to_bytes()),
+            controller_tls_ca_pem: None,
         });
         state
             .authorizations
@@ -4224,6 +4392,131 @@ mod tests {
             Some(&authorization)
         );
         assert!(state.authorizations.is_empty());
+    }
+
+    #[test]
+    fn legacy_planet_trust_only_migrates_to_the_matching_controller() {
+        let controller = SigningKey::from_bytes(&[35_u8; 32]);
+        let mut matching = test_joined_network();
+        matching.control_plane.controller_url = Some("https://PLANET.example/".into());
+
+        let mut foreign = test_joined_network();
+        foreign.network.id = NetworkId(Uuid::from_u128(92));
+        foreign.network.name = "foreign-controller".into();
+        foreign.control_plane.controller_url = Some("https://other.example".into());
+        foreign.control_plane.controller_tls_ca_pem = Some("foreign-ca".into());
+
+        let mut state = PersistedState::new();
+        state.networks = vec![matching, foreign];
+        state.relay_endpoints = vec!["203.0.113.35:51820".parse().unwrap()];
+        state.root_servers = vec![PlanetRoot {
+            public_key: vec![35; 32],
+            endpoints: vec!["203.0.113.35:51819".parse().unwrap()],
+            priority: 0,
+        }];
+        state.stun_servers = vec!["stun.planet.example:3478".into()];
+        state.planet = Some(PersistedPlanet {
+            manifest_url: "https://planet.example/v1/planet/".into(),
+            controller_url: "https://planet.example".into(),
+            controller_public_key_base64: STANDARD.encode(controller.verifying_key().to_bytes()),
+            controller_tls_ca_pem: Some("legacy-private-ca".into()),
+        });
+
+        assert!(migrate_legacy_network_control_planes(&mut state));
+
+        let matching = &state.networks[0].control_plane;
+        assert_eq!(
+            matching.controller_tls_ca_pem.as_deref(),
+            Some("legacy-private-ca")
+        );
+        assert_eq!(
+            matching.planet_manifest_url.as_deref(),
+            Some("https://planet.example/v1/planet")
+        );
+        assert_eq!(matching.verified_roots.len(), 1);
+        assert_eq!(matching.verified_relays.len(), 1);
+        assert_eq!(
+            matching.verified_stun_servers,
+            vec!["stun.planet.example:3478"]
+        );
+        assert_eq!(
+            matching.pinned_controller_public_key,
+            controller.verifying_key().to_bytes()
+        );
+
+        let foreign = &state.networks[1].control_plane;
+        assert_eq!(
+            foreign.controller_url.as_deref(),
+            Some("https://other.example")
+        );
+        assert_eq!(foreign.controller_tls_ca_pem.as_deref(), Some("foreign-ca"));
+        assert!(foreign.planet_manifest_url.is_none());
+        assert!(foreign.pinned_controller_public_key.is_empty());
+        assert!(foreign.verified_roots.is_empty());
+        assert!(foreign.verified_relays.is_empty());
+        assert!(foreign.verified_stun_servers.is_empty());
+    }
+
+    #[test]
+    fn normalize_http_url_is_strict_and_canonical() {
+        assert_eq!(
+            normalize_http_url(" HTTPS://Example.COM:443/api/// ", "test URL").unwrap(),
+            "https://example.com/api"
+        );
+        for value in [
+            "ftp://example.com",
+            "https:///missing-host",
+            "https://user:secret@example.com",
+            "https://@example.com",
+            "https://example.com\\unexpected",
+            "https://example.com/path?token=secret",
+            "https://example.com/path#fragment",
+        ] {
+            assert!(normalize_http_url(value, "test URL").is_err(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn private_ca_rejects_plain_http_controller_and_manifest_urls() {
+        let controller = SigningKey::from_bytes(&[36_u8; 32]);
+        let network_id = NetworkId(Uuid::from_u128(360));
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            1,
+            1,
+            Vec::new(),
+            Vec::new(),
+            now(),
+            now() + 90,
+            &controller,
+        )
+        .unwrap();
+
+        let controller_error = resolve_enrollment_control_plane(
+            Some(EnrollmentControlPlane {
+                controller_url: "http://controller.example".into(),
+                planet_manifest_url: None,
+                controller_tls_ca_pem: Some("private-ca".into()),
+            }),
+            &controller.verifying_key().to_bytes(),
+            authorization.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(controller_error.1.contains("https:// controller URL"));
+
+        let manifest_error = resolve_enrollment_control_plane(
+            Some(EnrollmentControlPlane {
+                controller_url: "https://controller.example".into(),
+                planet_manifest_url: Some("http://controller.example/v1/planet".into()),
+                controller_tls_ca_pem: Some("private-ca".into()),
+            }),
+            &controller.verifying_key().to_bytes(),
+            authorization,
+        )
+        .await
+        .unwrap_err();
+        assert!(manifest_error.1.contains("https:// Planet manifest URL"));
     }
 
     #[tokio::test]
@@ -4279,6 +4572,7 @@ mod tests {
             Some(EnrollmentControlPlane {
                 controller_url: "http://controller.example".into(),
                 planet_manifest_url: Some(format!("http://{address}/v1/planet")),
+                controller_tls_ca_pem: None,
             }),
             &controller.verifying_key().to_bytes(),
             authorization.clone(),
@@ -4553,10 +4847,13 @@ mod tests {
 
         assert!(agent.state.read().await.networks.is_empty());
         assert!(agent.transport_revision.load(Ordering::Acquire) > previous_revision);
-        let persisted: PersistedState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let persisted: PersistedState =
+            decode_protected_state(&fs::read(&path).unwrap(), AGENT_STATE_PROTECTION_PURPOSE)
+                .unwrap()
+                .value;
         assert!(persisted.networks.is_empty());
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&directory).unwrap();
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[tokio::test]
@@ -4670,6 +4967,7 @@ mod tests {
             control_plane: Some(EnrollmentControlPlane {
                 controller_url: "https://controller.example".into(),
                 planet_manifest_url: None,
+                controller_tls_ca_pem: None,
             }),
         };
 
@@ -4680,8 +4978,70 @@ mod tests {
         assert_eq!(state.networks[0].network.id, network_id);
         drop(state);
 
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&directory).unwrap();
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn authorization_refresh_keeps_private_ca_scoped_per_network() {
+        let directory = env::temp_dir().join(format!("meshlake-ca-scope-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let (device_id, identity) = {
+            let state = agent.state.read().await;
+            (state.device_id, identity_signing_key(&state).unwrap())
+        };
+        let first_controller = SigningKey::from_bytes(&[37_u8; 32]);
+        let second_controller = SigningKey::from_bytes(&[38_u8; 32]);
+        let first_id = NetworkId(Uuid::from_u128(370));
+        let second_id = NetworkId(Uuid::from_u128(380));
+        let mut first = joined_network_with_authorization(
+            &first_controller,
+            &identity,
+            device_id,
+            first_id,
+            Uuid::from_u128(371),
+            1,
+            1,
+            "https://first.example".into(),
+        );
+        first.control_plane.controller_tls_ca_pem = Some("first-private-ca".into());
+        let mut second = joined_network_with_authorization(
+            &second_controller,
+            &identity,
+            device_id,
+            second_id,
+            Uuid::from_u128(381),
+            1,
+            1,
+            "https://second.example".into(),
+        );
+        second.control_plane.controller_tls_ca_pem = Some("second-private-ca".into());
+        agent.state.write().await.networks = vec![first, second];
+
+        let (_, _, targets) = agent.authorization_refresh_material().await.unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.network_id == first_id)
+                .unwrap()
+                .controller_tls_ca_pem
+                .as_deref(),
+            Some("first-private-ca")
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.network_id == second_id)
+                .unwrap()
+                .controller_tls_ca_pem
+                .as_deref(),
+            Some("second-private-ca")
+        );
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[tokio::test]
@@ -4717,29 +5077,33 @@ mod tests {
         })
         .await
         .expect("transport supervisor should stop cleanly");
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&directory).unwrap();
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[test]
     fn state_rewrite_and_backup_recovery_preserve_identity() {
         let directory = env::temp_dir().join(format!("meshlake-state-test-{}", Uuid::new_v4()));
         let path = directory.join("agent.json");
+        let state_lock = StateFileLock::acquire(&path).unwrap();
         let mut state = PersistedState::new();
         let original_device = state.device_id;
         write_state(&path, &state).unwrap();
         state.schema_version += 1;
         write_state(&path, &state).unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
-        assert!(!path.with_extension("json.bak").exists());
+        assert!(!has_temporary_state_file(&path));
+        assert!(!suffixed_state_path(&path, ".bak").exists());
 
-        let decoded: PersistedState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let decoded: PersistedState =
+            decode_protected_state(&fs::read(&path).unwrap(), AGENT_STATE_PROTECTION_PURPOSE)
+                .unwrap()
+                .value;
         assert_eq!(decoded.device_id, original_device);
         assert_eq!(decoded.schema_version, state.schema_version);
 
-        let backup = path.with_extension("json.bak");
+        let backup = suffixed_state_path(&path, ".bak");
         fs::rename(&path, &backup).unwrap();
-        recover_state_file(&path).unwrap();
+        recover_protected_state_file(&path).unwrap();
         assert!(path.exists());
         assert!(!backup.exists());
 
@@ -4752,7 +5116,127 @@ mod tests {
             );
         }
 
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&directory).unwrap();
+        drop(state_lock);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[test]
+    fn agent_holds_the_state_lock_until_it_is_dropped() {
+        let directory = env::temp_dir().join(format!("meshlake-lock-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let first = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let error = match Agent::open(path.clone(), adapter::default_wintun_path()) {
+            Ok(_) => panic!("a second agent unexpectedly acquired the same state lock"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("cannot exclusively lock MeshLake state"));
+        drop(first);
+
+        let reopened = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        drop(reopened);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_open_upgrades_legacy_plaintext_state() {
+        let directory = env::temp_dir().join(format!("meshlake-plaintext-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.json");
+        let state = PersistedState::new();
+        let original_device = state.device_id;
+        fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        assert_eq!(agent.state.blocking_read().device_id, original_device);
+        let bytes = fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<PersistedState>(&bytes).is_err());
+        let decoded: meshlake_core::DecodedState<PersistedState> =
+            decode_protected_state(&bytes, AGENT_STATE_PROTECTION_PURPOSE).unwrap();
+        assert_eq!(decoded.value.device_id, original_device);
+        assert!(!decoded.needs_protection_upgrade);
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_open_removes_plaintext_backup_after_validating_protected_primary_state() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-stale-backup-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.json");
+        let backup = suffixed_state_path(&path, ".bak");
+        let state = PersistedState::new();
+        let original_device = state.device_id;
+        write_state(&path, &state).unwrap();
+        fs::write(&backup, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&fs::read(&backup).unwrap())
+            .contains(&original_device.0.to_string()));
+
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        assert_eq!(agent.state.blocking_read().device_id, original_device);
+        assert!(!backup.exists());
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_open_keeps_backup_when_current_primary_identity_is_invalid() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-invalid-primary-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.json");
+        let backup = suffixed_state_path(&path, ".bak");
+        let valid_backup = PersistedState::new();
+        let mut invalid_primary = valid_backup.clone();
+        invalid_primary.identity_secret_key.clear();
+        let protected =
+            meshlake_core::encode_protected_state(&invalid_primary, AGENT_STATE_PROTECTION_PURPOSE)
+                .unwrap();
+        fs::write(&path, protected).unwrap();
+        fs::write(&backup, serde_json::to_vec_pretty(&valid_backup).unwrap()).unwrap();
+
+        let error = match Agent::open(path.clone(), adapter::default_wintun_path()) {
+            Ok(_) => panic!("agent unexpectedly accepted an invalid current-schema identity"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("refusing automatic identity rotation"));
+        assert!(backup.exists());
+
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_open_restricts_an_existing_state_file_to_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            env::temp_dir().join(format!("meshlake-permission-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("agent.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&PersistedState::new()).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 }

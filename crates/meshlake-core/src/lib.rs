@@ -7,6 +7,7 @@ mod overlay;
 mod relay;
 mod root;
 mod session;
+mod state_protection;
 
 pub use authorization::{
     AuthorizedMembership, MembershipRefreshRequest, MembershipRefreshResponse,
@@ -35,4 +36,10 @@ pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,
     InitiatorHandshake, PairwiseSessionKeys, ReplayWindow, SessionPacket, SESSION_DATA_HEADER_LEN,
     SESSION_PROTOCOL_VERSION,
+};
+pub use state_protection::{
+    cleanup_stale_state_backup, decode_protected_state, encode_protected_state,
+    recover_protected_state_file, restrict_state_file_permissions, write_protected_state_file,
+    DecodedState, StateFileError, StateFileLock, StateProtectionError,
+    AGENT_STATE_PROTECTION_PURPOSE, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };

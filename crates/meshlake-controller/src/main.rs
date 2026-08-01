@@ -13,14 +13,18 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
-    AuthorizedMembership, DeviceId, EnrollmentResponse, MembershipCertificate, MembershipClaims,
-    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId,
-    NetworkKey, PlanetManifest, PlanetRelay, PlanetRoot, UpsertNetworkRequest, VirtualNetwork,
+    cleanup_stale_state_backup, decode_protected_state, recover_protected_state_file,
+    restrict_state_file_permissions, write_protected_state_file, AuthorizedMembership, DeviceId,
+    EnrollmentResponse, MembershipCertificate, MembershipClaims, MembershipRefreshRequest,
+    MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId, NetworkKey, PlanetManifest,
+    PlanetRelay, PlanetRoot, StateFileLock, UpsertNetworkRequest, VirtualNetwork,
+    CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::BufReader,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
@@ -37,9 +41,21 @@ use uuid::Uuid;
     about = "MeshLake controller and enrollment service"
 )]
 struct Cli {
-    /// Keep the loopback default until a reverse proxy and TLS are configured.
+    /// HTTP/HTTPS listener. Plain HTTP is restricted to loopback by default.
     #[arg(long, default_value = "127.0.0.1:51822")]
     bind: SocketAddr,
+    /// PEM certificate chain used by the controller's native HTTPS listener.
+    #[arg(long, value_name = "CERTIFICATE_PEM")]
+    tls_certificate: Option<PathBuf>,
+    /// PEM private key matching --tls-certificate.
+    #[arg(long, value_name = "PRIVATE_KEY_PEM")]
+    tls_private_key: Option<PathBuf>,
+    /// Public PEM CA certificate embedded in invitations for private-PKI clients.
+    #[arg(long, value_name = "CA_CERTIFICATE_PEM")]
+    tls_client_ca_certificate: Option<PathBuf>,
+    /// DANGEROUS: permit plain HTTP on a non-loopback address for isolated development only.
+    #[arg(long)]
+    allow_insecure_public_http: bool,
     #[arg(long)]
     state_file: Option<PathBuf>,
     /// Public controller URL published through the signed Planet manifest.
@@ -127,6 +143,7 @@ struct EnrollmentRequest {
 #[derive(Debug, Clone)]
 struct PlanetSettings {
     controller_url: String,
+    tls_client_ca_pem: Option<String>,
     roots: Vec<PlanetRoot>,
     relays: Vec<PlanetRelay>,
     stun_servers: Vec<String>,
@@ -137,16 +154,22 @@ struct Controller {
     state: RwLock<ControllerState>,
     planet: Option<PlanetSettings>,
     refresh_nonces: Mutex<HashMap<[u8; 16], Instant>>,
+    _state_lock: StateFileLock,
 }
 
 impl Controller {
     fn open(path: PathBuf, planet: Option<PlanetSettings>) -> Result<(Self, Option<String>)> {
-        let (mut state, initial_token) = if path.exists() {
+        let state_lock = StateFileLock::acquire(&path)?;
+        recover_protected_state_file(&path)?;
+        let (mut state, initial_token, mut migrated) = if path.exists() {
+            restrict_state_file_permissions(&path)?;
             let bytes =
                 fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-            let state = serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid controller state {}", path.display()))?;
-            (state, None)
+            let decoded = decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE)
+                .with_context(|| {
+                    format!("invalid or unreadable controller state {}", path.display())
+                })?;
+            (decoded.value, None, decoded.needs_protection_upgrade)
         } else {
             let mut signing_key = [0_u8; 32];
             getrandom::fill(&mut signing_key).map_err(|error| {
@@ -161,9 +184,8 @@ impl Controller {
                 enrollment_tokens: HashMap::new(),
             };
             write_state(&path, &state)?;
-            (state, Some(admin_token))
+            (state, Some(admin_token), false)
         };
-        let mut migrated = false;
         for managed in state.networks.values_mut() {
             if managed.network_key.len() != 32 {
                 managed.network_key = NetworkKey::generate()?.to_bytes().to_vec();
@@ -190,15 +212,18 @@ impl Controller {
             state.schema_version = 2;
             migrated = true;
         }
+        validate_controller_state(&state)?;
         if migrated {
             write_state(&path, &state)?;
         }
+        cleanup_stale_state_backup(&path)?;
         Ok((
             Self {
                 path,
                 state: RwLock::new(state),
                 planet,
                 refresh_nonces: Mutex::new(HashMap::new()),
+                _state_lock: state_lock,
             },
             initial_token,
         ))
@@ -278,6 +303,7 @@ impl Controller {
                     network_id.0,
                     &token.to_string(),
                     &STANDARD.encode(controller_public_key),
+                    planet.tls_client_ca_pem.as_deref(),
                 )
             }),
         })
@@ -538,6 +564,22 @@ fn signing_key(state: &ControllerState) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
+fn validate_controller_state(state: &ControllerState) -> Result<()> {
+    signing_key(state)?;
+    if state.admin_token.trim().is_empty() {
+        anyhow::bail!("controller administrator token is empty");
+    }
+    for (network_id, managed) in &state.networks {
+        NetworkKey::from_slice(&managed.network_key).with_context(|| {
+            format!(
+                "controller network {} contains an invalid network key",
+                network_id.0
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn sign_authorization(
     network: &ManagedNetwork,
     signing_key: &SigningKey,
@@ -671,17 +713,8 @@ fn require_admin(state: &ControllerState, headers: &HeaderMap) -> Result<(), Api
 }
 
 fn write_state(path: &FsPath, state: &ControllerState) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("state path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)?;
-    Ok(())
+    write_protected_state_file(path, state, CONTROLLER_STATE_PROTECTION_PURPOSE)
+        .with_context(|| format!("cannot securely write controller state {}", path.display()))
 }
 
 fn now() -> u64 {
@@ -699,6 +732,7 @@ fn make_invite_link(
     network_id: Uuid,
     token: &str,
     controller_public_key_base64: &str,
+    tls_client_ca_pem: Option<&str>,
 ) -> String {
     let mut link = Url::parse("meshlake://join").expect("static invitation URL is valid");
     link.query_pairs_mut()
@@ -713,6 +747,10 @@ fn make_invite_link(
             "planet",
             &format!("{}/v1/planet", controller_url.trim_end_matches('/')),
         );
+    if let Some(tls_client_ca_pem) = tls_client_ca_pem {
+        link.query_pairs_mut()
+            .append_pair("tls_ca", &STANDARD.encode(tls_client_ca_pem.as_bytes()));
+    }
     link.into()
 }
 
@@ -841,14 +879,30 @@ async fn refresh_membership(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider()?;
     let cli = Cli::parse();
+    let tls_files = controller_tls_configuration(&cli)?;
+    // Load and validate the complete chain/key pair before opening the state.
+    // A broken TLS deployment must never create a fresh controller identity
+    // whose one-time administrator token is then lost in the startup error.
+    let tls = load_controller_tls_configuration(tls_files).await?;
+    let tls_client_ca_pem = load_tls_client_ca(cli.tls_client_ca_certificate.as_deref())?;
+    if tls_client_ca_pem.is_some() && cli.planet_controller_url.is_none() {
+        anyhow::bail!(
+            "--tls-client-ca-certificate requires --planet-controller-url so the CA can be embedded in invitations"
+        );
+    }
     let path = cli.state_file.unwrap_or_else(default_state_path);
     let planet = match (
         cli.planet_controller_url,
         cli.planet_relay_endpoints.is_empty(),
     ) {
         (Some(controller_url), false) => Some(PlanetSettings {
-            controller_url: controller_url.trim_end_matches('/').to_owned(),
+            controller_url: validate_controller_url(
+                &controller_url,
+                cli.allow_insecure_public_http,
+            )?,
+            tls_client_ca_pem,
             roots: cli
                 .planet_roots
                 .into_iter()
@@ -907,11 +961,156 @@ async fn main() -> Result<()> {
         .route("/v1/enroll", post(enroll))
         .route("/v1/membership/refresh", post(refresh_membership))
         .with_state(Arc::new(controller));
-    let listener = tokio::net::TcpListener::bind(cli.bind).await?;
-    println!("MeshLake controller listening on http://{}", cli.bind);
     println!("State file: {}", path.display());
-    axum::serve(listener, app).await?;
+    if let Some(tls) = tls {
+        println!("MeshLake controller listening on https://{}", cli.bind);
+        axum_server::bind_rustls(cli.bind, tls)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(cli.bind).await?;
+        println!("MeshLake controller listening on http://{}", cli.bind);
+        if cli.allow_insecure_public_http && !cli.bind.ip().is_loopback() {
+            eprintln!(
+                "WARNING: MeshLake controller is serving plaintext HTTP on a non-loopback address"
+            );
+        }
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    // MeshLake standardizes on Ring. Installing it explicitly avoids Rustls'
+    // ambiguous-provider panic when dependencies enable another provider.
+    let provider = rustls::crypto::ring::default_provider();
+    let _ = provider.install_default();
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        anyhow::bail!("cannot install the Rustls Ring crypto provider");
+    }
+    Ok(())
+}
+
+async fn load_controller_tls_configuration(
+    tls_files: Option<(PathBuf, PathBuf)>,
+) -> Result<Option<axum_server::tls_rustls::RustlsConfig>> {
+    let Some((certificate, private_key)) = tls_files else {
+        return Ok(None);
+    };
+    Ok(Some(
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            certificate.clone(),
+            private_key.clone(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "cannot load TLS certificate {} and private key {}",
+                certificate.display(),
+                private_key.display()
+            )
+        })?,
+    ))
+}
+
+fn controller_tls_configuration(cli: &Cli) -> Result<Option<(PathBuf, PathBuf)>> {
+    let tls = match (&cli.tls_certificate, &cli.tls_private_key) {
+        (Some(certificate), Some(private_key)) => Some((certificate.clone(), private_key.clone())),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "--tls-certificate and --tls-private-key must always be provided together"
+        ),
+    };
+    if cli.allow_insecure_public_http && (tls.is_some() || cli.tls_client_ca_certificate.is_some())
+    {
+        anyhow::bail!(
+            "--allow-insecure-public-http cannot be combined with TLS certificate options"
+        );
+    }
+    if tls.is_none() && !cli.bind.ip().is_loopback() && !cli.allow_insecure_public_http {
+        anyhow::bail!(
+            "refusing plaintext controller HTTP on non-loopback {}; configure --tls-certificate and --tls-private-key, bind to loopback behind an HTTPS reverse proxy, or explicitly use --allow-insecure-public-http for isolated development",
+            cli.bind
+        );
+    }
+    Ok(tls)
+}
+
+fn validate_controller_url(value: &str, allow_insecure_public_http: bool) -> Result<String> {
+    let value = value.trim();
+    let Some((raw_scheme, authority_and_path)) = value.split_once("://") else {
+        anyhow::bail!("--planet-controller-url must start with http:// or https://");
+    };
+    let raw_authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if !matches!(raw_scheme.to_ascii_lowercase().as_str(), "http" | "https")
+        || authority_and_path.is_empty()
+        || authority_and_path.starts_with('/')
+        || value.contains('\\')
+        || raw_authority.contains('@')
+    {
+        anyhow::bail!("--planet-controller-url must include a valid HTTP authority");
+    }
+    let mut parsed = Url::parse(value).context("--planet-controller-url is not a valid URL")?;
+    if parsed.host_str().is_none() || !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("--planet-controller-url must be an http:// or https:// URL with a host");
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        anyhow::bail!("--planet-controller-url must not contain embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("--planet-controller-url must not contain a query or fragment");
+    }
+    if parsed.path() != "/" {
+        anyhow::bail!("--planet-controller-url must not contain a path");
+    }
+    if parsed.scheme() != "https" && !allow_insecure_public_http {
+        anyhow::bail!(
+            "--planet-controller-url must use https:// by default; plain http:// is only available with --allow-insecure-public-http for isolated development"
+        );
+    }
+    parsed.set_path("");
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+fn load_tls_client_ca(path: Option<&FsPath>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = fs::read(path)
+        .with_context(|| format!("cannot read client CA certificate {}", path.display()))?;
+    if bytes.is_empty() || bytes.len() > 64 * 1024 {
+        anyhow::bail!("client CA certificate must contain between 1 byte and 64 KiB");
+    }
+    let pem = String::from_utf8(bytes).context("client CA certificate is not UTF-8 PEM")?;
+    let mut reader = BufReader::new(pem.as_bytes());
+    let items = rustls_pemfile::read_all(&mut reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("client CA certificate is not valid PEM")?;
+    let mut certificate_count = 0_usize;
+    let mut roots = rustls::RootCertStore::empty();
+    for item in items {
+        match item {
+            rustls_pemfile::Item::X509Certificate(certificate) => {
+                roots
+                    .add(certificate)
+                    .context("client CA certificate contains invalid X.509 data")?;
+                certificate_count += 1;
+            }
+            _ => anyhow::bail!(
+                "client CA certificate bundle may contain only PEM CERTIFICATE blocks"
+            ),
+        }
+    }
+    if certificate_count == 0 {
+        anyhow::bail!("client CA certificate does not contain a valid PEM certificate block");
+    }
+    Ok(Some(pem))
 }
 
 fn parse_planet_root(value: &str) -> Result<PlanetRoot, String> {
@@ -946,6 +1145,179 @@ fn default_state_path() -> PathBuf {
 mod tests {
     use super::*;
     use meshlake_core::RelayPolicy;
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path =
+                env::temp_dir().join(format!("meshlake-controller-{label}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_cli(bind: SocketAddr) -> Cli {
+        Cli {
+            bind,
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_client_ca_certificate: None,
+            allow_insecure_public_http: false,
+            state_file: None,
+            planet_controller_url: None,
+            planet_relay_endpoints: Vec::new(),
+            planet_roots: Vec::new(),
+            planet_stun_servers: Vec::new(),
+        }
+    }
+
+    fn test_state(schema_version: u32) -> ControllerState {
+        ControllerState {
+            schema_version,
+            signing_key: vec![7; 32],
+            admin_token: "preserved-administrator-token".into(),
+            networks: HashMap::new(),
+            enrollment_tokens: HashMap::new(),
+        }
+    }
+
+    fn backup_path(path: &FsPath) -> PathBuf {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        backup.into()
+    }
+
+    fn generated_certificate(subject_alt_name: &str) -> (String, String) {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec![subject_alt_name.to_owned()]).unwrap();
+        (cert.pem(), signing_key.serialize_pem())
+    }
+
+    async fn start_https_server(
+        certificate_pem: &str,
+        private_key_pem: &str,
+    ) -> (
+        TestDirectory,
+        SocketAddr,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        install_rustls_crypto_provider().unwrap();
+        let directory = TestDirectory::new("https");
+        let certificate = directory.file("certificate.pem");
+        let private_key = directory.file("private-key.pem");
+        fs::write(&certificate, certificate_pem).unwrap();
+        fs::write(&private_key, private_key_pem).unwrap();
+        let tls = load_controller_tls_configuration(Some((certificate, private_key)))
+            .await
+            .unwrap()
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = axum_server::Handle::<SocketAddr>::new();
+        let server = axum_server::from_tcp_rustls(listener, tls)
+            .unwrap()
+            .handle(handle.clone())
+            .serve(
+                Router::new()
+                    .route("/health", get(health))
+                    .into_make_service(),
+            );
+        let task = tokio::spawn(server);
+        let address = tokio::time::timeout(Duration::from_secs(5), handle.listening())
+            .await
+            .expect("HTTPS listener did not start in time")
+            .expect("HTTPS listener failed to bind");
+        (directory, address, task)
+    }
+
+    async fn https_get_with_private_ca(
+        address: SocketAddr,
+        server_name: &str,
+        certificate_pem: &str,
+    ) -> Result<String> {
+        let server_name = server_name.to_owned();
+        let certificate_pem = certificate_pem.to_owned();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                use rustls::pki_types::ServerName;
+                use std::io::{Read, Write};
+
+                let mut reader = BufReader::new(certificate_pem.as_bytes());
+                let certificates = rustls_pemfile::certs(&mut reader)
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .context("test CA is not valid PEM")?;
+                let mut roots = rustls::RootCertStore::empty();
+                for certificate in certificates {
+                    roots
+                        .add(certificate)
+                        .context("test CA is not valid X.509")?;
+                }
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let server_name_value = ServerName::try_from(server_name.clone())
+                    .context("test server name is invalid")?;
+                let connection =
+                    rustls::ClientConnection::new(Arc::new(config), server_name_value)?;
+                let socket =
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                write!(
+                    stream,
+                    "GET /health HTTP/1.1\r\nHost: {server_name}\r\nConnection: close\r\n\r\n"
+                )?;
+                stream.flush()?;
+
+                let mut response = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => response.extend_from_slice(&buffer[..read]),
+                        Err(error)
+                            if !response.is_empty()
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                String::from_utf8(response).context("HTTPS response is not UTF-8")
+            }),
+        )
+        .await
+        .context("HTTPS smoke-test request timed out")?
+        .context("HTTPS smoke-test worker panicked")?
+    }
+
+    async fn stop_https_server(task: tokio::task::JoinHandle<std::io::Result<()>>) {
+        task.abort();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("aborted HTTPS server task did not stop within five seconds");
+        assert!(result.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn allocation_skips_assigned_addresses() {
@@ -1016,11 +1388,13 @@ mod tests {
 
     #[test]
     fn invitation_carries_planet_bootstrap_information() {
+        let tls_ca = "-----BEGIN CERTIFICATE-----\nprivate-ca\n-----END CERTIFICATE-----\n";
         let link = make_invite_link(
             "https://planet.example.com/",
             Uuid::from_u128(1),
             "single-use-token",
             "public-key",
+            Some(tls_ca),
         );
         let link = Url::parse(&link).unwrap();
         assert_eq!(link.scheme(), "meshlake");
@@ -1034,5 +1408,274 @@ mod tests {
             parameters.get("planet").map(|value| value.as_ref()),
             Some("https://planet.example.com/v1/planet")
         );
+        assert_eq!(
+            parameters
+                .get("tls_ca")
+                .and_then(|value| STANDARD.decode(value.as_bytes()).ok()),
+            Some(tls_ca.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn tls_arguments_must_be_complete_and_exclude_the_dangerous_http_switch() {
+        let bind = "127.0.0.1:51822".parse().unwrap();
+        let mut cli = test_cli(bind);
+        assert!(controller_tls_configuration(&cli).unwrap().is_none());
+
+        cli.tls_certificate = Some("certificate.pem".into());
+        assert!(controller_tls_configuration(&cli).is_err());
+
+        cli.tls_certificate = None;
+        cli.tls_private_key = Some("private-key.pem".into());
+        assert!(controller_tls_configuration(&cli).is_err());
+
+        cli.tls_certificate = Some("certificate.pem".into());
+        assert!(controller_tls_configuration(&cli).unwrap().is_some());
+
+        cli.allow_insecure_public_http = true;
+        assert!(controller_tls_configuration(&cli).is_err());
+
+        cli.tls_certificate = None;
+        cli.tls_private_key = None;
+        cli.tls_client_ca_certificate = Some("ca.pem".into());
+        assert!(controller_tls_configuration(&cli).is_err());
+    }
+
+    #[test]
+    fn non_loopback_plain_http_requires_the_explicit_development_switch() {
+        let mut cli = test_cli("0.0.0.0:51822".parse().unwrap());
+        assert!(controller_tls_configuration(&cli).is_err());
+        cli.allow_insecure_public_http = true;
+        assert!(controller_tls_configuration(&cli).unwrap().is_none());
+    }
+
+    #[test]
+    fn published_controller_url_is_https_by_default() {
+        assert_eq!(
+            validate_controller_url(" HTTPS://PLANET.EXAMPLE.COM:443/ ", false).unwrap(),
+            "https://planet.example.com"
+        );
+        assert!(validate_controller_url("http://203.0.113.10:51822", false).is_err());
+        assert_eq!(
+            validate_controller_url("http://192.0.2.10:51822/", true).unwrap(),
+            "http://192.0.2.10:51822"
+        );
+    }
+
+    #[test]
+    fn published_controller_url_rejects_credentials_query_and_fragment() {
+        for value in [
+            "https://user:password@planet.example.com",
+            "https://@planet.example.com",
+            "https://planet.example.com\\",
+            "https://planet.example.com?token=secret",
+            "https://planet.example.com#fragment",
+            "https://planet.example.com/controller",
+            "ftp://planet.example.com",
+            "https:///missing-host",
+        ] {
+            assert!(
+                validate_controller_url(value, false).is_err(),
+                "unexpectedly accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_ca_loader_accepts_a_real_bundle_and_rejects_fake_or_secret_pem() {
+        let directory = TestDirectory::new("client-ca");
+        let (first_certificate, first_private_key) = generated_certificate("first.example");
+        let (second_certificate, _) = generated_certificate("second.example");
+        let valid_path = directory.file("bundle.pem");
+        let bundle = format!("{first_certificate}{second_certificate}");
+        fs::write(&valid_path, &bundle).unwrap();
+        assert_eq!(load_tls_client_ca(Some(&valid_path)).unwrap(), Some(bundle));
+
+        let fake_path = directory.file("fake.pem");
+        fs::write(
+            &fake_path,
+            "-----BEGIN CERTIFICATE-----\nnot-a-certificate\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(load_tls_client_ca(Some(&fake_path)).is_err());
+
+        let secret_path = directory.file("contains-private-key.pem");
+        fs::write(
+            &secret_path,
+            format!("{first_certificate}{first_private_key}"),
+        )
+        .unwrap();
+        assert!(load_tls_client_ca(Some(&secret_path)).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_tls_configuration_rejects_a_mismatched_key() {
+        install_rustls_crypto_provider().unwrap();
+        let directory = TestDirectory::new("mismatched-tls");
+        let (certificate, _) = generated_certificate("127.0.0.1");
+        let (_, wrong_private_key) = generated_certificate("127.0.0.1");
+        let certificate_path = directory.file("certificate.pem");
+        let private_key_path = directory.file("private-key.pem");
+        fs::write(&certificate_path, certificate).unwrap();
+        fs::write(&private_key_path, wrong_private_key).unwrap();
+        assert!(
+            load_controller_tls_configuration(Some((certificate_path, private_key_path)))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_https_uses_the_selected_provider_and_private_ca() {
+        let (certificate, private_key) = generated_certificate("127.0.0.1");
+        let (_directory, address, task) = start_https_server(&certificate, &private_key).await;
+        let response = https_get_with_private_ca(address, "127.0.0.1", &certificate)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("MeshLake controller is running"));
+
+        let (wrong_certificate, _) = generated_certificate("127.0.0.1");
+        assert!(
+            https_get_with_private_ca(address, "127.0.0.1", &wrong_certificate)
+                .await
+                .is_err()
+        );
+
+        stop_https_server(task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_https_rejects_a_certificate_with_the_wrong_san() {
+        let (certificate, private_key) = generated_certificate("localhost");
+        let (_directory, address, task) = start_https_server(&certificate, &private_key).await;
+        assert!(
+            https_get_with_private_ca(address, "127.0.0.1", &certificate)
+                .await
+                .is_err()
+        );
+        stop_https_server(task).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plaintext_controller_state_is_dpapi_protected_without_rotating_credentials() {
+        let directory = TestDirectory::new("legacy-state");
+        let path = directory.file("controller.json");
+        let original = test_state(2);
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let (controller, initial_token) = Controller::open(path.clone(), None).unwrap();
+        assert!(initial_token.is_none());
+        let bytes = fs::read(&path).unwrap();
+        let decoded: meshlake_core::DecodedState<ControllerState> =
+            decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE).unwrap();
+        assert_eq!(decoded.value.schema_version, 2);
+        assert_eq!(decoded.value.signing_key, original.signing_key);
+        assert_eq!(decoded.value.admin_token, original.admin_token);
+        assert!(!String::from_utf8_lossy(&bytes).contains("preserved-administrator-token"));
+        drop(controller);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_open_removes_plaintext_backup_after_validating_protected_primary_state() {
+        let directory = TestDirectory::new("stale-plaintext-backup");
+        let path = directory.file("controller.json");
+        let backup = backup_path(&path);
+        let original = test_state(2);
+        write_state(&path, &original).unwrap();
+        fs::write(&backup, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&fs::read(&backup).unwrap())
+            .contains("preserved-administrator-token"));
+
+        let (controller, initial_token) = Controller::open(path.clone(), None).unwrap();
+        assert!(initial_token.is_none());
+        assert!(!backup.exists());
+        let decoded: meshlake_core::DecodedState<ControllerState> = decode_protected_state(
+            &fs::read(&path).unwrap(),
+            CONTROLLER_STATE_PROTECTION_PURPOSE,
+        )
+        .unwrap();
+        assert_eq!(decoded.value.signing_key, original.signing_key);
+        assert_eq!(decoded.value.admin_token, original.admin_token);
+
+        drop(controller);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_open_keeps_backup_when_primary_state_fails_validation() {
+        let directory = TestDirectory::new("invalid-primary-keeps-backup");
+        let path = directory.file("controller.json");
+        let backup = backup_path(&path);
+        let mut invalid = test_state(2);
+        invalid.signing_key.clear();
+        write_state(&path, &invalid).unwrap();
+        let recovery = test_state(2);
+        fs::write(&backup, serde_json::to_vec_pretty(&recovery).unwrap()).unwrap();
+
+        let error = match Controller::open(path.clone(), None) {
+            Ok(_) => panic!("invalid controller state unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("controller signing key is invalid"));
+        assert!(backup.exists());
+        assert!(String::from_utf8_lossy(&fs::read(&backup).unwrap())
+            .contains("preserved-administrator-token"));
+    }
+
+    #[test]
+    fn legacy_controller_schema_migrates_without_rotating_credentials() {
+        let directory = TestDirectory::new("legacy-schema");
+        let path = directory.file("controller.json");
+        let original = test_state(1);
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let (controller, initial_token) = Controller::open(path.clone(), None).unwrap();
+        assert!(initial_token.is_none());
+        let bytes = fs::read(&path).unwrap();
+        let decoded: meshlake_core::DecodedState<ControllerState> =
+            decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE).unwrap();
+        assert_eq!(decoded.value.schema_version, 2);
+        assert_eq!(decoded.value.signing_key, original.signing_key);
+        assert_eq!(decoded.value.admin_token, original.admin_token);
+        drop(controller);
+    }
+
+    #[test]
+    fn interrupted_state_replacement_recovers_the_backup() {
+        let directory = TestDirectory::new("state-recovery");
+        let path = directory.file("controller.json");
+        let backup = backup_path(&path);
+        let original = test_state(2);
+        fs::write(&backup, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let (controller, initial_token) = Controller::open(path.clone(), None).unwrap();
+        assert!(initial_token.is_none());
+        assert!(path.exists());
+        assert!(!backup.exists());
+        let bytes = fs::read(&path).unwrap();
+        let decoded: meshlake_core::DecodedState<ControllerState> =
+            decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE).unwrap();
+        assert_eq!(decoded.value.admin_token, original.admin_token);
+        drop(controller);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_controller_state_is_always_restricted_to_mode_0600() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = TestDirectory::new("state-permissions");
+        let path = directory.file("controller.json");
+        fs::write(&path, serde_json::to_vec_pretty(&test_state(2)).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (controller, _) = Controller::open(path.clone(), None).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        drop(controller);
     }
 }

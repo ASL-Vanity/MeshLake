@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 /target-upnp/
+/target-controller-security/
 /%MESHLAKE_TARGET%/
 
 # Packaged releases and local staging
@@ -24,6 +25,8 @@ root-identity.json
 relay-config.json
 *.json.bak
 *.json.tmp
+*.json.tmp-*
+*.json.lock
 *.pem
 *.key
 *.pfx

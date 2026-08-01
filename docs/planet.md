@@ -38,12 +38,15 @@ meshlake-cli.exe network join-link --link '<管理员发来的完整链接>'
 ```powershell
 meshlake-controller.exe `
   --bind 0.0.0.0:51822 `
+  --tls-certificate C:\MeshLake\tls\fullchain.pem `
+  --tls-private-key C:\MeshLake\tls\private-key.pem `
+  --tls-client-ca-certificate C:\MeshLake\tls\root-ca.pem `
   --planet-controller-url https://planet.example.com `
   --planet-relay-endpoint planet.example.com:51820 `
   --planet-stun stun.example.com:3478
 ```
 
-清单地址为：`https://planet.example.com/v1/planet`。生产环境应通过 HTTPS 反向代理转发到本机控制器，而不要将控制器的 HTTP 端口直接暴露到公网。
+清单地址为：`https://planet.example.com/v1/planet`。生产环境可以使用控制器原生 HTTPS，也可以通过 HTTPS 反向代理转发到仅监听回环地址的控制器；不要将纯 HTTP 控制器直接暴露到公网。
 
 ## Windows 客户端配置
 
@@ -52,6 +55,16 @@ GUI 的“行星服务器（推荐）”展开项填写清单 URL 和控制器�
 ```powershell
 meshlake-cli.exe planet set `
   --manifest https://planet.example.com/v1/planet `
+  --controller-public-key-base64 <管理员可信渠道提供的公钥>
+```
+
+若 Planet/控制器使用自建 CA，把全局参数放在子命令之前；同一 CA 会用于清单下载并保存到对应控制面记录：
+
+```powershell
+meshlake-cli.exe `
+  --tls-ca-certificate C:\MeshLake\tls\root-ca.pem `
+  planet set `
+  --manifest https://planet.example.internal/v1/planet `
   --controller-public-key-base64 <管理员可信渠道提供的公钥>
 ```
 

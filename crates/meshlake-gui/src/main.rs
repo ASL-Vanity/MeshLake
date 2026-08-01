@@ -5,10 +5,10 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use eframe::egui;
 use meshlake_core::{
-    AgentStatus, EnrollmentResponse, MembershipClaims, RelayPolicy, UpsertNetworkRequest,
-    VirtualNetwork,
+    decode_protected_state, AgentStatus, EnrollmentResponse, MembershipClaims, RelayPolicy,
+    UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, Certificate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{fs, net::TcpStream, path::PathBuf, process::Command, time::Duration};
@@ -146,7 +146,10 @@ struct App {
     stun_servers: String,
     planet_manifest: String,
     planet_public_key: String,
+    controller_tls_ca_pem: String,
     admin_token: String,
+    admin_token_bound_value: String,
+    admin_token_controller: Option<String>,
     managed_networks: Vec<VirtualNetwork>,
     selected_network: Option<Uuid>,
     members: Vec<MembershipClaims>,
@@ -185,11 +188,23 @@ impl Default for Settings {
 #[derive(Deserialize)]
 struct IssuedToken {
     token: String,
+    #[serde(default)]
+    invite_link: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LocalControllerState {
     admin_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedInviteLink {
+    controller: String,
+    network_id: String,
+    token: String,
+    public_key: String,
+    planet_manifest_url: Option<String>,
+    tls_ca_pem: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -222,7 +237,10 @@ impl Default for App {
             stun_servers: String::new(),
             planet_manifest: String::new(),
             planet_public_key: String::new(),
+            controller_tls_ca_pem: String::new(),
             admin_token: String::new(),
+            admin_token_bound_value: String::new(),
+            admin_token_controller: None,
             managed_networks: Vec::new(),
             selected_network: None,
             members: Vec::new(),
@@ -247,6 +265,10 @@ impl App {
         ensure_local_controller_running();
         let mut app = Self::default();
         app.admin_token = load_local_admin_token().unwrap_or_default();
+        app.admin_token_bound_value = app.admin_token.clone();
+        if !app.admin_token.is_empty() {
+            app.admin_token_controller = Some(app.controller.clone());
+        }
         app.refresh_controller_public_key(false);
         if !app.controller_public_key.is_empty() {
             app.public_key = app.controller_public_key.clone();
@@ -317,8 +339,46 @@ impl App {
                 return;
             }
         };
-        let controller = self.controller.trim_end_matches('/');
-        let enrollment: EnrollmentResponse = match self.client.post(format!("{controller}/v1/enroll")).json(&json!({"network_id": network_id, "device_id": device_id, "device_public_key": device_public_key, "token": self.token.trim()})).send() {
+        let tls_ca_pem = match normalize_optional_tls_ca(&self.controller_tls_ca_pem) {
+            Ok(value) => value,
+            Err(error) => {
+                self.message = format!("控制器私有 CA 无效：{error}");
+                return;
+            }
+        };
+        let controller = match controller_base_url(&self.controller, tls_ca_pem.is_some()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.message = format!("控制器 URL 无效：{error}");
+                return;
+            }
+        };
+        let planet_manifest_url = match planet_manifest_url {
+            Some(value) => match normalize_http_url(&value, "Planet manifest URL", true) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    self.message = format!("Planet 清单 URL 无效：{error}");
+                    return;
+                }
+            },
+            None => None,
+        };
+        if let Err(error) = validate_tls_url_pair(
+            &controller,
+            planet_manifest_url.as_deref(),
+            tls_ca_pem.is_some(),
+        ) {
+            self.message = error;
+            return;
+        }
+        let enrollment_client = match controller_http_client(tls_ca_pem.as_deref()) {
+            Ok(client) => client,
+            Err(error) => {
+                self.message = format!("无法创建安全控制器连接：{error}");
+                return;
+            }
+        };
+        let enrollment: EnrollmentResponse = match enrollment_client.post(format!("{controller}/v1/enroll")).json(&json!({"network_id": network_id, "device_id": device_id, "device_public_key": device_public_key, "token": self.token.trim()})).send() {
             Ok(response) if response.status().is_success() => match response.json() {
                 Ok(value) => value,
                 Err(error) => { self.message = format!("控制器返回格式无效：{error}"); return; }
@@ -335,6 +395,7 @@ impl App {
                 "control_plane": {
                     "controller_url": controller,
                     "planet_manifest_url": planet_manifest_url,
+                    "controller_tls_ca_pem": tls_ca_pem,
                 }
             }))
             .send()
@@ -354,53 +415,43 @@ impl App {
     }
 
     fn join_invite_link(&mut self) {
-        let link = match Url::parse(self.invite_link.trim()) {
-            Ok(link) if link.scheme() == "meshlake" && link.host_str() == Some("join") => link,
-            _ => {
-                self.message = self
-                    .t(
-                        "邀请链接格式无效。请粘贴完整的 meshlake://join?... 链接。",
-                        "The invitation link is invalid. Paste the complete meshlake://join?... link.",
-                    )
-                    .into();
+        let invitation = match parse_invite_link(self.invite_link.trim()) {
+            Ok(invitation) => invitation,
+            Err(error) => {
+                self.message = format!("邀请链接无效：{error}");
                 return;
             }
         };
-        let parameter = |name: &str| {
-            link.query_pairs()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.into_owned())
-                .ok_or_else(|| format!("邀请链接缺少 {name}。"))
-        };
-        let (controller, network_id, token, public_key) = match (
-            parameter("controller"),
-            parameter("network_id"),
-            parameter("token"),
-            parameter("public_key"),
+        let current_controller = normalize_http_url(&self.controller, "controller URL", false).ok();
+        let configured_tls_ca =
+            if current_controller.as_deref() == Some(invitation.controller.as_str()) {
+                match normalize_optional_tls_ca(&self.controller_tls_ca_pem) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.message = format!("已配置的控制器私有 CA 无效：{error}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+        let effective_tls_ca = match select_effective_tls_ca(
+            invitation.tls_ca_pem.as_deref(),
+            configured_tls_ca.as_deref(),
         ) {
-            (Ok(controller), Ok(network_id), Ok(token), Ok(public_key)) => {
-                (controller, network_id, token, public_key)
-            }
-            _ => {
-                self.message = self
-                    .t(
-                        "邀请链接不完整，请让管理员重新生成。",
-                        "The invitation link is incomplete. Ask the administrator to create a new one.",
-                    )
-                    .into();
+            Ok(value) => value,
+            Err(error) => {
+                self.message = error;
                 return;
             }
         };
-        let planet_manifest_url = link
-            .query_pairs()
-            .find(|(key, _)| key == "planet")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| value.starts_with("https://") || value.starts_with("http://"));
-        self.controller = controller;
-        self.network_id = network_id;
-        self.token = token;
-        self.public_key = public_key;
-        self.join_network(planet_manifest_url);
+        self.switch_controller_context(invitation.controller);
+        self.network_id = invitation.network_id;
+        self.token = invitation.token;
+        self.public_key = invitation.public_key.clone();
+        self.controller_public_key = invitation.public_key;
+        self.controller_tls_ca_pem = effective_tls_ca.unwrap_or_default();
+        self.join_network(invitation.planet_manifest_url);
     }
 
     fn configure_relay(&mut self) {
@@ -427,12 +478,32 @@ impl App {
     }
 
     fn configure_planet(&mut self) {
+        let tls_ca_pem = match normalize_optional_tls_ca(&self.controller_tls_ca_pem) {
+            Ok(value) => value,
+            Err(error) => {
+                self.message = format!("控制器私有 CA 无效：{error}");
+                return;
+            }
+        };
+        let manifest_url =
+            match normalize_http_url(&self.planet_manifest, "Planet manifest URL", true) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.message = format!("Planet 清单 URL 无效：{error}");
+                    return;
+                }
+            };
+        if tls_ca_pem.is_some() && !manifest_url.starts_with("https://") {
+            self.message = "使用私有 CA 时，Planet 清单 URL 必须是 https://。".into();
+            return;
+        }
         match self
             .client
             .post(format!("{LOCAL_API}/planet"))
             .json(&json!({
-                "manifest_url": self.planet_manifest.trim(),
+                "manifest_url": manifest_url,
                 "controller_public_key_base64": self.planet_public_key.trim(),
+                "tls_ca_certificate_pem": tls_ca_pem,
             }))
             .send()
         {
@@ -449,21 +520,63 @@ impl App {
     }
 
     fn controller_request(
-        &self,
+        &mut self,
         method: reqwest::Method,
         path: String,
-    ) -> reqwest::blocking::RequestBuilder {
-        self.client
-            .request(
-                method,
-                format!("{}{}", self.controller.trim_end_matches('/'), path),
-            )
-            .header("x-meshlake-admin-token", self.admin_token.trim())
+        requires_admin: bool,
+    ) -> Result<reqwest::blocking::RequestBuilder, String> {
+        let tls_ca_pem = normalize_optional_tls_ca(&self.controller_tls_ca_pem)?;
+        let controller = controller_base_url(&self.controller, tls_ca_pem.is_some())?;
+        let client = controller_http_client(tls_ca_pem.as_deref())?;
+        let request = client.request(method, format!("{controller}{path}"));
+        if !requires_admin {
+            return Ok(request);
+        }
+
+        let admin_token = self.admin_token.trim().to_owned();
+        if admin_token.is_empty() {
+            self.admin_token_bound_value = self.admin_token.clone();
+            self.admin_token_controller = None;
+            return Err("当前控制器需要管理员令牌。".into());
+        }
+        if self.admin_token != self.admin_token_bound_value {
+            self.admin_token_bound_value = self.admin_token.clone();
+            self.admin_token_controller = Some(controller.clone());
+        }
+        if self.admin_token_controller.as_deref() != Some(controller.as_str()) {
+            return Err("管理员令牌已绑定到另一个控制器；请为当前控制器重新输入令牌。".into());
+        }
+        Ok(request.header("x-meshlake-admin-token", admin_token))
+    }
+
+    fn switch_controller_context(&mut self, controller: String) {
+        let current = normalize_http_url(&self.controller, "controller URL", false).ok();
+        if current.as_deref() != Some(controller.as_str()) {
+            self.admin_token.clear();
+            self.admin_token_bound_value.clear();
+            self.admin_token_controller = None;
+            self.controller_public_key.clear();
+            self.controller_tls_ca_pem.clear();
+            self.managed_networks.clear();
+            self.selected_network = None;
+            self.members.clear();
+            self.issued_token.clear();
+        }
+        self.controller = controller;
     }
 
     fn refresh_controller_public_key(&mut self, show_message: bool) {
-        let url = format!("{}/v1/public-key", self.controller.trim_end_matches('/'));
-        match self.client.get(url).send() {
+        let request =
+            match self.controller_request(reqwest::Method::GET, "/v1/public-key".into(), false) {
+                Ok(request) => request,
+                Err(error) => {
+                    if show_message {
+                        self.message = format!("控制器配置无效：{error}");
+                    }
+                    return;
+                }
+            };
+        match request.send() {
             Ok(response) if response.status().is_success() => {
                 match response.json::<ControllerPublicKey>() {
                     Ok(response) => {
@@ -494,10 +607,15 @@ impl App {
 
     fn refresh_managed_networks(&mut self) {
         ensure_local_controller_running();
-        match self
-            .controller_request(reqwest::Method::GET, "/v1/networks".into())
-            .send()
-        {
+        let request =
+            match self.controller_request(reqwest::Method::GET, "/v1/networks".into(), false) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.message = format!("控制器配置无效：{error}");
+                    return;
+                }
+            };
+        match request.send() {
             Ok(response) if response.status().is_success() => match response.json() {
                 Ok(networks) => {
                     self.managed_networks = networks;
@@ -518,18 +636,22 @@ impl App {
 
     fn create_managed_network(&mut self) {
         ensure_local_controller_running();
-        let request = UpsertNetworkRequest {
+        let network_request = UpsertNetworkRequest {
             id: None,
             name: self.name.trim().to_owned(),
             ipv4_prefix: self.prefix.trim().to_owned(),
             ipv6_prefix: None,
             relay_policy: RelayPolicy::Preferred,
         };
-        match self
-            .controller_request(reqwest::Method::POST, "/v1/networks".into())
-            .json(&request)
-            .send()
-        {
+        let controller_request =
+            match self.controller_request(reqwest::Method::POST, "/v1/networks".into(), true) {
+                Ok(request) => request.json(&network_request),
+                Err(error) => {
+                    self.message = format!("控制器配置无效：{error}");
+                    return;
+                }
+            };
+        match controller_request.send() {
             Ok(response) if response.status().is_success() => {
                 self.message = self
                     .t("控制器网络已创建。", "Controller network created.")
@@ -547,10 +669,18 @@ impl App {
     }
 
     fn delete_managed_network(&mut self, id: Uuid) {
-        match self
-            .controller_request(reqwest::Method::DELETE, format!("/v1/networks/{id}"))
-            .send()
-        {
+        let request = match self.controller_request(
+            reqwest::Method::DELETE,
+            format!("/v1/networks/{id}"),
+            true,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.message = format!("控制器配置无效：{error}");
+                return;
+            }
+        };
+        match request.send() {
             Ok(response) if response.status().is_success() => {
                 self.message = self
                     .t("网络已从控制器删除。", "Network deleted from controller.")
@@ -577,24 +707,48 @@ impl App {
                 .into();
             return;
         }
-        match self
-            .controller_request(
-                reqwest::Method::POST,
-                format!("/v1/networks/{id}/enrollment-tokens"),
-            )
-            .json(&json!({"expires_in_seconds": 900}))
-            .send()
-        {
+        let request = match self.controller_request(
+            reqwest::Method::POST,
+            format!("/v1/networks/{id}/enrollment-tokens"),
+            true,
+        ) {
+            Ok(request) => request.json(&json!({"expires_in_seconds": 900})),
+            Err(error) => {
+                self.message = format!("控制器配置无效：{error}");
+                return;
+            }
+        };
+        match request.send() {
             Ok(response) if response.status().is_success() => {
                 match response.json::<IssuedToken>() {
                     Ok(token) => {
                         self.issued_token = token.token;
-                        self.invite_link = make_invite_link(
-                            &self.controller,
-                            id,
-                            &self.issued_token,
-                            &self.controller_public_key,
-                        );
+                        self.invite_link = match token.invite_link {
+                            Some(link) if !link.trim().is_empty() => match parse_invite_link(&link)
+                            {
+                                Ok(_) => link,
+                                Err(error) => {
+                                    self.message = format!("控制器返回了无效的邀请链接：{error}");
+                                    return;
+                                }
+                            },
+                            _ => match make_invite_link(
+                                &self.controller,
+                                id,
+                                &self.issued_token,
+                                &self.controller_public_key,
+                                normalize_optional_tls_ca(&self.controller_tls_ca_pem)
+                                    .ok()
+                                    .flatten()
+                                    .as_deref(),
+                            ) {
+                                Ok(link) => link,
+                                Err(error) => {
+                                    self.message = format!("无法生成邀请链接：{error}");
+                                    return;
+                                }
+                            },
+                        };
                         self.message = self
                             .t(
                                 "已生成 15 分钟有效的一次性入网令牌。",
@@ -616,10 +770,18 @@ impl App {
 
     fn load_members(&mut self, id: Uuid) {
         ensure_local_controller_running();
-        match self
-            .controller_request(reqwest::Method::GET, format!("/v1/networks/{id}/members"))
-            .send()
-        {
+        let request = match self.controller_request(
+            reqwest::Method::GET,
+            format!("/v1/networks/{id}/members"),
+            true,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.message = format!("控制器配置无效：{error}");
+                return;
+            }
+        };
+        match request.send() {
             Ok(response) if response.status().is_success() => match response.json() {
                 Ok(members) => {
                     self.selected_network = Some(id);
@@ -636,13 +798,18 @@ impl App {
 
     fn remove_member(&mut self, network_id: Uuid, device_id: Uuid) {
         ensure_local_controller_running();
-        match self
-            .controller_request(
-                reqwest::Method::DELETE,
-                format!("/v1/networks/{network_id}/members/{device_id}"),
-            )
-            .send()
-        {
+        let request = match self.controller_request(
+            reqwest::Method::DELETE,
+            format!("/v1/networks/{network_id}/members/{device_id}"),
+            true,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.message = format!("控制器配置无效：{error}");
+                return;
+            }
+        };
+        match request.send() {
             Ok(response) if response.status().is_success() => {
                 self.message = self
                     .t(
@@ -667,19 +834,300 @@ impl App {
     }
 }
 
+fn parse_invite_link(value: &str) -> Result<ParsedInviteLink, String> {
+    let link = Url::parse(value.trim()).map_err(|error| error.to_string())?;
+    if link.scheme() != "meshlake" || link.host_str() != Some("join") {
+        return Err("链接必须以 meshlake://join? 开头".into());
+    }
+    if !link.username().is_empty()
+        || link.password().is_some()
+        || !link.path().is_empty()
+        || link.fragment().is_some()
+    {
+        return Err("链接包含不支持的 URL 组成部分".into());
+    }
+    let parameter = |name: &str| {
+        link.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("链接缺少 {name}"))
+    };
+    let controller = normalize_http_url(&parameter("controller")?, "controller URL", false)?;
+    let network_id = Uuid::parse_str(&parameter("network_id")?)
+        .map_err(|_| "network_id 不是有效 UUID".to_owned())?
+        .to_string();
+    let token = parameter("token")?;
+    let public_key = parameter("public_key")?;
+    let decoded_key = STANDARD
+        .decode(&public_key)
+        .map_err(|_| "public_key 不是有效 Base64".to_owned())?;
+    if decoded_key.len() != 32 {
+        return Err("public_key 必须正好包含 32 字节".into());
+    }
+    let planet_manifest_url = link
+        .query_pairs()
+        .find(|(key, _)| key == "planet")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_http_url(&value, "Planet manifest URL", true))
+        .transpose()?;
+    let tls_ca_pem = link
+        .query_pairs()
+        .find(|(key, _)| key == "tls_ca")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+        .map(|encoded| {
+            let decoded = STANDARD
+                .decode(encoded)
+                .map_err(|_| "tls_ca 不是有效 Base64".to_owned())?;
+            if decoded.is_empty() || decoded.len() > 64 * 1024 {
+                return Err("tls_ca 必须包含 1 字节到 64 KiB".into());
+            }
+            let pem =
+                String::from_utf8(decoded).map_err(|_| "tls_ca 不是 UTF-8 PEM 证书".to_owned())?;
+            normalize_tls_ca_pem(&pem)
+        })
+        .transpose()?;
+    validate_tls_url_pair(
+        &controller,
+        planet_manifest_url.as_deref(),
+        tls_ca_pem.is_some(),
+    )?;
+    Ok(ParsedInviteLink {
+        controller,
+        network_id,
+        token,
+        public_key,
+        planet_manifest_url,
+        tls_ca_pem,
+    })
+}
+
+fn normalize_http_url(value: &str, description: &str, allow_path: bool) -> Result<String, String> {
+    let value = value.trim();
+    let Some((raw_scheme, authority_and_path)) = value.split_once("://") else {
+        return Err(format!("{description} 必须使用 http:// 或 https://"));
+    };
+    let raw_authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if !matches!(raw_scheme.to_ascii_lowercase().as_str(), "http" | "https")
+        || authority_and_path.is_empty()
+        || authority_and_path.starts_with('/')
+        || value.contains('\\')
+        || raw_authority.contains('@')
+    {
+        return Err(format!("{description} 必须包含有效的 HTTP authority"));
+    }
+    let mut url =
+        Url::parse(value).map_err(|error| format!("{description} 不是有效 URL：{error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("{description} 必须使用 http:// 或 https://"));
+    }
+    if url.host_str().is_none() {
+        return Err(format!("{description} 必须包含主机名或 IP"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{description} 不得包含用户名或密码"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!("{description} 不得包含 query 或 fragment"));
+    }
+    if !allow_path && url.path() != "/" {
+        return Err(format!("{description} 不得包含路径"));
+    }
+    if allow_path && url.path() == "/" {
+        return Err(format!("{description} 必须包含清单路径"));
+    }
+    if !allow_path {
+        url.set_path("");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn validate_tls_url_pair(
+    controller_url: &str,
+    planet_manifest_url: Option<&str>,
+    has_private_ca: bool,
+) -> Result<(), String> {
+    if !has_private_ca {
+        return Ok(());
+    }
+    if Url::parse(controller_url)
+        .map_err(|error| error.to_string())?
+        .scheme()
+        != "https"
+    {
+        return Err("使用私有 CA 时，控制器 URL 必须是 https://".into());
+    }
+    if let Some(planet_manifest_url) = planet_manifest_url {
+        if Url::parse(planet_manifest_url)
+            .map_err(|error| error.to_string())?
+            .scheme()
+            != "https"
+        {
+            return Err("使用私有 CA 时，Planet 清单 URL 必须是 https://".into());
+        }
+    }
+    Ok(())
+}
+
+fn controller_base_url(value: &str, has_private_ca: bool) -> Result<String, String> {
+    let url = normalize_http_url(value, "controller URL", false)?;
+    validate_tls_url_pair(&url, None, has_private_ca)?;
+    Ok(url)
+}
+
+fn normalize_optional_tls_ca(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        normalize_tls_ca_pem(value).map(Some)
+    }
+}
+
+fn select_effective_tls_ca(
+    invitation: Option<&str>,
+    configured: Option<&str>,
+) -> Result<Option<String>, String> {
+    match (invitation, configured) {
+        (None, None) => Ok(None),
+        (Some(ca), None) | (None, Some(ca)) => Ok(Some(ca.to_owned())),
+        (Some(invitation), Some(configured)) if invitation == configured => {
+            Ok(Some(invitation.to_owned()))
+        }
+        (Some(_), Some(_)) => {
+            Err("邀请链接中的私有 CA 与当前控制器配置冲突；已拒绝入网，请先核对 CA 指纹。".into())
+        }
+    }
+}
+
+fn tls_certificate_der_bundle(pem: &str) -> Result<Vec<Vec<u8>>, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if pem.is_empty() || pem.len() > 64 * 1024 {
+        return Err("CA PEM 必须包含 1 字节到 64 KiB".into());
+    }
+    let mut certificates = Vec::new();
+    let mut current = None::<String>;
+    for line in pem.lines().map(str::trim) {
+        match line {
+            BEGIN => {
+                if current.is_some() {
+                    return Err("CA PEM 包含嵌套的证书块".into());
+                }
+                current = Some(String::new());
+            }
+            END => {
+                let encoded = current
+                    .take()
+                    .ok_or_else(|| "CA PEM 的证书结束标记没有对应的开始标记".to_owned())?;
+                if encoded.is_empty() {
+                    return Err("CA PEM 包含空证书块".into());
+                }
+                certificates.push(
+                    STANDARD
+                        .decode(encoded)
+                        .map_err(|_| "CA PEM 证书不是有效 Base64".to_owned())?,
+                );
+            }
+            "" => {}
+            value => {
+                let Some(encoded) = current.as_mut() else {
+                    return Err("CA PEM 的证书块外存在其他数据".into());
+                };
+                if !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+                {
+                    return Err("CA PEM 证书包含非法字符".into());
+                }
+                encoded.push_str(value);
+            }
+        }
+    }
+    if current.is_some() {
+        return Err("CA PEM 证书块缺少结束标记".into());
+    }
+    if certificates.is_empty() {
+        return Err("CA PEM 不包含证书".into());
+    }
+    certificates.sort();
+    certificates.dedup();
+    Ok(certificates)
+}
+
+fn normalize_tls_ca_pem(pem: &str) -> Result<String, String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let certificates = tls_certificate_der_bundle(pem)?;
+    let mut builder = Client::builder().tls_built_in_root_certs(false);
+    for certificate in &certificates {
+        builder = builder.add_root_certificate(
+            Certificate::from_der(certificate)
+                .map_err(|error| format!("CA DER 证书无效：{error}"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|error| format!("CA X.509 证书无效：{error}"))?;
+
+    let mut normalized = String::new();
+    for certificate in certificates {
+        normalized.push_str(BEGIN);
+        normalized.push('\n');
+        let encoded = STANDARD.encode(certificate);
+        for line in encoded.as_bytes().chunks(64) {
+            normalized.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            normalized.push('\n');
+        }
+        normalized.push_str(END);
+        normalized.push('\n');
+    }
+    Ok(normalized)
+}
+
+fn controller_http_client(tls_ca_pem: Option<&str>) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(tls_ca_pem) = tls_ca_pem {
+        let certificates = tls_certificate_der_bundle(tls_ca_pem)?;
+        builder = builder.tls_built_in_root_certs(false);
+        for certificate in certificates {
+            builder = builder.add_root_certificate(
+                Certificate::from_der(&certificate)
+                    .map_err(|error| format!("CA DER 证书无效：{error}"))?,
+            );
+        }
+    }
+    builder
+        .build()
+        .map_err(|error| format!("无法创建 HTTPS 客户端：{error}"))
+}
+
 fn make_invite_link(
     controller: &str,
     network_id: Uuid,
     token: &str,
     controller_public_key: &str,
-) -> String {
+    tls_ca_pem: Option<&str>,
+) -> Result<String, String> {
+    let controller = controller_base_url(controller, tls_ca_pem.is_some())?;
     let mut link = Url::parse("meshlake://join").expect("static invitation URL is valid");
     link.query_pairs_mut()
-        .append_pair("controller", controller.trim_end_matches('/'))
+        .append_pair("controller", &controller)
         .append_pair("network_id", &network_id.to_string())
         .append_pair("token", token)
         .append_pair("public_key", controller_public_key);
-    link.into()
+    if let Some(tls_ca_pem) = tls_ca_pem {
+        link.query_pairs_mut()
+            .append_pair("tls_ca", &STANDARD.encode(tls_ca_pem.as_bytes()));
+    }
+    Ok(link.into())
 }
 
 impl eframe::App for App {
@@ -770,6 +1218,24 @@ impl eframe::App for App {
             } else {
                 ui.label("GUI 关闭不会停止正在运行的后台服务。");
             }
+            ui.collapsing(
+                self.t(
+                    "私有控制器 / Planet CA（高级）",
+                    "Private controller / Planet CA (advanced)",
+                ),
+                |ui| {
+                    ui.label(self.t(
+                        "仅在控制器使用私有 CA 签发 HTTPS 证书时粘贴 PEM。邀请链接中的 CA 会自动填入这里，并按网络保存到后台。",
+                        "Paste PEM only when the controller HTTPS certificate is issued by a private CA. An invitation CA is filled here automatically and stored per network by the agent.",
+                    ));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.controller_tls_ca_pem)
+                            .desired_rows(4)
+                            .desired_width(780.0)
+                            .hint_text("-----BEGIN CERTIFICATE-----"),
+                    );
+                },
+            );
             ui.separator();
             ui.collapsing(
                 self.t("控制器网络管理", "Controller network management"),
@@ -781,8 +1247,8 @@ impl eframe::App for App {
                     ui.colored_label(
                         egui::Color32::YELLOW,
                         self.t(
-                            "注意：移除成员会撤销其控制器记录；旧证书的在线吊销将在后续版本补齐。",
-                            "Note: removing a member revokes its controller record; online revocation of already-issued certificates is not implemented yet.",
+                            "注意：移除成员会轮换网络密钥并更新签名授权清单。正常在线客户端通常在约 20 秒内停用该成员；拒绝刷新客户端的最坏窗口由 90 秒授权租约限定。",
+                            "Removing a member rotates the network key and updates the signed authorization manifest. Normal online clients usually enforce it within about 20 seconds; the worst case for a non-refreshing client is bounded by the 90-second authorization lease.",
                         ),
                     );
                     egui::Grid::new("controller-admin")
@@ -975,8 +1441,8 @@ impl eframe::App for App {
 
         if self.show_close_confirmation {
             let (title, text, minimize, exit, never) = match self.settings.language {
-                Language::Chinese => ("关闭 MeshLake", "是否最小化到系统托盘？后台网络服务将继续运行。", "最小化到托盘", "退出界面", "不再询问"),
-                Language::English => ("Close MeshLake", "Minimize to the system tray? The background network service will keep running.", "Minimize to tray", "Exit window", "Don't ask again"),
+                Language::Chinese => ("关闭 MeshLake", "请选择最小化到系统托盘，或完全退出 MeshLake 并结束后台网络服务。", "最小化到托盘", "完全退出 MeshLake", "不再询问"),
+                Language::English => ("Close MeshLake", "Minimize to the system tray, or fully exit MeshLake and stop its background network services.", "Minimize to tray", "Fully exit MeshLake", "Don't ask again"),
             };
             let mut action = None;
             egui::Window::new(title)
@@ -1133,9 +1599,14 @@ fn load_local_admin_token() -> Option<String> {
         .map(PathBuf::from)?
         .join("MeshLake")
         .join("controller.json");
-    serde_json::from_slice::<LocalControllerState>(&fs::read(path).ok()?)
+    let bytes = fs::read(path).ok()?;
+    decode_local_admin_token(&bytes)
+}
+
+fn decode_local_admin_token(bytes: &[u8]) -> Option<String> {
+    decode_protected_state::<LocalControllerState>(bytes, CONTROLLER_STATE_PROTECTION_PURPOSE)
         .ok()
-        .map(|state| state.admin_token)
+        .map(|decoded| decoded.value.admin_token)
 }
 
 fn shutdown_all_meshlake_and_exit() {
@@ -1147,6 +1618,7 @@ fn shutdown_all_meshlake_and_exit() {
         for process in [
             "meshlaked.exe",
             "meshlake-controller.exe",
+            "meshlake-root.exe",
             "meshlake-relay.exe",
         ] {
             let mut command = Command::new("taskkill");
@@ -1216,8 +1688,226 @@ fn show_native_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generated_test_ca_pem() -> String {
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["planet.example.com".into()]).unwrap();
+        cert.pem()
+    }
+
+    fn invitation(controller: &str, planet: Option<&str>, tls_ca: Option<&str>) -> String {
+        let mut link = Url::parse("meshlake://join").unwrap();
+        link.query_pairs_mut()
+            .append_pair("controller", controller)
+            .append_pair("network_id", "2a2d7ed1-5a22-4f60-b6c5-573ac589c514")
+            .append_pair("token", "single-use")
+            .append_pair("public_key", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        if let Some(planet) = planet {
+            link.query_pairs_mut().append_pair("planet", planet);
+        }
+        if let Some(tls_ca) = tls_ca {
+            link.query_pairs_mut()
+                .append_pair("tls_ca", &STANDARD.encode(tls_ca.as_bytes()));
+        }
+        link.into()
+    }
+
     #[test]
     fn base64_controller_key_decodes() {
         assert_eq!(STANDARD.decode("AQIDBA==").unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn invitation_private_ca_is_normalized_and_kept_with_planet() {
+        let pem = generated_test_ca_pem();
+        let normalized = normalize_tls_ca_pem(&pem).unwrap();
+        let parsed = parse_invite_link(&invitation(
+            "https://planet.example.com/",
+            Some("https://planet.example.com/v1/planet"),
+            Some(&pem),
+        ))
+        .unwrap();
+        assert_eq!(parsed.controller, "https://planet.example.com");
+        assert_eq!(
+            parsed.planet_manifest_url.as_deref(),
+            Some("https://planet.example.com/v1/planet")
+        );
+        assert_eq!(parsed.tls_ca_pem.as_deref(), Some(normalized.as_str()));
+        assert!(controller_http_client(parsed.tls_ca_pem.as_deref()).is_ok());
+    }
+
+    #[test]
+    fn invitation_rejects_private_ca_over_plain_http() {
+        let pem = generated_test_ca_pem();
+        assert!(
+            parse_invite_link(&invitation("http://planet.example.com", None, Some(&pem),)).is_err()
+        );
+        assert!(parse_invite_link(&invitation(
+            "https://planet.example.com",
+            Some("http://planet.example.com/v1/planet"),
+            Some(&pem),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn invitation_ca_conflict_is_rejected_instead_of_overwriting_configuration() {
+        let invitation = normalize_tls_ca_pem(&generated_test_ca_pem()).unwrap();
+        let configured = normalize_tls_ca_pem(&generated_test_ca_pem()).unwrap();
+        assert_ne!(invitation, configured);
+        assert!(select_effective_tls_ca(Some(&invitation), Some(&configured)).is_err());
+
+        assert_eq!(
+            select_effective_tls_ca(None, Some(&configured)).unwrap(),
+            Some(configured.clone())
+        );
+        assert_eq!(
+            select_effective_tls_ca(Some(&invitation), Some(&invitation)).unwrap(),
+            Some(invitation)
+        );
+    }
+
+    #[test]
+    fn controller_url_rejects_credentials_query_fragment_and_paths() {
+        assert!(controller_base_url("https://user@example.com", false).is_err());
+        assert!(controller_base_url("https://@example.com", false).is_err());
+        assert!(controller_base_url("https://example.com\\", false).is_err());
+        assert!(controller_base_url("https://example.com?token=x", false).is_err());
+        assert!(controller_base_url("https://example.com#fragment", false).is_err());
+        assert!(controller_base_url("https://example.com/controller", false).is_err());
+    }
+
+    #[test]
+    fn controller_url_is_returned_in_normalized_form() {
+        assert_eq!(
+            controller_base_url("HTTPS://EXAMPLE.COM:443/", false).unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn public_controller_requests_never_include_the_admin_token() {
+        let mut app = App::default();
+        app.admin_token = "local-administrator-token".into();
+        app.admin_token_bound_value = app.admin_token.clone();
+        app.admin_token_controller = Some(app.controller.clone());
+
+        let request = app
+            .controller_request(reqwest::Method::GET, "/v1/public-key".into(), false)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key("x-meshlake-admin-token"));
+    }
+
+    #[test]
+    fn local_admin_token_is_not_sent_to_a_remote_controller() {
+        let mut app = App::default();
+        app.admin_token = "local-administrator-token".into();
+        app.admin_token_bound_value = app.admin_token.clone();
+        app.admin_token_controller = Some(app.controller.clone());
+        app.controller = "https://remote.example.com".into();
+
+        let error = app
+            .controller_request(reqwest::Method::POST, "/v1/networks".into(), true)
+            .unwrap_err();
+        assert!(error.contains("另一个控制器"));
+    }
+
+    #[test]
+    fn reentered_admin_token_binds_only_to_the_current_controller() {
+        let mut app = App::default();
+        app.admin_token = "local-administrator-token".into();
+        app.admin_token_bound_value = app.admin_token.clone();
+        app.admin_token_controller = Some(app.controller.clone());
+        app.controller = "https://remote.example.com".into();
+
+        app.admin_token = "remote-administrator-token".into();
+        let request = app
+            .controller_request(reqwest::Method::POST, "/v1/networks".into(), true)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get("x-meshlake-admin-token")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "remote-administrator-token"
+        );
+        assert_eq!(
+            app.admin_token_controller.as_deref(),
+            Some("https://remote.example.com")
+        );
+    }
+
+    #[test]
+    fn switching_invitation_controller_clears_the_old_management_context() {
+        let mut app = App::default();
+        app.admin_token = "local-administrator-token".into();
+        app.admin_token_bound_value = app.admin_token.clone();
+        app.admin_token_controller = Some(app.controller.clone());
+        app.controller_public_key = "old-public-key".into();
+        app.controller_tls_ca_pem = "old-private-ca".into();
+        app.managed_networks.push(VirtualNetwork {
+            id: meshlake_core::NetworkId(Uuid::new_v4()),
+            name: "old-network".into(),
+            ipv4_prefix: "100.64.10.0/24".into(),
+            ipv6_prefix: None,
+            relay_policy: RelayPolicy::Preferred,
+        });
+        app.selected_network = Some(Uuid::new_v4());
+        app.members.push(MembershipClaims {
+            network_id: meshlake_core::NetworkId(Uuid::new_v4()),
+            device_id: meshlake_core::DeviceId(Uuid::new_v4()),
+            device_public_key: vec![7; 32],
+            assigned_addresses: vec!["100.64.10.2".parse().unwrap()],
+            allowed_routes: vec!["100.64.10.0/24".into()],
+            issued_at_unix_seconds: 1,
+            expires_at_unix_seconds: Some(2),
+        });
+        app.issued_token = "old-issued-token".into();
+
+        app.switch_controller_context("https://remote.example.com".into());
+
+        assert_eq!(app.controller, "https://remote.example.com");
+        assert!(app.admin_token.is_empty());
+        assert!(app.admin_token_bound_value.is_empty());
+        assert!(app.admin_token_controller.is_none());
+        assert!(app.controller_public_key.is_empty());
+        assert!(app.controller_tls_ca_pem.is_empty());
+        assert!(app.managed_networks.is_empty());
+        assert!(app.selected_network.is_none());
+        assert!(app.members.is_empty());
+        assert!(app.issued_token.is_empty());
+    }
+
+    #[test]
+    fn plaintext_controller_state_remains_readable() {
+        let state = serde_json::to_vec(&LocalControllerState {
+            admin_token: "legacy-admin-token".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_local_admin_token(&state).as_deref(),
+            Some("legacy-admin-token")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_controller_state_is_readable() {
+        let state = LocalControllerState {
+            admin_token: "protected-admin-token".into(),
+        };
+        let protected =
+            meshlake_core::encode_protected_state(&state, CONTROLLER_STATE_PROTECTION_PURPOSE)
+                .unwrap();
+        assert_eq!(
+            decode_local_admin_token(&protected).as_deref(),
+            Some("protected-admin-token")
+        );
     }
 }

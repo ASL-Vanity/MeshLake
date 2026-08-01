@@ -56,6 +56,10 @@ pub struct NetworkControlPlane {
     /// Raw 32-byte Ed25519 controller public key pinned during enrollment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_controller_public_key: Vec<u8>,
+    /// Optional PEM trust anchor carried by a trusted invitation. When set,
+    /// controller HTTPS clients trust only this CA instead of system roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_tls_ca_pem: Option<String>,
     /// URL from which the currently verified Planet manifest was obtained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planet_manifest_url: Option<String>,
@@ -78,6 +82,7 @@ impl NetworkControlPlane {
     pub fn is_empty(&self) -> bool {
         self.controller_url.is_none()
             && self.pinned_controller_public_key.is_empty()
+            && self.controller_tls_ca_pem.is_none()
             && self.planet_manifest_url.is_none()
             && self.verified_roots.is_empty()
             && self.verified_relays.is_empty()
@@ -301,6 +306,9 @@ mod tests {
             control_plane: NetworkControlPlane {
                 controller_url: Some("https://controller.example".into()),
                 pinned_controller_public_key: vec![7; 32],
+                controller_tls_ca_pem: Some(
+                    "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".into(),
+                ),
                 planet_manifest_url: Some("https://planet.example/manifest.json".into()),
                 verified_roots: vec![PlanetRoot {
                     public_key: vec![8; 32],
@@ -336,6 +344,10 @@ mod tests {
             serialized["control_plane"]["planet_manifest_url"],
             "https://planet.example/manifest.json"
         );
+        assert!(serialized["control_plane"]["controller_tls_ca_pem"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN CERTIFICATE"));
         assert_eq!(
             serialized["control_plane"]["authorization_manifest"]["authorization_epoch"],
             3
