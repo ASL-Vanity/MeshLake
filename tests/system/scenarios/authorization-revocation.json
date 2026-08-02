@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "authorization-revocation",
   "description": "Revoke one member and verify old sessions and authorization state are removed without affecting another network.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
   "hosts": [
     { "role": "node_a", "platforms": ["windows", "linux"] },
     { "role": "node_b", "platforms": ["windows", "linux"] },
@@ -12,9 +13,18 @@
     {
       "name": "two_network_baseline",
       "actions": [
-        { "type": "enroll_nodes", "network": "revoked_network", "roles": ["node_a", "node_b"] },
-        { "type": "enroll_nodes", "network": "control_network", "roles": ["node_a", "node_b"] },
-        { "type": "establish_sessions", "networks": ["revoked_network", "control_network"] }
+        {
+          "type": "enroll_nodes", "network": "revoked_network", "roles": ["node_a", "node_b"],
+          "cleanup": { "type": "unenroll_nodes", "network": "revoked_network", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        {
+          "type": "enroll_nodes", "network": "control_network", "roles": ["node_a", "node_b"],
+          "cleanup": { "type": "unenroll_nodes", "network": "control_network", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        {
+          "type": "establish_sessions", "networks": ["revoked_network", "control_network"],
+          "cleanup": { "type": "close_sessions", "networks": ["revoked_network", "control_network"], "idempotent": true }
+        }
       ],
       "assertions": [
         { "type": "session_count_by_network", "network": "revoked_network", "minimum": 1 },
@@ -24,7 +34,10 @@
     {
       "name": "revoke",
       "actions": [
-        { "type": "revoke_member", "network": "revoked_network", "role": "node_b" },
+        {
+          "type": "revoke_member", "network": "revoked_network", "role": "node_b",
+          "cleanup": { "type": "restore_member_authorization", "network": "revoked_network", "role": "node_b", "idempotent": true }
+        },
         { "type": "wait_authorization_refresh", "role": "node_b" }
       ],
       "assertions": [

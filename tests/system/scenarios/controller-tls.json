@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "controller-tls",
+  "description": "Exercise pinned controller TLS trust and rejection of an untrusted peer in a disposable lab.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "controller", "platforms": ["windows", "linux"] }
+  ],
+  "phases": [
+    {
+      "name": "trusted_controller",
+      "actions": [
+        {
+          "type": "configure_controller_tls", "roles": ["node_a", "controller"],
+          "cleanup": [
+            { "type": "restore_controller_tls", "roles": ["node_a", "controller"], "idempotent": true },
+            { "type": "remove_test_ca", "roles": ["node_a", "controller"], "idempotent": true }
+          ]
+        },
+        { "type": "wait_local_api", "role": "node_a", "path": "/v1/status" }
+      ],
+      "assertions": [
+        { "type": "tls_handshake_succeeds", "roles": ["node_a", "controller"] },
+        { "type": "tls_rejects_untrusted_peer", "role": "node_a" }
+      ]
+    }
+  ]
+}

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Offline planner/validator for MeshLake cross-host system scenarios.
-
-This stage deliberately performs no SSH, WinRM, VM or cloud operations. It
-validates declarative scenarios and an optional inventory, then emits a stable
-execution plan for a future executor.
-"""
+"""Planner and safety-gated simulator for MeshLake system scenarios."""
 
 from __future__ import annotations
 
@@ -14,10 +9,21 @@ import pathlib
 import sys
 from typing import Any
 
+from executor import (
+    ExecutionValidationError,
+    SimulatedBackend,
+    execute_scenario,
+    reject_sensitive_inventory,
+    validate_execution_gate,
+    validate_execution_schema,
+    validate_inventory_shape,
+)
+
 
 ROOT = pathlib.Path(__file__).resolve().parent
 SCENARIO_DIR = ROOT / "scenarios"
 SCHEMA_VERSION = 1
+EXECUTION_INVENTORY_SCHEMA_VERSION = 2
 SUPPORTED_PLATFORMS = {"windows", "linux"}
 
 
@@ -88,6 +94,10 @@ def validate_scenario(path: pathlib.Path, scenario: dict[str, Any]) -> None:
                     raise ValidationError(
                         f"{path}: phase {name} {field} entries need a string type"
                     )
+    try:
+        validate_execution_schema(str(path), scenario)
+    except ExecutionValidationError as error:
+        raise ValidationError(str(error)) from error
 
 
 def load_scenarios() -> dict[str, dict[str, Any]]:
@@ -107,8 +117,18 @@ def load_scenarios() -> dict[str, dict[str, Any]]:
 def validate_inventory(
     path: pathlib.Path, inventory: dict[str, Any], scenario: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    if inventory.get("schema_version") != SCHEMA_VERSION:
+    try:
+        reject_sensitive_inventory(inventory, str(path))
+    except ExecutionValidationError as error:
+        raise ValidationError(str(error)) from error
+    inventory_version = inventory.get("schema_version")
+    if inventory_version not in {SCHEMA_VERSION, EXECUTION_INVENTORY_SCHEMA_VERSION}:
         raise ValidationError(f"{path}: unsupported inventory schema_version")
+    if inventory_version == EXECUTION_INVENTORY_SCHEMA_VERSION:
+        try:
+            validate_inventory_shape(str(path), inventory)
+        except ExecutionValidationError as error:
+            raise ValidationError(str(error)) from error
     hosts = inventory.get("hosts")
     if not isinstance(hosts, list):
         raise ValidationError(f"{path}: hosts must be an array")
@@ -126,7 +146,9 @@ def validate_inventory(
             raise ValidationError(f"{path}: host names must be unique non-empty strings")
         if platform not in SUPPORTED_PLATFORMS:
             raise ValidationError(f"{path}: host {name} has unsupported platform")
-        if "address" in host and not isinstance(host["address"], str):
+        if inventory_version == SCHEMA_VERSION and "address" in host and not isinstance(
+            host["address"], str
+        ):
             raise ValidationError(f"{path}: host {name} address must be a string")
         names.add(name)
         by_role[role] = host
@@ -181,12 +203,35 @@ def main() -> int:
     parser.add_argument("--inventory", type=pathlib.Path, help="optional host inventory JSON")
     parser.add_argument("--json", action="store_true", help="emit stable JSON")
     parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="run the explicitly gated simulated backend",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["simulated"],
+        default="simulated",
+        help="execution backend (only side-effect-free simulation is available)",
+    )
+    parser.add_argument(
+        "--allow-target",
+        action="append",
+        default=[],
+        help="allow one exact disposable inventory host name (repeat for each host)",
+    )
+    parser.add_argument(
+        "--confirm-lab-id",
+        help="confirm the version 4 UUID lab_id for this invocation",
+    )
+    parser.add_argument(
         "--validate-all", action="store_true", help="validate every scenario and exit"
     )
     args = parser.parse_args()
 
     try:
         scenarios = load_scenarios()
+        if args.execute and (args.validate_all or args.list or not args.scenario):
+            raise ValidationError("--execute requires exactly one --scenario")
         if args.validate_all:
             result: Any = {
                 "schema_version": SCHEMA_VERSION,
@@ -207,7 +252,30 @@ def main() -> int:
             if args.inventory:
                 inventory = load_json(args.inventory)
                 inventory_hosts = validate_inventory(args.inventory, inventory, scenario)
-            result = build_plan(scenario, inventory_hosts)
+            if args.execute:
+                if args.inventory is None or inventory_hosts is None:
+                    raise ValidationError("--execute requires --inventory")
+                if inventory.get("schema_version") != EXECUTION_INVENTORY_SCHEMA_VERSION:
+                    raise ValidationError(
+                        "execution requires inventory schema_version 2"
+                    )
+                try:
+                    validate_execution_gate(
+                        str(args.inventory),
+                        inventory,
+                        {
+                            requirement["role"]: inventory_hosts[requirement["role"]]
+                            for requirement in scenario["hosts"]
+                        },
+                        args.allow_target,
+                        args.confirm_lab_id,
+                        args.backend,
+                    )
+                    result = execute_scenario(scenario, SimulatedBackend())
+                except ExecutionValidationError as error:
+                    raise ValidationError(str(error)) from error
+            else:
+                result = build_plan(scenario, inventory_hosts)
         else:
             parser.error("choose --list, --validate-all or --scenario")
             return 2
@@ -233,8 +301,19 @@ def main() -> int:
                 f"  phase {phase['name']}: "
                 f"{len(phase['actions'])} action(s), {len(phase['assertions'])} assertion(s)"
             )
+    elif result.get("mode") == "executed":
+        scenario_result = result["scenario"]
+        print(f"Scenario: {scenario_result['id']}")
+        print("Mode: executed (backend=simulated; no real host actions)")
+        print(f"Status: {scenario_result['status']}")
+        print(f"Sessions: {result['session_counts']['total']}")
+        print(
+            "Safety: network_access_performed=false, processes_started=0"
+        )
     else:
         print(f"Validated {len(result['scenarios'])} scenario(s); no network access performed.")
+    if isinstance(result, dict) and result.get("mode") == "executed":
+        return 0 if result["scenario"]["status"] == "passed" else 1
     return 0
 
 

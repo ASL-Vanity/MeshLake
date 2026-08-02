@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "policy-rollback-failure",
+  "description": "Verify a policy rollback failure is reported separately and forces adapter shutdown.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] }
+  ],
+  "phases": [
+    {
+      "name": "inject_rollback_failure",
+      "actions": [
+        {
+          "type": "start_adapter", "role": "node_a",
+          "cleanup": { "type": "shutdown_adapter", "role": "node_a", "idempotent": true }
+        },
+        {
+          "type": "inject_policy_rollback_failure", "role": "node_a",
+          "cleanup": [
+            { "type": "restore_network_policy", "role": "node_a", "idempotent": true },
+            { "type": "shutdown_adapter", "role": "node_a", "idempotent": true }
+          ]
+        }
+      ],
+      "assertions": [
+        { "type": "rollback_failure_reported", "role": "node_a" },
+        { "type": "adapter_stopped", "role": "node_a" }
+      ]
+    }
+  ]
+}

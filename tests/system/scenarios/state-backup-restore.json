@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "state-backup-restore",
+  "description": "Exercise protected state backup verification and restoration without exposing backup contents.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] }
+  ],
+  "phases": [
+    {
+      "name": "backup",
+      "actions": [
+        {
+          "type": "create_state_backup", "role": "node_a", "name": "protected_backup",
+          "cleanup": { "type": "remove_temporary_backup", "role": "node_a", "name": "protected_backup", "idempotent": true }
+        },
+        { "type": "verify_backup", "role": "node_a", "name": "protected_backup" }
+      ],
+      "assertions": [
+        { "type": "backup_verified", "role": "node_a", "name": "protected_backup" }
+      ]
+    },
+    {
+      "name": "restore",
+      "actions": [
+        {
+          "type": "replace_state_from_backup", "role": "node_a", "name": "protected_backup",
+          "cleanup": { "type": "restore_original_state", "role": "node_a", "idempotent": true }
+        }
+      ],
+      "assertions": [
+        { "type": "restored_state_matches", "role": "node_a" },
+        { "type": "no_secret_fields", "api": "/v1/sessions" }
+      ]
+    }
+  ]
+}

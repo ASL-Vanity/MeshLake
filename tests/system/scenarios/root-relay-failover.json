@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "root-relay-failover",
   "description": "Validate primary Root and Relay failure handling with explicitly configured secondary endpoints.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
   "hosts": [
     { "role": "node_a", "platforms": ["windows", "linux"] },
     { "role": "node_b", "platforms": ["windows", "linux"] },
@@ -14,9 +15,18 @@
     {
       "name": "healthy_baseline",
       "actions": [
-        { "type": "configure_ordered_roots", "roles": ["root_primary", "root_secondary"] },
-        { "type": "configure_ordered_relays", "roles": ["relay_primary", "relay_secondary"] },
-        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" }
+        {
+          "type": "configure_ordered_roots", "roles": ["root_primary", "root_secondary"],
+          "cleanup": { "type": "restore_root_configuration", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        {
+          "type": "configure_ordered_relays", "roles": ["relay_primary", "relay_secondary"],
+          "cleanup": { "type": "restore_relay_configuration", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        {
+          "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b",
+          "cleanup": { "type": "close_sessions", "roles": ["node_a", "node_b"], "idempotent": true }
+        }
       ],
       "assertions": [
         { "type": "root_responsive", "role": "root_primary" },
@@ -27,8 +37,14 @@
     {
       "name": "primary_failure",
       "actions": [
-        { "type": "stop_service", "role": "root_primary", "service": "meshlake-root" },
-        { "type": "stop_service", "role": "relay_primary", "service": "meshlake-relay" },
+        {
+          "type": "stop_service", "role": "root_primary", "service": "meshlake-root",
+          "cleanup": { "type": "start_service", "role": "root_primary", "service": "meshlake-root", "idempotent": true }
+        },
+        {
+          "type": "stop_service", "role": "relay_primary", "service": "meshlake-relay",
+          "cleanup": { "type": "start_service", "role": "relay_primary", "service": "meshlake-relay", "idempotent": true }
+        },
         { "type": "wait_health_convergence" },
         { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" }
       ],

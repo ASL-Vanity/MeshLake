@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "dual-stack-direct",
   "description": "Establish one isolated pairwise session and verify direct IPv4 and IPv6 overlay traffic.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
   "hosts": [
     { "role": "node_a", "platforms": ["windows", "linux"] },
     { "role": "node_b", "platforms": ["windows", "linux"] },
@@ -12,8 +13,14 @@
     {
       "name": "enroll",
       "actions": [
-        { "type": "create_network", "network": "test_network", "ipv4": true, "ipv6": true },
-        { "type": "enroll_nodes", "network": "test_network", "roles": ["node_a", "node_b"] },
+        {
+          "type": "create_network", "network": "test_network", "ipv4": true, "ipv6": true,
+          "cleanup": { "type": "delete_network", "network": "test_network", "idempotent": true }
+        },
+        {
+          "type": "enroll_nodes", "network": "test_network", "roles": ["node_a", "node_b"],
+          "cleanup": { "type": "unenroll_nodes", "network": "test_network", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
         { "type": "wait_transport_ready", "roles": ["node_a", "node_b"] }
       ],
       "assertions": [

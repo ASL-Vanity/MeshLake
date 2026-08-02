@@ -1,41 +1,55 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "lab_id": "8e92b54e-3df6-4f44-9098-b26ffdf1af54",
   "hosts": [
     {
       "role": "node_a",
-      "name": "replace-node-a",
+      "name": "sim-node-a",
       "platform": "windows",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/node-a" }
     },
     {
       "role": "node_b",
-      "name": "replace-node-b",
+      "name": "sim-node-b",
       "platform": "linux",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/node-b" }
+    },
+    {
+      "role": "controller",
+      "name": "sim-controller",
+      "platform": "linux",
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/controller" }
     },
     {
       "role": "root_primary",
-      "name": "replace-with-root-host",
+      "name": "sim-root-primary",
       "platform": "linux",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/root-primary" }
     },
     {
       "role": "root_secondary",
-      "name": "replace-with-second-root-host",
+      "name": "sim-root-secondary",
       "platform": "linux",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/root-secondary" }
     },
     {
       "role": "relay_primary",
-      "name": "replace-with-relay-host",
+      "name": "sim-relay-primary",
       "platform": "linux",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/relay-primary" }
     },
     {
       "role": "relay_secondary",
-      "name": "replace-with-second-relay-host",
+      "name": "sim-relay-secondary",
       "platform": "linux",
-      "address": "replace-before-use"
+      "disposable": true,
+      "connection": { "type": "simulated", "ref": "lab/relay-secondary" }
     }
   ]
 }

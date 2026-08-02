@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "direct-relay-fallback",
   "description": "Verify a live peer can move from a direct path to the configured relay without crossing network boundaries.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
   "hosts": [
     { "role": "node_a", "platforms": ["windows", "linux"] },
     { "role": "node_b", "platforms": ["windows", "linux"] },
@@ -12,7 +13,10 @@
     {
       "name": "direct_baseline",
       "actions": [
-        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" },
+        {
+          "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b",
+          "cleanup": { "type": "close_sessions", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
         { "type": "capture_session_snapshot", "role": "node_a", "name": "direct" }
       ],
       "assertions": [
@@ -23,7 +27,10 @@
     {
       "name": "force_relay",
       "actions": [
-        { "type": "block_direct_path", "roles": ["node_a", "node_b"], "scope": "disposable_hosts_only" },
+        {
+          "type": "block_direct_path", "roles": ["node_a", "node_b"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_direct_path", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
         { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
         { "type": "capture_session_snapshot", "role": "node_a", "name": "relay" }
       ],

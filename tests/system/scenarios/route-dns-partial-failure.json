@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "id": "route-dns-partial-failure",
+  "description": "Exercise fail-closed route and DNS policy transactions when only one platform step succeeds.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] }
+  ],
+  "phases": [
+    {
+      "name": "baseline",
+      "actions": [
+        {
+          "type": "apply_network_policy", "role": "node_a",
+          "cleanup": { "type": "restore_network_policy", "role": "node_a", "idempotent": true }
+        }
+      ],
+      "assertions": [
+        { "type": "security_counters_monotonic", "role": "node_a" }
+      ]
+    },
+    {
+      "name": "route_apply_failure",
+      "actions": [
+        {
+          "type": "inject_route_apply_failure", "role": "node_a",
+          "cleanup": { "type": "restore_network_policy", "role": "node_a", "idempotent": true }
+        }
+      ],
+      "assertions": [
+        { "type": "route_policy_absent", "role": "node_a" },
+        { "type": "dns_policy_unchanged", "role": "node_a" }
+      ]
+    },
+    {
+      "name": "dns_apply_failure",
+      "actions": [
+        {
+          "type": "inject_dns_apply_failure", "role": "node_a",
+          "cleanup": { "type": "restore_network_policy", "role": "node_a", "idempotent": true }
+        }
+      ],
+      "assertions": [
+        { "type": "policy_restored", "role": "node_a" }
+      ]
+    }
+  ]
+}

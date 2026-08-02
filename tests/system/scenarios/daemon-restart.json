@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "daemon-restart",
   "description": "Restart meshlaked and prove process-local sessions are cleared before a fresh authenticated session is established.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
   "hosts": [
     { "role": "node_a", "platforms": ["windows", "linux"] },
     { "role": "node_b", "platforms": ["windows", "linux"] },
@@ -12,7 +13,10 @@
     {
       "name": "baseline",
       "actions": [
-        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" },
+        {
+          "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b",
+          "cleanup": { "type": "close_sessions", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
         { "type": "capture_session_snapshot", "role": "node_a", "name": "before_restart" }
       ],
       "assertions": [
@@ -23,7 +27,10 @@
     {
       "name": "restart",
       "actions": [
-        { "type": "restart_daemon", "role": "node_a" },
+        {
+          "type": "restart_daemon", "role": "node_a",
+          "cleanup": { "type": "ensure_daemon_running", "role": "node_a", "idempotent": true }
+        },
         { "type": "wait_local_api", "role": "node_a", "path": "/v1/status" },
         { "type": "capture_session_snapshot", "role": "node_a", "name": "after_restart" }
       ],

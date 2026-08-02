@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "adapter-shutdown",
+  "description": "Verify explicit adapter shutdown remains idempotent after a failed policy transaction.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] }
+  ],
+  "phases": [
+    {
+      "name": "shutdown",
+      "actions": [
+        {
+          "type": "start_adapter", "role": "node_a",
+          "cleanup": { "type": "shutdown_adapter", "role": "node_a", "idempotent": true }
+        },
+        { "type": "stop_adapter", "role": "node_a" },
+        { "type": "shutdown_adapter", "role": "node_a", "idempotent": true }
+      ],
+      "assertions": [
+        { "type": "adapter_stopped", "role": "node_a" }
+      ]
+    }
+  ]
+}
