@@ -199,23 +199,33 @@ fn address_commands(
 }
 
 fn planned_addresses(networks: &[JoinedNetwork]) -> Result<Vec<PlannedAddress>> {
-    let mut addresses = BTreeMap::<IpAddr, u8>::new();
+    let mut addresses = BTreeMap::<IpAddr, (meshlake_core::NetworkId, u8)>::new();
     for joined in networks {
         for address in &joined.assigned_addresses {
             let prefix_length = assigned_prefix_length(joined, *address)?;
-            match addresses.insert(*address, prefix_length) {
-                Some(existing) if existing != prefix_length => {
+            match addresses.get(address) {
+                Some((existing_network, _)) if *existing_network != joined.network.id => {
                     bail!(
-                        "assigned address {address} has conflicting prefix lengths {existing} and {prefix_length}"
+                        "assigned address {address} belongs to both network {} and network {}; refusing cross-network address reuse",
+                        existing_network.0,
+                        joined.network.id.0
                     );
                 }
-                _ => {}
+                Some((_, existing_prefix)) if *existing_prefix != prefix_length => {
+                    bail!(
+                        "assigned address {address} has conflicting prefix lengths {existing_prefix} and {prefix_length}"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    addresses.insert(*address, (joined.network.id, prefix_length));
+                }
             }
         }
     }
     Ok(addresses
         .into_iter()
-        .map(|(address, prefix_length)| PlannedAddress {
+        .map(|(address, (_, prefix_length))| PlannedAddress {
             address,
             prefix_length,
         })
@@ -403,7 +413,38 @@ mod tests {
     #[test]
     fn rejects_conflicting_prefixes_for_the_same_address() {
         let first = joined_network(10, "100.64.10.0/24", None, &["100.64.10.1"]);
-        let second = joined_network(11, "100.64.10.0/25", None, &["100.64.10.1"]);
+        let second = joined_network(10, "100.64.10.0/25", None, &["100.64.10.1"]);
+        assert!(planned_addresses(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn deduplicates_the_same_address_for_the_same_network_id() {
+        let first = joined_network(
+            11,
+            "100.64.11.0/24",
+            Some("fd00:11::/64"),
+            &["100.64.11.1", "fd00:11::1"],
+        );
+        let duplicate = first.clone();
+        assert_eq!(
+            planned_addresses(&[first, duplicate]).unwrap(),
+            vec![
+                PlannedAddress {
+                    address: "100.64.11.1".parse().unwrap(),
+                    prefix_length: 24,
+                },
+                PlannedAddress {
+                    address: "fd00:11::1".parse().unwrap(),
+                    prefix_length: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_the_same_address_from_distinct_networks_with_the_same_prefix() {
+        let first = joined_network(12, "100.64.12.0/24", None, &["100.64.12.1"]);
+        let second = joined_network(13, "100.64.12.0/24", None, &["100.64.12.1"]);
         assert!(planned_addresses(&[first, second]).is_err());
     }
 }
