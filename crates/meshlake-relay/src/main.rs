@@ -34,14 +34,24 @@ struct Cli {
 type PeerKey = (NetworkId, DeviceId);
 const PEER_TTL: Duration = Duration::from_secs(90);
 const REGISTRATION_NONCE_TTL: Duration = Duration::from_secs(300);
+const MAX_CANDIDATES_PER_PEER: usize = 16;
 
 #[derive(Debug, Clone)]
 struct PeerRecord {
     endpoint: SocketAddr,
+    candidates: Vec<SocketAddr>,
     assigned_addresses: Vec<IpAddr>,
     certificate: MembershipCertificate,
     authorization_expires_at_unix_seconds: u64,
     last_seen: Instant,
+}
+
+struct AuthenticatedRegistration {
+    key: PeerKey,
+    certificate: MembershipCertificate,
+    nonce: [u8; 16],
+    authorization_expires_at_unix_seconds: u64,
+    candidates: Vec<SocketAddr>,
 }
 
 #[tokio::main]
@@ -88,9 +98,14 @@ async fn handle_packet(
 ) -> Result<()> {
     match packet[4] {
         RELAY_REGISTER_SIGNED => {
-            if let Some((key, certificate, nonce, authorization_expires_at_unix_seconds)) =
-                parse_signed_registration(&packet[5..], trusted_key)
-            {
+            if let Some(registration) = parse_signed_registration(&packet[5..], trusted_key) {
+                let AuthenticatedRegistration {
+                    key,
+                    certificate,
+                    nonce,
+                    authorization_expires_at_unix_seconds,
+                    candidates: advertised_candidates,
+                } = registration;
                 seen_nonces.retain(|_, seen| seen.elapsed() <= REGISTRATION_NONCE_TTL);
                 if seen_nonces.insert(nonce, Instant::now()).is_some() {
                     trace_transport(format!(
@@ -99,6 +114,7 @@ async fn handle_packet(
                     ));
                     return Ok(());
                 }
+                let candidates = accepted_candidates(remote, advertised_candidates);
                 let assigned_addresses = authorized_addresses(&certificate);
                 if has_address_conflict(peers, key, &assigned_addresses) {
                     trace_transport(format!(
@@ -118,6 +134,7 @@ async fn handle_packet(
                     key,
                     PeerRecord {
                         endpoint: remote,
+                        candidates: candidates.clone(),
                         assigned_addresses: assigned_addresses.clone(),
                         certificate: certificate.clone(),
                         authorization_expires_at_unix_seconds,
@@ -130,12 +147,16 @@ async fn handle_packet(
                     key.1 .0, key.0 .0
                 ));
                 for (peer_key, peer) in existing {
-                    socket
-                        .send_to(&peer_announcement(key, remote), peer.endpoint)
-                        .await?;
-                    socket
-                        .send_to(&peer_announcement(peer_key, peer.endpoint), remote)
-                        .await?;
+                    for candidate in &candidates {
+                        socket
+                            .send_to(&peer_announcement(key, *candidate), peer.endpoint)
+                            .await?;
+                    }
+                    for candidate in &peer.candidates {
+                        socket
+                            .send_to(&peer_announcement(peer_key, *candidate), remote)
+                            .await?;
+                    }
                     socket
                         .send_to(&peer_identity_announcement(&certificate)?, peer.endpoint)
                         .await?;
@@ -159,8 +180,17 @@ async fn handle_packet(
         }
         RELAY_CANDIDATE => {
             if let Some((key, candidate)) = parse_candidate(packet) {
-                if peers.get(&key).map(|peer| peer.endpoint) != Some(remote) {
+                let Some(peer) = peers.get_mut(&key) else {
                     return Ok(());
+                };
+                if peer.endpoint != remote {
+                    return Ok(());
+                }
+                if !peer.candidates.contains(&candidate) {
+                    if peer.candidates.len() >= MAX_CANDIDATES_PER_PEER {
+                        return Ok(());
+                    }
+                    peer.candidates.push(candidate);
                 }
                 for (peer_key, peer) in peers {
                     if peer_key.0 == key.0 && *peer_key != key {
@@ -244,7 +274,27 @@ fn parse_candidate(packet: &[u8]) -> Option<(PeerKey, SocketAddr)> {
         }
         _ => return None,
     };
-    Some(((network, device), endpoint))
+    valid_candidate(endpoint).then_some(((network, device), endpoint))
+}
+
+fn valid_candidate(candidate: SocketAddr) -> bool {
+    candidate.port() != 0 && !candidate.ip().is_unspecified()
+}
+
+fn accepted_candidates(
+    observed_endpoint: SocketAddr,
+    advertised_candidates: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut candidates = Vec::with_capacity(MAX_CANDIDATES_PER_PEER);
+    for candidate in std::iter::once(observed_endpoint).chain(advertised_candidates) {
+        if valid_candidate(candidate) && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+            if candidates.len() == MAX_CANDIDATES_PER_PEER {
+                break;
+            }
+        }
+    }
+    candidates
 }
 
 fn relay_targets(
@@ -310,7 +360,7 @@ fn decode_controller_key(encoded: &str) -> Result<Vec<u8>> {
 fn parse_signed_registration(
     bytes: &[u8],
     trusted_controller_key: &Vec<u8>,
-) -> Option<(PeerKey, MembershipCertificate, [u8; 16], u64)> {
+) -> Option<AuthenticatedRegistration> {
     let registration: RootRegistration = serde_json::from_slice(bytes).ok()?;
     registration
         .verify_authorized(std::slice::from_ref(trusted_controller_key), now(), 120)
@@ -319,6 +369,7 @@ fn parse_signed_registration(
         return None;
     }
     let nonce = registration.payload.nonce;
+    let candidates = registration.payload.candidates.clone();
     let certificate = registration.payload.certificates.into_iter().next()?;
     let authorization_expires_at_unix_seconds = registration
         .payload
@@ -327,12 +378,15 @@ fn parse_signed_registration(
         .find(|authorization| authorization.network_id == certificate.claims.network_id)?
         .expires_at_unix_seconds;
     let key = (certificate.claims.network_id, certificate.claims.device_id);
-    (certificate.claims.device_id == registration.payload.device_id).then_some((
-        key,
-        certificate,
-        nonce,
-        authorization_expires_at_unix_seconds,
-    ))
+    (certificate.claims.device_id == registration.payload.device_id).then_some(
+        AuthenticatedRegistration {
+            key,
+            certificate,
+            nonce,
+            authorization_expires_at_unix_seconds,
+            candidates,
+        },
+    )
 }
 
 fn parse_data_header(packet: &[u8]) -> Option<(NetworkId, DeviceId, DeviceId)> {
@@ -389,6 +443,15 @@ mod tests {
         node: &SigningKey,
         certificate: MembershipCertificate,
     ) -> Vec<u8> {
+        signed_registration_packet_with_candidates(controller, node, certificate, vec![])
+    }
+
+    fn signed_registration_packet_with_candidates(
+        controller: &SigningKey,
+        node: &SigningKey,
+        certificate: MembershipCertificate,
+        candidates: Vec<SocketAddr>,
+    ) -> Vec<u8> {
         let timestamp = now();
         let authorization = NetworkAuthorizationManifest::sign(
             certificate.claims.network_id,
@@ -410,7 +473,7 @@ mod tests {
             certificate.claims.device_id,
             vec![certificate],
             vec![authorization],
-            vec![],
+            candidates,
             timestamp,
             *Uuid::new_v4().as_bytes(),
             node,
@@ -443,20 +506,20 @@ mod tests {
         let packet = signed_registration_packet(&controller, &node, certificate.clone());
         let registration: RootRegistration = serde_json::from_slice(&packet[5..]).unwrap();
         let raw = serde_json::to_vec(&registration).unwrap();
-        let (key, decoded, nonce, authorization_expires_at) =
+        let decoded =
             parse_signed_registration(&raw, &controller.verifying_key().to_bytes().to_vec())
                 .unwrap();
         assert_eq!(
-            key,
+            decoded.key,
             (certificate.claims.network_id, certificate.claims.device_id)
         );
-        assert_eq!(decoded, certificate);
-        assert_eq!(nonce, registration.payload.nonce);
-        assert!(authorization_expires_at >= now());
+        assert_eq!(decoded.certificate, certificate);
+        assert_eq!(decoded.nonce, registration.payload.nonce);
+        assert!(decoded.authorization_expires_at_unix_seconds >= now());
 
         let legacy = RootRegistration::sign(
             device,
-            vec![decoded.clone()],
+            vec![decoded.certificate.clone()],
             vec![],
             now(),
             [1_u8; 16],
@@ -472,7 +535,7 @@ mod tests {
         let attacker = SigningKey::from_bytes(&[9; 32]);
         let replay = RootRegistration::sign_authorized(
             device,
-            vec![decoded],
+            vec![decoded.certificate],
             registration.payload.authorization_manifests,
             vec![],
             now(),
@@ -500,6 +563,7 @@ mod tests {
                 source,
                 PeerRecord {
                     endpoint: "127.0.0.1:5001".parse().unwrap(),
+                    candidates: vec!["127.0.0.1:5001".parse().unwrap()],
                     assigned_addresses: vec!["100.64.0.1".parse().unwrap()],
                     certificate: test_certificate(
                         &controller,
@@ -516,6 +580,7 @@ mod tests {
                 other,
                 PeerRecord {
                     endpoint: "127.0.0.1:5002".parse().unwrap(),
+                    candidates: vec!["127.0.0.1:5002".parse().unwrap()],
                     assigned_addresses: vec!["100.64.0.2".parse().unwrap()],
                     certificate: test_certificate(
                         &controller,
@@ -550,6 +615,7 @@ mod tests {
             existing,
             PeerRecord {
                 endpoint: "127.0.0.1:5032".parse().unwrap(),
+                candidates: vec!["127.0.0.1:5032".parse().unwrap()],
                 assigned_addresses: vec!["100.64.31.2".parse().unwrap()],
                 certificate: test_certificate(
                     &controller,
@@ -584,6 +650,186 @@ mod tests {
         assert_eq!(&packet[..5], b"MLR1\x06");
         assert_eq!(Uuid::from_slice(&packet[5..21]).unwrap(), peer.0 .0);
         assert_eq!(Uuid::from_slice(&packet[21..37]).unwrap(), peer.1 .0);
+    }
+
+    #[test]
+    fn signed_registration_candidates_reject_invalid_values_and_are_bounded() {
+        let observed: SocketAddr = "198.51.100.10:41000".parse().unwrap();
+        let mut advertised = vec![
+            "0.0.0.0:42000".parse().unwrap(),
+            "[::]:42001".parse().unwrap(),
+            "203.0.113.10:0".parse().unwrap(),
+            observed,
+        ];
+        advertised
+            .extend((0..20).map(|offset| SocketAddr::from(([203, 0, 113, 20 + offset], 43000))));
+
+        let candidates = accepted_candidates(observed, advertised);
+        assert_eq!(candidates.len(), MAX_CANDIDATES_PER_PEER);
+        assert_eq!(candidates[0], observed);
+        assert!(candidates
+            .iter()
+            .all(|candidate| valid_candidate(*candidate)));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| **candidate == observed)
+                .count(),
+            1
+        );
+
+        let peer = (
+            NetworkId(Uuid::from_u128(43)),
+            DeviceId(Uuid::from_u128(44)),
+        );
+        for invalid in [
+            "0.0.0.0:42000".parse().unwrap(),
+            "[::]:42001".parse().unwrap(),
+            "203.0.113.10:0".parse().unwrap(),
+        ] {
+            let mut packet = peer_announcement(peer, invalid);
+            packet[4] = RELAY_CANDIDATE;
+            assert!(parse_candidate(&packet).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_registration_candidates_are_distributed_within_the_network() {
+        let controller = SigningKey::from_bytes(&[15; 32]);
+        let node_one = SigningKey::from_bytes(&[16; 32]);
+        let node_two = SigningKey::from_bytes(&[17; 32]);
+        let network = NetworkId(Uuid::from_u128(51));
+        let device_one = DeviceId(Uuid::from_u128(52));
+        let device_two = DeviceId(Uuid::from_u128(53));
+        let key_one = (network, device_one);
+        let advertised = [
+            "203.0.113.51:45100".parse().unwrap(),
+            "[2001:db8::51]:45101".parse().unwrap(),
+        ];
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trusted_key = controller.verifying_key().to_bytes().to_vec();
+        let mut peers = HashMap::new();
+        let mut seen_nonces = HashMap::new();
+
+        let certificate_one =
+            test_certificate(&controller, &node_one, network, device_one, "100.64.51.1");
+        handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &mut peers,
+            &mut seen_nonces,
+            client_one.local_addr().unwrap(),
+            &signed_registration_packet_with_candidates(
+                &controller,
+                &node_one,
+                certificate_one.clone(),
+                advertised.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receive_datagram(&client_one).await[4], RELAY_REGISTER_ACK);
+
+        let certificate_two =
+            test_certificate(&controller, &node_two, network, device_two, "100.64.51.2");
+        handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &mut peers,
+            &mut seen_nonces,
+            client_two.local_addr().unwrap(),
+            &signed_registration_packet(&controller, &node_two, certificate_two),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receive_datagram(&client_two).await[4], RELAY_REGISTER_ACK);
+
+        let expected = advertised
+            .into_iter()
+            .map(|candidate| peer_announcement(key_one, candidate))
+            .collect::<Vec<_>>();
+        let message_count = peers.get(&key_one).unwrap().candidates.len() + 1;
+        let mut received = Vec::with_capacity(message_count);
+        for _ in 0..message_count {
+            received.push(receive_datagram(&client_two).await);
+        }
+        for announcement in expected {
+            assert!(received.contains(&announcement));
+        }
+        assert!(received
+            .iter()
+            .filter_map(|packet| parse_peer_identity(packet))
+            .any(|certificate| certificate == certificate_one));
+    }
+
+    #[tokio::test]
+    async fn signed_registration_candidates_do_not_cross_networks() {
+        let controller = SigningKey::from_bytes(&[18; 32]);
+        let node_one = SigningKey::from_bytes(&[19; 32]);
+        let node_two = SigningKey::from_bytes(&[20; 32]);
+        let first_network = NetworkId(Uuid::from_u128(61));
+        let second_network = NetworkId(Uuid::from_u128(62));
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trusted_key = controller.verifying_key().to_bytes().to_vec();
+        let mut peers = HashMap::new();
+        let mut seen_nonces = HashMap::new();
+
+        let first_certificate = test_certificate(
+            &controller,
+            &node_one,
+            first_network,
+            DeviceId(Uuid::from_u128(63)),
+            "100.64.61.1",
+        );
+        handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &mut peers,
+            &mut seen_nonces,
+            client_one.local_addr().unwrap(),
+            &signed_registration_packet_with_candidates(
+                &controller,
+                &node_one,
+                first_certificate,
+                vec!["203.0.113.61:46100".parse().unwrap()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receive_datagram(&client_one).await[4], RELAY_REGISTER_ACK);
+
+        let second_certificate = test_certificate(
+            &controller,
+            &node_two,
+            second_network,
+            DeviceId(Uuid::from_u128(64)),
+            "100.64.62.1",
+        );
+        handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &mut peers,
+            &mut seen_nonces,
+            client_two.local_addr().unwrap(),
+            &signed_registration_packet(&controller, &node_two, second_certificate),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receive_datagram(&client_two).await[4], RELAY_REGISTER_ACK);
+
+        for client in [&client_one, &client_two] {
+            let mut unexpected = [0_u8; 64];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50),
+                client.recv_from(&mut unexpected)
+            )
+            .await
+            .is_err());
+        }
     }
 
     #[tokio::test]
