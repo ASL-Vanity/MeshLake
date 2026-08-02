@@ -1,6 +1,6 @@
 //! Linux TUN adapter implementation used by the headless MeshLake agent.
 
-use super::policy::PolicyPlan;
+use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::JoinedNetwork;
@@ -186,21 +186,37 @@ impl AdapterController {
             return Ok(());
         }
         let previous = current.clone();
-        run_linux_policy_commands(&linux_policy_commands(&previous, PolicyOperation::Remove))?;
-        if let Err(error) =
-            run_linux_policy_commands(&linux_policy_commands(&desired, PolicyOperation::Apply))
-        {
-            let _ = run_linux_policy_commands(&linux_policy_commands(
-                &desired,
-                PolicyOperation::Remove,
-            ));
-            let _ = run_linux_policy_commands(&linux_policy_commands(
-                &previous,
-                PolicyOperation::Apply,
-            ));
-            return Err(error.context("Linux policy transaction was rolled back"));
+        let result = apply_policy_transaction(
+            || {
+                run_linux_policy_commands(&linux_policy_commands(
+                    &previous,
+                    PolicyOperation::Remove,
+                ))
+                .map_err(|error| error.to_string())
+            },
+            || {
+                run_linux_policy_commands(&linux_policy_commands(&desired, PolicyOperation::Apply))
+                    .map_err(|error| error.to_string())
+            },
+            || {
+                run_linux_policy_commands(&linux_policy_commands(&desired, PolicyOperation::Remove))
+                    .map_err(|error| error.to_string())
+            },
+            || {
+                run_linux_policy_commands(&linux_policy_commands(&previous, PolicyOperation::Apply))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        if let Err(error) = finalize_policy_transaction(&mut current, desired, result) {
+            if error.is_fail_closed() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                return Err(anyhow!(
+                    "Linux policy transaction failed closed and disabled the adapter: {error}"
+                ));
+            }
+            return Err(anyhow!(error));
         }
-        *current = desired;
         Ok(())
     }
 
@@ -211,9 +227,7 @@ impl AdapterController {
             .expect("applied policy lock poisoned");
         let result =
             run_linux_policy_commands(&linux_policy_commands(&current, PolicyOperation::Remove));
-        if result.is_ok() {
-            *current = PolicyPlan::default();
-        }
+        *current = PolicyPlan::default();
         result
     }
 }
@@ -284,27 +298,34 @@ fn linux_policy_commands(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<L
 }
 
 fn run_linux_policy_commands(commands: &[LinuxPolicyCommand]) -> Result<()> {
-    let mut failures = Vec::new();
-    for command in commands {
-        let output = match Command::new(command.program)
+    run_linux_policy_commands_with(commands, |command| {
+        let output = Command::new(command.program)
             .args(&command.arguments)
             .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                failures.push(format!("cannot start {}: {error}", command.program));
-                continue;
-            }
-        };
-        if !output.status.success() {
-            failures.push(format!(
+            .map_err(|error| format!("cannot start {}: {error}", command.program))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
                 "{} {} failed ({}): {}{}",
                 command.program,
                 command.arguments.join(" "),
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            ))
+        }
+    })
+}
+
+fn run_linux_policy_commands_with(
+    commands: &[LinuxPolicyCommand],
+    mut execute: impl FnMut(&LinuxPolicyCommand) -> std::result::Result<(), String>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for command in commands {
+        if let Err(error) = execute(command) {
+            failures.push(error);
         }
     }
     if failures.is_empty() {
@@ -634,5 +655,30 @@ mod tests {
             .arguments
             .iter()
             .any(|argument| argument == "/etc/resolv.conf")));
+    }
+
+    #[test]
+    fn linux_command_runner_continues_after_injected_failure() {
+        let commands = vec![
+            LinuxPolicyCommand {
+                program: "ip",
+                arguments: vec!["first".into()],
+            },
+            LinuxPolicyCommand {
+                program: "resolvectl",
+                arguments: vec!["second".into()],
+            },
+        ];
+        let mut executed = Vec::new();
+        let result = run_linux_policy_commands_with(&commands, |command| {
+            executed.push(command.program);
+            if command.program == "ip" {
+                Err("injected Linux command failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(executed, vec!["ip", "resolvectl"]);
     }
 }

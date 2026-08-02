@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use meshlake_core::{DeviceId, JoinedNetwork, NetworkId};
-use std::{collections::BTreeMap, net::IpAddr};
+use std::{collections::BTreeMap, fmt, net::IpAddr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannedRoute {
@@ -95,6 +95,121 @@ impl PolicyPlan {
             routes: routes.into_values().collect(),
             dns_servers,
             search_domains,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PolicyTransactionError {
+    RolledBack {
+        stage: &'static str,
+        primary: String,
+    },
+    FailClosed {
+        stage: &'static str,
+        primary: String,
+        recovery_failures: Vec<String>,
+    },
+}
+
+impl PolicyTransactionError {
+    pub fn is_fail_closed(&self) -> bool {
+        matches!(self, Self::FailClosed { .. })
+    }
+}
+
+impl fmt::Display for PolicyTransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RolledBack { stage, primary } => write!(
+                formatter,
+                "policy transaction failed while {stage}: {primary}; previous policy was restored"
+            ),
+            Self::FailClosed {
+                stage,
+                primary,
+                recovery_failures,
+            } => write!(
+                formatter,
+                "policy transaction failed while {stage}: {primary}; recovery failed: {}; adapter must fail closed",
+                recovery_failures.join("; ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicyTransactionError {}
+
+pub(super) fn apply_policy_transaction(
+    mut remove_previous: impl FnMut() -> std::result::Result<(), String>,
+    mut apply_desired: impl FnMut() -> std::result::Result<(), String>,
+    mut remove_desired: impl FnMut() -> std::result::Result<(), String>,
+    mut restore_previous: impl FnMut() -> std::result::Result<(), String>,
+) -> std::result::Result<(), PolicyTransactionError> {
+    if let Err(primary) = remove_previous() {
+        return recover_policy_transaction(
+            "removing the previous policy",
+            primary,
+            &mut remove_desired,
+            &mut remove_previous,
+            &mut restore_previous,
+        );
+    }
+    if let Err(primary) = apply_desired() {
+        return recover_policy_transaction(
+            "applying the desired policy",
+            primary,
+            &mut remove_desired,
+            &mut remove_previous,
+            &mut restore_previous,
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn finalize_policy_transaction(
+    current: &mut PolicyPlan,
+    desired: PolicyPlan,
+    result: std::result::Result<(), PolicyTransactionError>,
+) -> std::result::Result<(), PolicyTransactionError> {
+    match result {
+        Ok(()) => {
+            *current = desired;
+            Ok(())
+        }
+        Err(error) => {
+            if error.is_fail_closed() {
+                *current = PolicyPlan::default();
+            }
+            Err(error)
+        }
+    }
+}
+
+fn recover_policy_transaction(
+    stage: &'static str,
+    primary: String,
+    remove_desired: &mut impl FnMut() -> std::result::Result<(), String>,
+    remove_previous: &mut impl FnMut() -> std::result::Result<(), String>,
+    restore_previous: &mut impl FnMut() -> std::result::Result<(), String>,
+) -> std::result::Result<(), PolicyTransactionError> {
+    let mut recovery_failures = Vec::new();
+    if let Err(error) = remove_desired() {
+        recovery_failures.push(format!("desired-policy cleanup: {error}"));
+    }
+    if let Err(error) = remove_previous() {
+        recovery_failures.push(format!("previous-policy cleanup: {error}"));
+    }
+    if let Err(error) = restore_previous() {
+        recovery_failures.push(format!("previous-policy restore: {error}"));
+    }
+    if recovery_failures.is_empty() {
+        Err(PolicyTransactionError::RolledBack { stage, primary })
+    } else {
+        Err(PolicyTransactionError::FailClosed {
+            stage,
+            primary,
+            recovery_failures,
         })
     }
 }
@@ -221,5 +336,93 @@ mod tests {
     #[test]
     fn rejects_routes_overlapping_overlay_address_space() {
         assert!(PolicyPlan::from_networks(&[network(4, "100.64.4.0/25", 40)], 50).is_err());
+    }
+
+    #[test]
+    fn command_failure_during_apply_restores_previous_policy() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = apply_policy_transaction(
+            || {
+                calls.borrow_mut().push("remove-previous");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("apply-desired");
+                Err("injected apply failure".into())
+            },
+            || {
+                calls.borrow_mut().push("remove-desired");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("restore-previous");
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PolicyTransactionError::RolledBack { .. })
+        ));
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "remove-previous",
+                "apply-desired",
+                "remove-desired",
+                "remove-previous",
+                "restore-previous"
+            ]
+        );
+    }
+
+    #[test]
+    fn command_failure_during_old_removal_attempts_full_restore() {
+        let attempts = std::cell::Cell::new(0_u8);
+        let result = apply_policy_transaction(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Err("injected old-policy removal failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(PolicyTransactionError::RolledBack { .. })
+        ));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn restore_failure_requires_adapter_fail_closed() {
+        let result = apply_policy_transaction(
+            || Ok(()),
+            || Err("injected apply failure".into()),
+            || Ok(()),
+            || Err("injected restore failure".into()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.is_fail_closed());
+        assert!(error.to_string().contains("adapter must fail closed"));
+        assert!(error.to_string().contains("previous-policy restore"));
+
+        let mut current = PolicyPlan {
+            routes: vec![PlannedRoute {
+                prefix: "10.70.0.0/16".into(),
+                network_id: NetworkId(Uuid::from_u128(70)),
+                gateway_device_id: DeviceId(Uuid::from_u128(71)),
+            }],
+            ..PolicyPlan::default()
+        };
+        assert!(
+            finalize_policy_transaction(&mut current, PolicyPlan::default(), Err(error),).is_err()
+        );
+        assert_eq!(current, PolicyPlan::default());
     }
 }

@@ -3,7 +3,7 @@
 //! The driver is intentionally not linked at build time. A release package places the signed
 //! `wintun.dll` next to `meshlaked.exe`; development can pass `--wintun-dll <path>`.
 
-use super::policy::PolicyPlan;
+use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use meshlake_core::JoinedNetwork;
@@ -340,15 +340,34 @@ impl AdapterController {
             return Ok(());
         }
         let previous = current.clone();
-        run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Remove))?;
-        if let Err(error) =
-            run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Apply))
-        {
-            let _ = run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Remove));
-            let _ = run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Apply));
-            return Err(error.context("Windows policy transaction was rolled back"));
+        let result = apply_policy_transaction(
+            || {
+                run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Remove))
+                    .map_err(|error| error.to_string())
+            },
+            || {
+                run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Apply))
+                    .map_err(|error| error.to_string())
+            },
+            || {
+                run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Remove))
+                    .map_err(|error| error.to_string())
+            },
+            || {
+                run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Apply))
+                    .map_err(|error| error.to_string())
+            },
+        );
+        if let Err(error) = finalize_policy_transaction(&mut current, desired, result) {
+            if error.is_fail_closed() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                return Err(anyhow!(
+                    "Windows policy transaction failed closed and disabled the adapter: {error}"
+                ));
+            }
+            return Err(anyhow!(error));
         }
-        *current = desired;
         Ok(())
     }
 
@@ -358,9 +377,7 @@ impl AdapterController {
             .lock()
             .expect("applied policy lock poisoned");
         let result = run_policy_scripts(&windows_policy_scripts(&current, PolicyOperation::Remove));
-        if result.is_ok() {
-            *current = PolicyPlan::default();
-        }
+        *current = PolicyPlan::default();
         result
     }
 }
@@ -427,27 +444,34 @@ fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<
 }
 
 fn run_policy_scripts(scripts: &[String]) -> Result<()> {
-    let mut failures = Vec::new();
-    for script in scripts {
-        let output = match Command::new("powershell.exe")
+    run_policy_scripts_with(scripts, |script| {
+        let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                failures.push(format!(
-                    "cannot start PowerShell to configure MeshLake policy: {error}"
-                ));
-                continue;
-            }
-        };
-        if !output.status.success() {
-            failures.push(format!(
+            .map_err(|error| {
+                format!("cannot start PowerShell to configure MeshLake policy: {error}")
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
                 "PowerShell policy command failed ({}): {}{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            ))
+        }
+    })
+}
+
+fn run_policy_scripts_with(
+    scripts: &[String],
+    mut execute: impl FnMut(&str) -> std::result::Result<(), String>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for script in scripts {
+        if let Err(error) = execute(script) {
+            failures.push(error);
         }
     }
     if failures.is_empty() {
@@ -593,5 +617,21 @@ mod tests {
         let remove = windows_policy_scripts(&plan, PolicyOperation::Remove).join("\n");
         assert!(remove.contains("Remove-NetRoute"));
         assert!(remove.contains("ResetServerAddresses"));
+    }
+
+    #[test]
+    fn windows_command_runner_continues_after_injected_failure() {
+        let scripts = vec!["first".to_owned(), "second".to_owned()];
+        let mut executed = Vec::new();
+        let result = run_policy_scripts_with(&scripts, |script| {
+            executed.push(script.to_owned());
+            if script == "first" {
+                Err("injected Windows command failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(executed, scripts);
     }
 }

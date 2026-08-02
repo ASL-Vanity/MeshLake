@@ -13,7 +13,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use meshlake_core::{
     cleanup_stale_state_backup, decode_protected_state, recover_protected_state_file,
     restrict_state_file_permissions, write_protected_state_file, AuthorizedMembership, DeviceId,
@@ -138,6 +138,12 @@ struct PolicyUpdateRequest {
     routes: Vec<ManagedPolicyRoute>,
     #[serde(default)]
     dns: DnsPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemberRouteAuthorizationRequest {
+    #[serde(default)]
+    allowed_routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +451,57 @@ impl Controller {
             .get(&network_id)
             .ok_or_else(|| ApiError::not_found("network does not exist"))?;
         Ok(network.members.values().cloned().collect())
+    }
+
+    async fn authorize_member_routes(
+        &self,
+        headers: &HeaderMap,
+        network_id: NetworkId,
+        device_id: DeviceId,
+        request: MemberRouteAuthorizationRequest,
+    ) -> Result<MembershipClaims, ApiError> {
+        let mut state = self.state.write().await;
+        require_admin(&state, headers)?;
+        let signing_key = signing_key(&state).map_err(ApiError::internal)?;
+        let network = state
+            .networks
+            .get_mut(&network_id)
+            .ok_or_else(|| ApiError::not_found("network does not exist"))?;
+        let mut candidate = network.clone();
+        let mut allowed_routes = vec![candidate.network.ipv4_prefix.clone()];
+        if let Some(prefix) = &candidate.network.ipv6_prefix {
+            allowed_routes.push(prefix.clone());
+        }
+        for raw in request.allowed_routes {
+            let prefix = raw
+                .parse::<IpNet>()
+                .map_err(|_| ApiError::bad_request(format!("invalid allowed route {raw:?}")))?;
+            if prefix.prefix_len() == 0 {
+                return Err(ApiError::bad_request(
+                    "default routes are not supported in this stage",
+                ));
+            }
+            allowed_routes.push(prefix.to_string());
+        }
+        allowed_routes.sort();
+        allowed_routes.dedup();
+        if allowed_routes.len() > 258 {
+            return Err(ApiError::bad_request(
+                "too many member route authorizations",
+            ));
+        }
+        let claims = candidate
+            .members
+            .get_mut(&device_id)
+            .ok_or_else(|| ApiError::not_found("member does not exist"))?;
+        claims.allowed_routes = allowed_routes;
+        claims.issued_at_unix_seconds = now();
+        claims.expires_at_unix_seconds = Some(now() + 86_400);
+        let updated = claims.clone();
+        sign_policy(&candidate, &signing_key).map_err(ApiError::bad_request)?;
+        *network = candidate;
+        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        Ok(updated)
     }
 
     async fn remove_member(
@@ -758,9 +815,17 @@ fn sign_policy(
             .copied()
             .ok_or_else(|| anyhow::anyhow!("policy gateway certificate is missing"))?;
         let mut policy_claims = claims.clone();
-        policy_claims.allowed_routes.push(route.prefix.clone());
-        policy_claims.allowed_routes.sort();
-        policy_claims.allowed_routes.dedup();
+        if !policy_claims
+            .allowed_routes
+            .iter()
+            .any(|allowed| route_prefix_covers(allowed, &route.prefix))
+        {
+            anyhow::bail!(
+                "policy gateway {} is not authorized for route {}",
+                route.gateway_device_id.0,
+                route.prefix
+            );
+        }
         policy_claims.issued_at_unix_seconds = now();
         policy_claims.expires_at_unix_seconds = Some(now() + 86_400);
         let certificate = MembershipCertificate::sign_authorized(
@@ -784,6 +849,18 @@ fn sign_policy(
         signing_key,
     )
     .map_err(Into::into)
+}
+
+fn route_prefix_covers(allowed: &str, target: &str) -> bool {
+    match (allowed.parse::<IpNet>(), target.parse::<IpNet>()) {
+        (Ok(IpNet::V4(allowed)), Ok(IpNet::V4(target))) => {
+            allowed.prefix_len() <= target.prefix_len() && allowed.contains(&target.network())
+        }
+        (Ok(IpNet::V6(allowed)), Ok(IpNet::V6(target))) => {
+            allowed.prefix_len() <= target.prefix_len() && allowed.contains(&target.network())
+        }
+        _ => false,
+    }
 }
 
 fn assigned_addresses_for_device(
@@ -1029,6 +1106,24 @@ async fn remove_member(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+async fn authorize_member_routes(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Path((network_id, device_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<MemberRouteAuthorizationRequest>,
+) -> Result<Json<MembershipClaims>, ApiError> {
+    Ok(Json(
+        controller
+            .authorize_member_routes(
+                &headers,
+                NetworkId(network_id),
+                DeviceId(device_id),
+                request,
+            )
+            .await?,
+    ))
+}
 async fn enroll(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<EnrollmentRequest>,
@@ -1157,6 +1252,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/networks/{id}/members/{device_id}",
             delete(remove_member),
+        )
+        .route(
+            "/v1/networks/{id}/members/{device_id}/allowed-routes",
+            post(authorize_member_routes),
         )
         .route("/v1/enroll", post(enroll))
         .route("/v1/membership/refresh", post(refresh_membership))
@@ -1886,7 +1985,7 @@ mod tests {
                     device_id: gateway,
                     device_public_key: vec![6; 32],
                     assigned_addresses: vec!["100.64.61.2".parse().unwrap()],
-                    allowed_routes: vec!["100.64.61.0/24".into()],
+                    allowed_routes: vec!["100.64.61.0/24".into(), "10.61.0.0/16".into()],
                     issued_at_unix_seconds: now(),
                     expires_at_unix_seconds: Some(now() + 86_400),
                 },
@@ -1925,6 +2024,55 @@ mod tests {
             .claims
             .allowed_routes
             .contains(&"10.61.0.0/16".into()));
+    }
+
+    #[test]
+    fn policy_cannot_implicitly_expand_gateway_allowed_routes() {
+        let signing_key = SigningKey::from_bytes(&[64; 32]);
+        let network_id = NetworkId(Uuid::from_u128(64));
+        let gateway = DeviceId(Uuid::from_u128(65));
+        let managed = ManagedNetwork {
+            network: VirtualNetwork {
+                id: network_id,
+                name: "no-implicit-expansion".into(),
+                ipv4_prefix: "100.64.64.0/24".into(),
+                ipv6_prefix: None,
+                relay_policy: RelayPolicy::Preferred,
+            },
+            members: HashMap::from([(
+                gateway,
+                MembershipClaims {
+                    network_id,
+                    device_id: gateway,
+                    device_public_key: vec![6; 32],
+                    assigned_addresses: vec!["100.64.64.2".parse().unwrap()],
+                    allowed_routes: vec!["100.64.64.0/24".into()],
+                    issued_at_unix_seconds: now(),
+                    expires_at_unix_seconds: Some(now() + 86_400),
+                },
+            )]),
+            network_key: vec![7; 32],
+            network_key_epoch: 1,
+            authorization_epoch: 1,
+            member_certificate_ids: HashMap::from([(gateway, Uuid::from_u128(66))]),
+            revoked_certificate_ids: HashMap::new(),
+            policy_epoch: 2,
+            policy: ManagedPolicy {
+                routes: vec![ManagedPolicyRoute {
+                    prefix: "10.64.0.0/16".into(),
+                    gateway_device_id: gateway,
+                }],
+                dns: DnsPolicy::default(),
+            },
+        };
+        assert!(sign_policy(&managed, &signing_key)
+            .unwrap_err()
+            .to_string()
+            .contains("not authorized"));
+        assert_eq!(
+            managed.members[&gateway].allowed_routes,
+            vec!["100.64.64.0/24"]
+        );
     }
 
     #[cfg(unix)]

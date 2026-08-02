@@ -111,21 +111,56 @@ pub(crate) fn local_device_is_gateway_for(
     policy_gateway(network, destination).is_some_and(|(_, gateway)| gateway == local_device)
 }
 
+pub(crate) fn peer_is_gateway_for_source(
+    network: &JoinedNetwork,
+    peer_device: DeviceId,
+    source: std::net::IpAddr,
+) -> bool {
+    policy_gateway(network, source).is_some_and(|(_, gateway)| gateway == peer_device)
+}
+
 fn policy_gateway(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<(u8, DeviceId)> {
     let policy = network.control_plane.policy_manifest.as_ref()?;
+    let authorization = network.control_plane.authorization_manifest.as_ref()?;
+    let pinned_key = &network.control_plane.pinned_controller_public_key;
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    if current_time > policy.expires_at_unix_seconds {
+    if pinned_key.is_empty()
+        || policy.network_id != network.network.id
+        || policy.controller_public_key != *pinned_key
+        || policy.issued_at_unix_seconds > current_time.saturating_add(120)
+        || current_time > policy.expires_at_unix_seconds
+        || authorization.network_id != network.network.id
+        || authorization.controller_public_key != *pinned_key
+        || authorization.issued_at_unix_seconds > current_time.saturating_add(120)
+        || current_time > authorization.expires_at_unix_seconds
+    {
         return None;
     }
     let mut matches = policy.routes.iter().filter_map(|route| {
         let prefix = route.prefix.parse::<ipnet::IpNet>().ok()?;
-        prefix.contains(&address).then_some((
-            prefix.prefix_len(),
-            route.gateway_certificate.claims.device_id,
-        ))
+        let certificate = &route.gateway_certificate;
+        if certificate.controller_public_key != *pinned_key
+            || certificate.claims.network_id != network.network.id
+            || certificate.claims.issued_at_unix_seconds > current_time.saturating_add(120)
+            || certificate
+                .claims
+                .expires_at_unix_seconds
+                .is_some_and(|expiry| current_time > expiry)
+            || !authorization.authorizes(certificate)
+            || !certificate
+                .claims
+                .allowed_routes
+                .iter()
+                .any(|allowed| prefix_covers(allowed, &route.prefix))
+        {
+            return None;
+        }
+        prefix
+            .contains(&address)
+            .then_some((prefix.prefix_len(), certificate.claims.device_id))
     });
     let mut best = matches.next()?;
     let mut ambiguous = false;
@@ -140,6 +175,21 @@ fn policy_gateway(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<
         }
     }
     (!ambiguous).then_some(best)
+}
+
+fn prefix_covers(allowed: &str, target: &str) -> bool {
+    match (
+        allowed.parse::<ipnet::IpNet>(),
+        target.parse::<ipnet::IpNet>(),
+    ) {
+        (Ok(ipnet::IpNet::V4(allowed)), Ok(ipnet::IpNet::V4(target))) => {
+            allowed.prefix_len() <= target.prefix_len() && allowed.contains(&target.network())
+        }
+        (Ok(ipnet::IpNet::V6(allowed)), Ok(ipnet::IpNet::V6(target))) => {
+            allowed.prefix_len() <= target.prefix_len() && allowed.contains(&target.network())
+        }
+        _ => false,
+    }
 }
 
 fn destination_prefix_len(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<u8> {
@@ -223,8 +273,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use meshlake_core::{
-        DnsPolicy, MembershipCertificate, MembershipClaims, NetworkControlPlane, NetworkId,
-        NetworkPolicyManifest, PolicyRoute, RelayPolicy, VirtualNetwork,
+        AuthorizedMembership, DnsPolicy, MembershipCertificate, MembershipClaims,
+        NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkPolicyManifest,
+        PolicyRoute, RelayPolicy, VirtualNetwork,
     };
     use uuid::Uuid;
 
@@ -286,7 +337,26 @@ mod tests {
                 )
                 .unwrap(),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network.network.id,
+            1,
+            1,
+            routes
+                .iter()
+                .map(|route| AuthorizedMembership {
+                    device_id: route.gateway_certificate.claims.device_id,
+                    certificate_id: route.gateway_certificate.certificate_id,
+                    device_public_key: route.gateway_certificate.claims.device_public_key.clone(),
+                    network_key_epoch: 1,
+                })
+                .collect(),
+            vec![],
+            1,
+            u64::MAX,
+            &signing,
+        )
+        .unwrap();
         network.control_plane.policy_manifest = Some(
             NetworkPolicyManifest::sign(
                 network.network.id,
@@ -299,6 +369,9 @@ mod tests {
             )
             .unwrap(),
         );
+        network.control_plane.authorization_manifest = Some(authorization);
+        network.control_plane.pinned_controller_public_key =
+            signing.verifying_key().to_bytes().to_vec();
         network
     }
 

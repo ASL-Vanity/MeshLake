@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use data_plane::ip::network_for_ip_packet;
 use data_plane::ip::{
     address_belongs_to_network, is_group_destination, local_device_is_gateway_for,
-    outbound_route_for_ip_packet, packet_addresses,
+    outbound_route_for_ip_packet, packet_addresses, peer_is_gateway_for_source,
 };
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
@@ -820,9 +820,19 @@ impl Agent {
             write_state(&self.path, &state)?;
             let rollback_networks = state.networks.clone();
             drop(state);
-            let _ = self.adapter.configure_policy(&rollback_networks);
-            return Err(
-                error.context("policy application failed and persisted state was rolled back")
+            if let Err(rollback_error) = self.adapter.configure_policy(&rollback_networks) {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "policy application failed: {error:#}; persisted policy was restored but adapter rollback also failed: {rollback_error:#}; adapter was disabled fail closed"
+                );
+            }
+            anyhow::bail!(
+                "policy application failed: {error:#}; persisted policy was restored{}",
+                if self.adapter.is_active() {
+                    " and the previous adapter policy is active"
+                } else {
+                    " and the adapter is disabled fail closed"
+                }
             );
         }
         self.request_transport_reload();
@@ -3653,6 +3663,7 @@ async fn receive_session_data(
     };
     if !packet_is_authorized_for_delivery(
         network,
+        source,
         source_route,
         destination,
         device_id,
@@ -3944,6 +3955,7 @@ fn peer_targets_for_packet(
 
 fn packet_is_authorized_for_delivery(
     network: &JoinedNetwork,
+    source_device: DeviceId,
     source_route: &PeerRoute,
     outer_destination: DeviceId,
     local_device: DeviceId,
@@ -3955,7 +3967,9 @@ fn packet_is_authorized_for_delivery(
     let Some((source_address, destination_address)) = packet_addresses(packet) else {
         return false;
     };
-    if !source_route.assigned_addresses.contains(&source_address) {
+    if !source_route.assigned_addresses.contains(&source_address)
+        && !peer_is_gateway_for_source(network, source_device, source_address)
+    {
         return false;
     }
     let group_destination = is_group_destination(network, destination_address);
@@ -4418,12 +4432,14 @@ mod tests {
     fn inbound_packet_requires_authorized_source_and_local_destination() {
         let network = test_joined_network();
         let local_device = DeviceId(Uuid::from_u128(100));
+        let source_device = DeviceId(Uuid::from_u128(101));
         let mut source_route = PeerRoute::empty();
         source_route.set_assigned_addresses(vec!["100.64.90.2".parse().unwrap()]);
 
         let valid = ipv4_packet([100, 64, 90, 2], [100, 64, 90, 1]);
         assert!(packet_is_authorized_for_delivery(
             &network,
+            source_device,
             &source_route,
             local_device,
             local_device,
@@ -4432,6 +4448,7 @@ mod tests {
         let forged_source = ipv4_packet([100, 64, 90, 9], [100, 64, 90, 1]);
         assert!(!packet_is_authorized_for_delivery(
             &network,
+            source_device,
             &source_route,
             local_device,
             local_device,
@@ -4440,6 +4457,7 @@ mod tests {
         let wrong_destination = ipv4_packet([100, 64, 90, 2], [100, 64, 90, 3]);
         assert!(!packet_is_authorized_for_delivery(
             &network,
+            source_device,
             &source_route,
             local_device,
             local_device,
@@ -4448,6 +4466,7 @@ mod tests {
         let broadcast = ipv4_packet([100, 64, 90, 2], [100, 64, 90, 255]);
         assert!(packet_is_authorized_for_delivery(
             &network,
+            source_device,
             &source_route,
             DeviceId(Uuid::nil()),
             local_device,
@@ -4455,6 +4474,7 @@ mod tests {
         ));
         assert!(!packet_is_authorized_for_delivery(
             &network,
+            source_device,
             &source_route,
             DeviceId(Uuid::nil()),
             local_device,
@@ -4482,26 +4502,51 @@ mod tests {
             &signing,
         )
         .unwrap();
-        network.control_plane.policy_manifest = Some(
-            NetworkPolicyManifest::sign(
+        let policy = NetworkPolicyManifest::sign(
+            network.network.id,
+            1,
+            vec![PolicyRoute {
+                prefix: "10.62.0.0/16".into(),
+                gateway_certificate,
+            }],
+            DnsPolicy::default(),
+            now(),
+            now() + 300,
+            &signing,
+        )
+        .unwrap();
+        network.control_plane.authorization_manifest = Some(
+            NetworkAuthorizationManifest::sign(
                 network.network.id,
                 1,
-                vec![PolicyRoute {
-                    prefix: "10.62.0.0/16".into(),
-                    gateway_certificate,
+                1,
+                vec![AuthorizedMembership {
+                    device_id: gateway,
+                    certificate_id: policy.routes[0].gateway_certificate.certificate_id,
+                    device_public_key: policy.routes[0]
+                        .gateway_certificate
+                        .claims
+                        .device_public_key
+                        .clone(),
+                    network_key_epoch: 1,
                 }],
-                DnsPolicy::default(),
+                vec![],
                 now(),
                 now() + 300,
                 &signing,
             )
             .unwrap(),
         );
+        network.control_plane.pinned_controller_public_key =
+            signing.verifying_key().to_bytes().to_vec();
+        network.control_plane.policy_manifest = Some(policy);
         let mut source_route = PeerRoute::empty();
         source_route.set_assigned_addresses(vec!["100.64.90.2".parse().unwrap()]);
+        let source_member = DeviceId(Uuid::from_u128(623));
         let packet = ipv4_packet([100, 64, 90, 2], [10, 62, 1, 9]);
         assert!(packet_is_authorized_for_delivery(
             &network,
+            source_member,
             &source_route,
             gateway,
             gateway,
@@ -4510,10 +4555,104 @@ mod tests {
         let other = DeviceId(Uuid::from_u128(622));
         assert!(!packet_is_authorized_for_delivery(
             &network,
+            source_member,
             &source_route,
             other,
             other,
             &packet,
+        ));
+    }
+
+    #[test]
+    fn gateway_return_source_requires_current_signed_route_authorization() {
+        let mut network = test_joined_network();
+        let signing = SigningKey::from_bytes(&[63; 32]);
+        let gateway = DeviceId(Uuid::from_u128(630));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: network.network.id,
+                device_id: gateway,
+                device_public_key: vec![9; 32],
+                assigned_addresses: vec!["100.64.90.254".parse().unwrap()],
+                allowed_routes: vec!["10.63.0.0/16".into()],
+                issued_at_unix_seconds: now(),
+                expires_at_unix_seconds: Some(now() + 300),
+            },
+            Uuid::from_u128(631),
+            1,
+            &signing,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network.network.id,
+            1,
+            1,
+            vec![AuthorizedMembership {
+                device_id: gateway,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: 1,
+            }],
+            vec![],
+            now(),
+            now() + 300,
+            &signing,
+        )
+        .unwrap();
+        network.control_plane.policy_manifest = Some(
+            NetworkPolicyManifest::sign(
+                network.network.id,
+                1,
+                vec![PolicyRoute {
+                    prefix: "10.63.0.0/16".into(),
+                    gateway_certificate: certificate,
+                }],
+                DnsPolicy::default(),
+                now(),
+                now() + 300,
+                &signing,
+            )
+            .unwrap(),
+        );
+        network.control_plane.authorization_manifest = Some(authorization);
+        network.control_plane.pinned_controller_public_key =
+            signing.verifying_key().to_bytes().to_vec();
+        let mut gateway_route = PeerRoute::empty();
+        gateway_route.set_assigned_addresses(vec!["100.64.90.254".parse().unwrap()]);
+        let returned = ipv4_packet([10, 63, 1, 9], [100, 64, 90, 1]);
+        assert!(packet_is_authorized_for_delivery(
+            &network,
+            gateway,
+            &gateway_route,
+            DeviceId(Uuid::from_u128(100)),
+            DeviceId(Uuid::from_u128(100)),
+            &returned,
+        ));
+        assert!(!packet_is_authorized_for_delivery(
+            &network,
+            DeviceId(Uuid::from_u128(632)),
+            &gateway_route,
+            DeviceId(Uuid::from_u128(100)),
+            DeviceId(Uuid::from_u128(100)),
+            &returned,
+        ));
+        let outside = ipv4_packet([10, 64, 1, 9], [100, 64, 90, 1]);
+        assert!(!packet_is_authorized_for_delivery(
+            &network,
+            gateway,
+            &gateway_route,
+            DeviceId(Uuid::from_u128(100)),
+            DeviceId(Uuid::from_u128(100)),
+            &outside,
+        ));
+        network.control_plane.authorization_manifest = None;
+        assert!(!packet_is_authorized_for_delivery(
+            &network,
+            gateway,
+            &gateway_route,
+            DeviceId(Uuid::from_u128(100)),
+            DeviceId(Uuid::from_u128(100)),
+            &returned,
         ));
     }
 
