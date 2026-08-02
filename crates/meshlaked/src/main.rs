@@ -26,17 +26,18 @@ use meshlake_core::{
     accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state_with,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
     restrict_state_file_permissions, session_handshake_id, write_protected_state_file,
-    write_protected_state_file_with, AgentStatus, DeviceId, EnrollmentResponse, InitiatorHandshake,
-    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
-    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey,
-    NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay,
-    PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration, RootResponse, SessionList,
-    SessionPath, SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRootResponse,
-    StateFileLock, StateKeyProvider, StateProtection, TransportStatus, UpsertNetworkRequest,
-    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
-    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
-    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
-    RELAY_SESSION_RESPONSE,
+    write_protected_state_file_with, AgentStatus, AuthorizationEpochHint, DeviceId,
+    EnrollmentResponse, InitiatorHandshake, JoinedNetwork, MembershipCertificate,
+    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
+    NetworkControlPlane, NetworkId, NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys,
+    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
+    RootRegistration, RootResponse, ServiceIdentityPolicy, SessionList, SessionPath,
+    SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRelayRegistrationAck,
+    SignedRootResponse, StateFileLock, StateKeyProvider, StateProtection, TransportStatus,
+    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
+    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
+    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED,
+    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,7 @@ use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock},
 };
-use transport_health::{select_relay_endpoint, EndpointHealthTable};
+use transport_health::{registration_retry_delay, select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -240,16 +241,23 @@ struct Agent {
     transport_supervisor_running: AtomicBool,
     authorization_supervisor_running: AtomicBool,
     transport_revision: AtomicU64,
+    relay_confirmations_accepted: AtomicU64,
+    relay_confirmations_rejected: AtomicU64,
+    authorization_hint_refreshes: AtomicU64,
+    registration_backoff_seconds: AtomicU64,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
     session_observability: SessionObservability,
     transport_reload: Notify,
+    authorization_refresh: Notify,
     shutdown: Notify,
 }
 
 #[derive(Debug, Clone, Default)]
 struct NetworkTransportConfiguration {
     relay_endpoints: Vec<SocketAddr>,
+    relay_identities: HashMap<SocketAddr, ServiceIdentityPolicy>,
+    planet_manifest_version: Option<u8>,
     root_servers: Vec<PlanetRoot>,
 }
 
@@ -306,6 +314,21 @@ impl TransportConfiguration {
             .get(&network_id)
             .map(|network| network.root_servers.as_slice())
             .unwrap_or_default()
+    }
+
+    fn relay_identity_for(
+        &self,
+        network_id: NetworkId,
+        endpoint: SocketAddr,
+    ) -> Option<&ServiceIdentityPolicy> {
+        self.networks
+            .get(&network_id)?
+            .relay_identities
+            .get(&endpoint)
+    }
+
+    fn planet_manifest_version_for(&self, network_id: NetworkId) -> Option<u8> {
+        self.networks.get(&network_id)?.planet_manifest_version
     }
 }
 
@@ -364,10 +387,15 @@ impl Agent {
             transport_supervisor_running: AtomicBool::new(false),
             authorization_supervisor_running: AtomicBool::new(false),
             transport_revision: AtomicU64::new(1),
+            relay_confirmations_accepted: AtomicU64::new(0),
+            relay_confirmations_rejected: AtomicU64::new(0),
+            authorization_hint_refreshes: AtomicU64::new(0),
+            registration_backoff_seconds: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
             session_observability,
             transport_reload: Notify::new(),
+            authorization_refresh: Notify::new(),
             shutdown: Notify::new(),
         })
     }
@@ -436,6 +464,18 @@ impl Agent {
                 responsive_roots,
                 configured_relays,
                 healthy_relays,
+                relay_confirmations_accepted: self
+                    .relay_confirmations_accepted
+                    .load(Ordering::Relaxed),
+                relay_confirmations_rejected: self
+                    .relay_confirmations_rejected
+                    .load(Ordering::Relaxed),
+                authorization_hint_refreshes: self
+                    .authorization_hint_refreshes
+                    .load(Ordering::Relaxed),
+                registration_backoff_seconds: self
+                    .registration_backoff_seconds
+                    .load(Ordering::Relaxed),
                 peer_paths,
             },
         }
@@ -538,6 +578,7 @@ impl Agent {
             ));
         }
         let mut state = self.state.write().await;
+        let manifest_version = manifest.version;
         let mut relays = manifest.relays;
         relays.sort_by_key(|relay| relay.priority);
         state.relay_endpoints = relays.iter().map(|relay| relay.endpoint).collect();
@@ -547,6 +588,7 @@ impl Agent {
         state.relay_endpoint = state.relay_endpoints.first().copied();
         state.root_servers = manifest.roots;
         state.root_servers.sort_by_key(|root| root.priority);
+        let verified_roots = state.root_servers.clone();
         state.stun_servers = manifest
             .stun_servers
             .into_iter()
@@ -560,6 +602,11 @@ impl Agent {
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
             controller_tls_ca_pem: tls_ca_pem,
         });
+        for joined in &mut state.networks {
+            joined.control_plane.planet_manifest_version = Some(manifest_version);
+            joined.control_plane.verified_relays = relays.clone();
+            joined.control_plane.verified_roots = verified_roots.clone();
+        }
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
         drop(state);
@@ -576,6 +623,35 @@ impl Agent {
         let revision = self.transport_revision.fetch_add(1, Ordering::AcqRel) + 1;
         self.session_observability.reset(revision);
         self.transport_reload.notify_one();
+    }
+
+    async fn consider_authorization_hint(&self, hint: &AuthorizationEpochHint) -> bool {
+        let state = self.state.read().await;
+        let Some(network) = state
+            .networks
+            .iter()
+            .find(|network| network.network.id == hint.network_id)
+        else {
+            return false;
+        };
+        if hint
+            .verify_from_controller(pinned_controller_key(network), now())
+            .is_err()
+        {
+            return false;
+        }
+        let current_epoch = network
+            .control_plane
+            .authorization_manifest
+            .as_ref()
+            .map(|authorization| authorization.authorization_epoch)
+            .unwrap_or_default();
+        if hint.authorization_epoch <= current_epoch {
+            return false;
+        }
+        drop(state);
+        self.authorization_refresh.notify_one();
+        true
     }
 
     fn sessions(&self) -> SessionList {
@@ -937,6 +1013,7 @@ impl Agent {
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(AUTHORIZATION_REFRESH_INTERVAL) => {}
+                    _ = agent.authorization_refresh.notified() => {}
                     _ = agent.shutdown.notified() => break,
                 }
             }
@@ -1305,6 +1382,7 @@ async fn resolve_enrollment_control_plane(
         ));
     }
 
+    let manifest_version = manifest.version;
     let mut roots = manifest.roots;
     roots.sort_by_key(|root| root.priority);
     let mut relays = manifest.relays;
@@ -1313,6 +1391,7 @@ async fn resolve_enrollment_control_plane(
         relays.push(PlanetRelay {
             endpoint: manifest.relay_endpoint,
             priority: 0,
+            identity: None,
         });
     }
     let mut stun_servers = manifest
@@ -1325,6 +1404,7 @@ async fn resolve_enrollment_control_plane(
     stun_servers.sort();
     stun_servers.dedup();
     control_plane.planet_manifest_url = Some(manifest_url);
+    control_plane.planet_manifest_version = Some(manifest_version);
     control_plane.verified_roots = roots;
     control_plane.verified_relays = relays;
     control_plane.verified_stun_servers = stun_servers;
@@ -1634,6 +1714,7 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
         .map(|(priority, endpoint)| PlanetRelay {
             endpoint,
             priority: priority.min(u16::MAX as usize) as u16,
+            identity: None,
         })
         .collect::<Vec<_>>();
     let mut changed = false;
@@ -1770,8 +1851,12 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
     for joined in &state.networks {
         let mut relays = joined.control_plane.verified_relays.clone();
         relays.sort_by_key(|relay| relay.priority);
+        let relay_identities = relays
+            .iter()
+            .filter_map(|relay| Some((relay.endpoint, relay.identity.clone()?)))
+            .collect::<HashMap<_, _>>();
         let mut relay_endpoints = relays
-            .into_iter()
+            .iter()
             .map(|relay| relay.endpoint)
             .collect::<Vec<_>>();
         if relay_endpoints.is_empty() {
@@ -1811,6 +1896,8 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
             joined.network.id,
             NetworkTransportConfiguration {
                 relay_endpoints,
+                relay_identities,
+                planet_manifest_version: joined.control_plane.planet_manifest_version,
                 root_servers,
             },
         );
@@ -2855,6 +2942,7 @@ async fn send_peer_routed_packet(
         relay_endpoints,
         endpoint_health,
         Instant::now(),
+        network.control_plane.planet_manifest_version == Some(3),
     ) else {
         return None;
     };
@@ -2878,14 +2966,17 @@ struct RootTransaction {
     network_id: NetworkId,
     endpoint: SocketAddr,
     public_key: Vec<u8>,
+    identity: Option<ServiceIdentityPolicy>,
     issued_at: Instant,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RelayRegistrationTransaction {
     network_id: NetworkId,
     device_id: DeviceId,
     endpoint: SocketAddr,
+    planet_manifest_version: Option<u8>,
+    identity: Option<ServiceIdentityPolicy>,
     issued_at: Instant,
 }
 
@@ -3033,6 +3124,8 @@ async fn run_relay_worker(
     let mut incoming_ipv6 = vec![0_u8; u16::MAX as usize];
     let mut tick = tokio::time::interval(Duration::from_millis(5));
     let mut next_registration = tokio::time::Instant::now();
+    let mut registration_failures = 0_u8;
+    let mut registration_succeeded = true;
     let mut next_port_mapping_refresh = tokio::time::Instant::now() + Duration::from_secs(1_800);
     let mut next_peer_probe = tokio::time::Instant::now();
     let mut next_handshake_retry = tokio::time::Instant::now();
@@ -3059,6 +3152,7 @@ async fn run_relay_worker(
                     &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
+                    &mut registration_succeeded,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -3079,6 +3173,7 @@ async fn run_relay_worker(
                     &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
+                    &mut registration_succeeded,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -3252,6 +3347,13 @@ async fn run_relay_worker(
                         tokio::time::Instant::now() + Duration::from_secs(5);
                 }
                 if tokio::time::Instant::now() >= next_registration {
+                    if registration_succeeded {
+                        registration_failures = 0;
+                    } else {
+                        registration_failures = registration_failures.saturating_add(1);
+                    }
+                    registration_succeeded = false;
+                    let mut sent_registration = false;
                     let (root_device, identity, memberships) =
                         agent.root_registration_material().await?;
                     for membership in &memberships {
@@ -3259,6 +3361,11 @@ async fn run_relay_worker(
                         for relay_endpoint in configuration
                             .relay_endpoints_for(certificate.claims.network_id)
                         {
+                            let transaction_key =
+                                (certificate.claims.network_id, *relay_endpoint);
+                            relay_registration_transactions.retain(|_, transaction| {
+                                (transaction.network_id, transaction.endpoint) != transaction_key
+                            });
                             let nonce = new_root_nonce();
                             let signed = RootRegistration::sign_authorized(
                                 root_device,
@@ -3273,12 +3380,23 @@ async fn run_relay_worker(
                             registration.push(RELAY_REGISTER_SIGNED);
                             registration.extend_from_slice(&serde_json::to_vec(&signed)?);
                             if sockets.send_to(&registration, *relay_endpoint).await {
+                                sent_registration = true;
                                 relay_registration_transactions.insert(
                                     nonce,
                                     RelayRegistrationTransaction {
                                         network_id: certificate.claims.network_id,
                                         device_id: root_device,
                                         endpoint: *relay_endpoint,
+                                        planet_manifest_version: configuration
+                                            .planet_manifest_version_for(
+                                                certificate.claims.network_id,
+                                            ),
+                                        identity: configuration
+                                            .relay_identity_for(
+                                                certificate.claims.network_id,
+                                                *relay_endpoint,
+                                            )
+                                            .cloned(),
                                         issued_at: Instant::now(),
                                     },
                                 );
@@ -3306,12 +3424,14 @@ async fn run_relay_worker(
                                     .send_to(&serde_json::to_vec(&registration)?, root_endpoint)
                                     .await
                                 {
+                                    sent_registration = true;
                                     root_transactions.insert(
                                         nonce,
                                         RootTransaction {
                                             network_id: certificate.claims.network_id,
                                             endpoint: root_endpoint,
                                             public_key: root.public_key.clone(),
+                                            identity: root.identity.clone(),
                                             issued_at: Instant::now(),
                                         },
                                     );
@@ -3343,7 +3463,17 @@ async fn run_relay_worker(
                     relay_registration_transactions.retain(|_, transaction| {
                         transaction.issued_at.elapsed() < TRANSPORT_TRANSACTION_TTL
                     });
-                    next_registration = tokio::time::Instant::now() + Duration::from_secs(20);
+                    if !sent_registration {
+                        registration_succeeded = true;
+                    }
+                    let retry_delay = registration_retry_delay(
+                        root_device.0.as_bytes(),
+                        registration_failures,
+                    );
+                    agent
+                        .registration_backoff_seconds
+                        .store(retry_delay.as_secs(), Ordering::Relaxed);
+                    next_registration = tokio::time::Instant::now() + retry_delay;
                 }
                 if !agent.adapter.is_active() {
                     continue;
@@ -3426,6 +3556,7 @@ async fn receive_udp_packet(
     relay_registration_transactions: &mut HashMap<[u8; 16], RelayRegistrationTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
     endpoint_health: &mut EndpointHealthTable,
+    registration_succeeded: &mut bool,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     let root_servers = configuration.root_servers.as_slice();
@@ -3465,6 +3596,7 @@ async fn receive_udp_packet(
         configuration_revision,
         root_servers,
         root_transactions,
+        registration_succeeded,
     )
     .await?
     {
@@ -3474,6 +3606,49 @@ async fn receive_udp_packet(
         return Ok(());
     }
     match packet[4] {
+        RELAY_REGISTER_ACK_SIGNED if relay_endpoints.contains(&remote) => {
+            let Ok(acknowledgement) =
+                serde_json::from_slice::<SignedRelayRegistrationAck>(&packet[5..])
+            else {
+                agent
+                    .relay_confirmations_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            let Some((network, authorization_hint)) = acknowledge_signed_relay_registration(
+                relay_registration_transactions,
+                endpoint_health,
+                &acknowledgement,
+                remote,
+                Instant::now(),
+                now(),
+            ) else {
+                agent
+                    .relay_confirmations_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            agent
+                .relay_confirmations_accepted
+                .fetch_add(1, Ordering::Relaxed);
+            *registration_succeeded = true;
+            agent.mark_relay_acknowledged(network, remote).await;
+            if let Some(hint) = authorization_hint.as_ref() {
+                if agent.consider_authorization_hint(hint).await {
+                    agent
+                        .authorization_hint_refreshes
+                        .fetch_add(1, Ordering::Relaxed);
+                    trace_transport(format!(
+                        "Relay authorization hint requested a signed manifest refresh for network {}",
+                        network.0
+                    ));
+                }
+            }
+            trace_transport(format!(
+                "verified signed Relay registration acknowledgement for network {}",
+                network.0
+            ));
+        }
         RELAY_REGISTER_ACK if relay_endpoints.contains(&remote) => {
             let Some((network, device, nonce)) = parse_registration_ack(packet) else {
                 return Ok(());
@@ -3495,8 +3670,14 @@ async fn receive_udp_packet(
                 remote,
                 acknowledged,
             ) {
+                agent
+                    .relay_confirmations_rejected
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
+            agent
+                .relay_confirmations_accepted
+                .fetch_add(1, Ordering::Relaxed);
             agent.mark_relay_acknowledged(network, remote).await;
             trace_transport(format!(
                 "relay {remote} registration acknowledged for network {}",
@@ -3665,6 +3846,7 @@ async fn handle_root_response(
     configuration_revision: u64,
     root_servers: &[PlanetRoot],
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
+    registration_succeeded: &mut bool,
 ) -> Result<bool> {
     let Ok(response) = serde_json::from_slice::<SignedRootResponse>(packet) else {
         return Ok(false);
@@ -3681,21 +3863,33 @@ async fn handle_root_response(
     {
         return Ok(true);
     }
-    if response.verify(&transaction.public_key).is_err() {
+    let identity_verified = transaction
+        .identity
+        .as_ref()
+        .map(|identity| response.verify_identity(identity, now()))
+        .unwrap_or_else(|| response.verify(&transaction.public_key));
+    if identity_verified.is_err() {
         return Ok(true);
     }
     match response.response {
         RootResponse::Registered {
             observed_endpoint,
             peers: discovered,
+            authorization_hints,
             ..
         } => {
+            *registration_succeeded = true;
             agent
                 .mark_root_responsive(transaction.network_id, remote)
                 .await;
             trace_transport(format!(
                 "authenticated root {remote} observed this node at {observed_endpoint}"
             ));
+            for hint in &authorization_hints {
+                if hint.network_id == transaction.network_id {
+                    agent.consider_authorization_hint(hint).await;
+                }
+            }
             let (self_id, networks) = agent.relay_snapshot().await;
             for peer in discovered {
                 if peer.network_id != transaction.network_id
@@ -4344,6 +4538,8 @@ fn acknowledge_relay_registration(
     if transaction.network_id != network_id
         || transaction.device_id != device_id
         || transaction.endpoint != endpoint
+        || !matches!(transaction.planet_manifest_version, Some(1 | 2))
+        || transaction.identity.is_some()
         || now.saturating_duration_since(transaction.issued_at) >= TRANSPORT_TRANSACTION_TTL
     {
         return false;
@@ -4351,6 +4547,42 @@ fn acknowledge_relay_registration(
     transactions.remove(&nonce);
     endpoint_health.mark_relay_acknowledged(network_id, endpoint, now);
     true
+}
+
+fn acknowledge_signed_relay_registration(
+    transactions: &mut HashMap<[u8; 16], RelayRegistrationTransaction>,
+    endpoint_health: &mut EndpointHealthTable,
+    acknowledgement: &SignedRelayRegistrationAck,
+    endpoint: SocketAddr,
+    now_instant: Instant,
+    now_unix_seconds: u64,
+) -> Option<(NetworkId, Option<AuthorizationEpochHint>)> {
+    let nonce = acknowledgement.payload.request_nonce;
+    let transaction = transactions.get(&nonce)?;
+    let identity = transaction.identity.as_ref()?;
+    if transaction.planet_manifest_version != Some(3)
+        || transaction.endpoint != endpoint
+        || now_instant.saturating_duration_since(transaction.issued_at) >= TRANSPORT_TRANSACTION_TTL
+        || acknowledgement
+            .verify(
+                identity,
+                transaction.network_id,
+                transaction.device_id,
+                nonce,
+                now_unix_seconds,
+                5,
+            )
+            .is_err()
+    {
+        return None;
+    }
+    let network_id = transaction.network_id;
+    transactions.remove(&nonce);
+    endpoint_health.mark_relay_acknowledged(network_id, endpoint, now_instant);
+    Some((
+        network_id,
+        acknowledgement.payload.authorization_hint.clone(),
+    ))
 }
 
 fn parse_peer_announcement(packet: &[u8]) -> Option<(NetworkId, DeviceId, SocketAddr)> {
@@ -5436,6 +5668,8 @@ mod tests {
             network_id: network,
             device_id: device,
             endpoint: relay,
+            planet_manifest_version: Some(2),
+            identity: None,
             issued_at,
         };
 
@@ -5508,6 +5742,8 @@ mod tests {
                 network_id: network,
                 device_id: device,
                 endpoint: relay,
+                planet_manifest_version: Some(2),
+                identity: None,
                 issued_at,
             },
         )]);
@@ -5525,6 +5761,95 @@ mod tests {
         ));
         assert_eq!(transactions.len(), 1);
         assert!(!health.relay_is_healthy(network, relay, now));
+    }
+
+    #[test]
+    fn signed_relay_acknowledgement_rejects_replay_cross_relay_and_out_of_order() {
+        let relay_key = SigningKey::from_bytes(&[74; 32]);
+        let relay_id = Uuid::from_u128(75);
+        let network = NetworkId(Uuid::from_u128(76));
+        let device = DeviceId(Uuid::from_u128(77));
+        let relay: SocketAddr = "203.0.113.76:51820".parse().unwrap();
+        let other_relay: SocketAddr = "203.0.113.77:51820".parse().unwrap();
+        let nonce = [78; 16];
+        let issued_at = Instant::now();
+        let identity =
+            ServiceIdentityPolicy::stable(relay_id, relay_key.verifying_key().to_bytes().to_vec());
+        let transaction = RelayRegistrationTransaction {
+            network_id: network,
+            device_id: device,
+            endpoint: relay,
+            planet_manifest_version: Some(3),
+            identity: Some(identity),
+            issued_at,
+        };
+        let acknowledgement = SignedRelayRegistrationAck::sign(
+            network,
+            device,
+            relay_id,
+            nonce,
+            "198.51.100.76:41000".parse().unwrap(),
+            100,
+            115,
+            None,
+            &[&relay_key],
+        )
+        .unwrap();
+        let mut transactions = HashMap::from([(nonce, transaction.clone())]);
+        let mut health = EndpointHealthTable::default();
+        assert!(acknowledge_signed_relay_registration(
+            &mut transactions,
+            &mut health,
+            &acknowledgement,
+            other_relay,
+            issued_at,
+            105,
+        )
+        .is_none());
+        assert_eq!(transactions.len(), 1);
+
+        let out_of_order = SignedRelayRegistrationAck::sign(
+            network,
+            device,
+            relay_id,
+            [79; 16],
+            "198.51.100.76:41000".parse().unwrap(),
+            100,
+            115,
+            None,
+            &[&relay_key],
+        )
+        .unwrap();
+        assert!(acknowledge_signed_relay_registration(
+            &mut transactions,
+            &mut health,
+            &out_of_order,
+            relay,
+            issued_at,
+            105,
+        )
+        .is_none());
+        assert_eq!(transactions.len(), 1);
+
+        assert!(acknowledge_signed_relay_registration(
+            &mut transactions,
+            &mut health,
+            &acknowledgement,
+            relay,
+            issued_at,
+            105,
+        )
+        .is_some());
+        assert!(transactions.is_empty());
+        assert!(acknowledge_signed_relay_registration(
+            &mut transactions,
+            &mut health,
+            &acknowledgement,
+            relay,
+            issued_at,
+            105,
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -5626,6 +5951,7 @@ mod tests {
                     certificate: Some(peer_certificate),
                 }],
                 refresh_after_seconds: 20,
+                authorization_hints: Vec::new(),
             },
             &root_identity,
         )
@@ -5636,6 +5962,7 @@ mod tests {
                 network_id: requested_network,
                 endpoint: root_endpoint,
                 public_key: root_identity.verifying_key().to_bytes().to_vec(),
+                identity: None,
                 issued_at: Instant::now(),
             },
         )]);
@@ -5643,6 +5970,7 @@ mod tests {
             public_key: root_identity.verifying_key().to_bytes().to_vec(),
             endpoints: vec![root_endpoint],
             priority: 0,
+            identity: None,
         }];
         let sockets = TransportSockets::bind().await.unwrap();
         let mut peers = HashMap::<PeerKey, PeerRoute>::new();
@@ -5658,6 +5986,7 @@ mod tests {
             1,
             &roots,
             &mut root_transactions,
+            &mut false,
         )
         .await
         .unwrap());
@@ -5740,11 +6069,13 @@ mod tests {
         first.control_plane.verified_relays = vec![PlanetRelay {
             endpoint: "203.0.113.10:51820".parse().unwrap(),
             priority: 0,
+            identity: None,
         }];
         first.control_plane.verified_roots = vec![PlanetRoot {
             public_key: vec![1; 32],
             endpoints: vec!["203.0.113.10:51819".parse().unwrap()],
             priority: 0,
+            identity: None,
         }];
         first.control_plane.verified_stun_servers = vec!["stun-a.example:3478".into()];
 
@@ -5754,11 +6085,13 @@ mod tests {
         second.control_plane.verified_relays = vec![PlanetRelay {
             endpoint: "198.51.100.20:51820".parse().unwrap(),
             priority: 0,
+            identity: None,
         }];
         second.control_plane.verified_roots = vec![PlanetRoot {
             public_key: vec![2; 32],
             endpoints: vec!["198.51.100.20:51819".parse().unwrap()],
             priority: 0,
+            identity: None,
         }];
         second.control_plane.verified_stun_servers = vec!["stun-b.example:3478".into()];
         let second_id = second.network.id;
@@ -5807,6 +6140,7 @@ mod tests {
             public_key: vec![9; 32],
             endpoints: vec!["203.0.113.30:51819".parse().unwrap()],
             priority: 0,
+            identity: None,
         }];
         state.stun_servers = vec!["stun.example:3478".into()];
         state.planet = Some(PersistedPlanet {
@@ -5857,6 +6191,7 @@ mod tests {
             public_key: vec![35; 32],
             endpoints: vec!["203.0.113.35:51819".parse().unwrap()],
             priority: 0,
+            identity: None,
         }];
         state.stun_servers = vec!["stun.planet.example:3478".into()];
         state.planet = Some(PersistedPlanet {
@@ -5986,10 +6321,12 @@ mod tests {
                 public_key: vec![4; 32],
                 endpoints: vec!["203.0.113.40:51819".parse().unwrap()],
                 priority: 0,
+                identity: None,
             }],
             vec![PlanetRelay {
                 endpoint: "203.0.113.40:51820".parse().unwrap(),
                 priority: 0,
+                identity: None,
             }],
             vec!["stun.example:3478".into()],
             now(),
@@ -6240,6 +6577,50 @@ mod tests {
         refresh
             .verify(&identity.verifying_key().to_bytes(), now(), 120)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_hint_only_requests_refresh_and_never_installs_authority() {
+        let directory = env::temp_dir().join(format!("meshlake-auth-hint-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path, adapter::default_wintun_path()).unwrap();
+        let (device_id, identity) = {
+            let state = agent.state.read().await;
+            (state.device_id, identity_signing_key(&state).unwrap())
+        };
+        let controller = SigningKey::from_bytes(&[79; 32]);
+        let network_id = NetworkId(Uuid::from_u128(80));
+        let network = joined_network_with_authorization(
+            &controller,
+            &identity,
+            device_id,
+            network_id,
+            Uuid::from_u128(81),
+            1,
+            1,
+            "http://127.0.0.1:1".into(),
+        );
+        agent.state.write().await.networks.push(network);
+        let timestamp = now();
+        let hint =
+            AuthorizationEpochHint::sign(network_id, 2, 2, timestamp, timestamp + 30, &controller)
+                .unwrap();
+        assert!(agent.consider_authorization_hint(&hint).await);
+        assert_eq!(
+            agent.state.read().await.networks[0]
+                .control_plane
+                .authorization_manifest
+                .as_ref()
+                .unwrap()
+                .authorization_epoch,
+            1
+        );
+        let old_hint =
+            AuthorizationEpochHint::sign(network_id, 1, 1, timestamp, timestamp + 30, &controller)
+                .unwrap();
+        assert!(!agent.consider_authorization_hint(&old_hint).await);
+        drop(agent);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[tokio::test]

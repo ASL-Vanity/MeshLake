@@ -8,14 +8,16 @@ mod policy;
 mod relay;
 mod root;
 mod secret_file;
+mod service_identity;
 mod session;
 mod session_observation;
 mod state_backup;
 mod state_protection;
 
 pub use authorization::{
-    AuthorizedMembership, MembershipRefreshRequest, MembershipRefreshResponse,
-    NetworkAuthorizationManifest, AUTHORIZATION_MANIFEST_VERSION,
+    AuthorizationEpochHint, AuthorizedMembership, MembershipRefreshRequest,
+    MembershipRefreshResponse, NetworkAuthorizationManifest, AUTHORIZATION_EPOCH_HINT_VERSION,
+    AUTHORIZATION_MANIFEST_VERSION,
 };
 pub use crypto::{
     CryptoError, EnrollmentResponse, MembershipCertificate, MembershipClaims, NetworkKey,
@@ -30,10 +32,12 @@ pub use policy::{
     DnsPolicy, NetworkPolicyManifest, PolicyError, PolicyRoute, NETWORK_POLICY_MANIFEST_VERSION,
 };
 pub use relay::{
-    parse_peer_identity, peer_identity_announcement, relay_associated_data, RELAY_CANDIDATE,
-    RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER,
-    RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER, RELAY_REGISTER_ACK,
-    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    parse_peer_identity, peer_identity_announcement, relay_associated_data, RelayProtocolError,
+    RelayReceiverEndpoint, RelayRegistrationAckPayload, SignedRelayRegistrationAck,
+    RELAY_ACK_PROTOCOL_VERSION, RELAY_CANDIDATE, RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER, RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED,
+    RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 pub use root::{
     RootPeer, RootProtocolError, RootRegistration, RootRegistrationPayload, RootResponse,
@@ -42,6 +46,10 @@ pub use root::{
 pub use secret_file::{
     create_restricted_secret_file, read_restricted_secret_file, read_restricted_secret_string_file,
     verify_restricted_secret_file, SecretFileError,
+};
+pub use service_identity::{
+    load_or_create_service_identity, ServiceIdentityError, ServiceIdentityFileError,
+    ServiceIdentityPolicy, ServiceSignature, ServiceSigningIdentity,
 };
 pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,

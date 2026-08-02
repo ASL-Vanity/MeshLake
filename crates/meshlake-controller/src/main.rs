@@ -20,8 +20,8 @@ use meshlake_core::{
     write_protected_state_file_with, AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse,
     MembershipCertificate, MembershipClaims, MembershipRefreshRequest, MembershipRefreshResponse,
     NetworkAuthorizationManifest, NetworkId, NetworkKey, NetworkPolicyManifest, PlanetManifest,
-    PlanetRelay, PlanetRoot, PolicyRoute, StateFileLock, StateKeyProvider, StateProtection,
-    UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    PlanetRelay, PlanetRoot, PolicyRoute, ServiceIdentityPolicy, StateFileLock, StateKeyProvider,
+    StateProtection, UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -101,9 +101,16 @@ struct Cli {
     /// Public MeshLake encrypted-UDP relay endpoint. Repeat for failover order.
     #[arg(long = "planet-relay-endpoint")]
     planet_relay_endpoints: Vec<SocketAddr>,
+    /// Planet V3 Relay identity: RELAY_UUID@CURRENT_KEY_BASE64@IP:PORT, or
+    /// RELAY_UUID@CURRENT_KEY_BASE64@NEXT_KEY_BASE64@NOT_BEFORE@NOT_AFTER@IP:PORT.
+    #[arg(long = "planet-relay-identity", value_parser = parse_planet_relay_identity)]
+    planet_relay_identities: Vec<PlanetRelay>,
     /// Root descriptor in BASE64_PUBLIC_KEY@IP:PORT form. Repeat for multiple roots.
     #[arg(long = "planet-root", value_parser = parse_planet_root)]
     planet_roots: Vec<PlanetRoot>,
+    /// Planet V3 Root identity using the same rotation descriptor as Relay identities.
+    #[arg(long = "planet-root-identity", value_parser = parse_planet_root_identity)]
+    planet_root_identities: Vec<PlanetRoot>,
     /// Optional STUN server (`host:port`). Repeat for multiple servers.
     #[arg(long = "planet-stun")]
     planet_stun_servers: Vec<String>,
@@ -235,6 +242,7 @@ struct EnrollmentRequest {
 
 #[derive(Debug, Clone)]
 struct PlanetSettings {
+    version: u8,
     controller_url: String,
     tls_client_ca_pem: Option<String>,
     roots: Vec<PlanetRoot>,
@@ -765,15 +773,28 @@ impl Controller {
         };
         let state = self.state.read().await;
         let signing_key = signing_key(&state)?;
-        Ok(Some(PlanetManifest::sign_v2(
-            planet.controller_url.clone(),
-            planet.roots.clone(),
-            planet.relays.clone(),
-            planet.stun_servers.clone(),
-            now(),
-            None,
-            &signing_key,
-        )?))
+        let manifest = if planet.version == 3 {
+            PlanetManifest::sign_v3(
+                planet.controller_url.clone(),
+                planet.roots.clone(),
+                planet.relays.clone(),
+                planet.stun_servers.clone(),
+                now(),
+                None,
+                &signing_key,
+            )?
+        } else {
+            PlanetManifest::sign_v2(
+                planet.controller_url.clone(),
+                planet.roots.clone(),
+                planet.relays.clone(),
+                planet.stun_servers.clone(),
+                now(),
+                None,
+                &signing_key,
+            )?
+        };
+        Ok(Some(manifest))
     }
 }
 
@@ -1385,18 +1406,37 @@ async fn main() -> Result<()> {
             "--tls-client-ca-certificate requires --planet-controller-url so the CA can be embedded in invitations"
         );
     }
-    let planet = match (
-        cli.planet_controller_url,
-        cli.planet_relay_endpoints.is_empty(),
-    ) {
-        (Some(controller_url), false) => Some(PlanetSettings {
+    if !cli.planet_relay_endpoints.is_empty() && !cli.planet_relay_identities.is_empty() {
+        anyhow::bail!(
+            "legacy --planet-relay-endpoint cannot be mixed with Planet V3 Relay identities"
+        );
+    }
+    if !cli.planet_roots.is_empty() && !cli.planet_root_identities.is_empty() {
+        anyhow::bail!("legacy --planet-root cannot be mixed with Planet V3 Root identities");
+    }
+    let uses_planet_v3 = !cli.planet_relay_identities.is_empty();
+    if uses_planet_v3 && !cli.planet_roots.is_empty()
+        || !uses_planet_v3 && !cli.planet_root_identities.is_empty()
+    {
+        anyhow::bail!(
+            "Planet V3 service identities must be used consistently for Roots and Relays"
+        );
+    }
+    let has_relays =
+        !cli.planet_relay_endpoints.is_empty() || !cli.planet_relay_identities.is_empty();
+    let planet = match (cli.planet_controller_url, has_relays) {
+        (Some(controller_url), true) => Some(PlanetSettings {
+            version: if uses_planet_v3 { 3 } else { 2 },
             controller_url: validate_controller_url(
                 &controller_url,
                 cli.allow_insecure_public_http,
             )?,
             tls_client_ca_pem,
-            roots: cli
-                .planet_roots
+            roots: if uses_planet_v3 {
+                cli.planet_root_identities
+            } else {
+                cli.planet_roots
+            }
                 .into_iter()
                 .enumerate()
                 .map(|(priority, mut root)| {
@@ -1404,15 +1444,25 @@ async fn main() -> Result<()> {
                     root
                 })
                 .collect(),
-            relays: cli
-                .planet_relay_endpoints
-                .into_iter()
-                .enumerate()
-                .map(|(priority, endpoint)| PlanetRelay {
-                    endpoint,
-                    priority: priority.min(u16::MAX as usize) as u16,
-                })
-                .collect(),
+            relays: if uses_planet_v3 {
+                cli.planet_relay_identities
+            } else {
+                cli.planet_relay_endpoints
+                    .into_iter()
+                    .map(|endpoint| PlanetRelay {
+                        endpoint,
+                        priority: 0,
+                        identity: None,
+                    })
+                    .collect()
+            }
+            .into_iter()
+            .enumerate()
+            .map(|(priority, mut relay)| {
+                relay.priority = priority.min(u16::MAX as usize) as u16;
+                relay
+            })
+            .collect(),
             stun_servers: cli
                 .planet_stun_servers
                 .into_iter()
@@ -1421,7 +1471,13 @@ async fn main() -> Result<()> {
                 .take(8)
                 .collect(),
         }),
-        (None, true) if cli.planet_roots.is_empty() && cli.planet_stun_servers.is_empty() => None,
+        (None, false)
+            if cli.planet_roots.is_empty()
+                && cli.planet_root_identities.is_empty()
+                && cli.planet_stun_servers.is_empty() =>
+        {
+            None
+        }
         _ => anyhow::bail!(
             "--planet-controller-url and at least one --planet-relay-endpoint must be provided together"
         ),
@@ -1643,7 +1699,85 @@ fn parse_planet_root(value: &str) -> Result<PlanetRoot, String> {
         public_key,
         endpoints: vec![endpoint],
         priority: 0,
+        identity: None,
     })
+}
+
+fn parse_planet_relay_identity(value: &str) -> Result<PlanetRelay, String> {
+    let (identity, endpoint) = parse_service_identity_descriptor(value)?;
+    Ok(PlanetRelay {
+        endpoint,
+        priority: 0,
+        identity: Some(identity),
+    })
+}
+
+fn parse_planet_root_identity(value: &str) -> Result<PlanetRoot, String> {
+    let (identity, endpoint) = parse_service_identity_descriptor(value)?;
+    Ok(PlanetRoot {
+        public_key: identity.current_public_key.clone(),
+        endpoints: vec![endpoint],
+        priority: 0,
+        identity: Some(identity),
+    })
+}
+
+fn parse_service_identity_descriptor(
+    value: &str,
+) -> Result<(ServiceIdentityPolicy, SocketAddr), String> {
+    let parts = value.split('@').collect::<Vec<_>>();
+    if !matches!(parts.len(), 3 | 4 | 6) {
+        return Err("service identity must use UUID@CURRENT_KEY@IP:PORT, UUID@CURRENT_KEY@REVOKED_KEY@IP:PORT, or UUID@CURRENT_KEY@NEXT_KEY@NOT_BEFORE@NOT_AFTER@IP:PORT".into());
+    }
+    let service_id = parts[0]
+        .parse::<Uuid>()
+        .map_err(|_| "service identity UUID is invalid".to_string())?;
+    let current_public_key = decode_service_public_key(parts[1])?;
+    let endpoint = parts[parts.len() - 1]
+        .parse::<SocketAddr>()
+        .map_err(|_| "service endpoint must be a numeric IP:PORT socket address".to_string())?;
+    let (next_public_key, not_before, not_after, revoked_public_keys) = if parts.len() == 6 {
+        (
+            Some(decode_service_public_key(parts[2])?),
+            Some(
+                parts[3]
+                    .parse::<u64>()
+                    .map_err(|_| "rotation NOT_BEFORE must be Unix seconds".to_string())?,
+            ),
+            Some(
+                parts[4]
+                    .parse::<u64>()
+                    .map_err(|_| "rotation NOT_AFTER must be Unix seconds".to_string())?,
+            ),
+            Vec::new(),
+        )
+    } else if parts.len() == 4 {
+        (None, None, None, vec![decode_service_public_key(parts[2])?])
+    } else {
+        (None, None, None, Vec::new())
+    };
+    let identity = ServiceIdentityPolicy {
+        service_id,
+        current_public_key,
+        next_public_key,
+        transition_not_before_unix_seconds: not_before,
+        transition_not_after_unix_seconds: not_after,
+        revoked_public_keys,
+    };
+    identity
+        .required_public_keys(now())
+        .map_err(|error| error.to_string())?;
+    Ok((identity, endpoint))
+}
+
+fn decode_service_public_key(encoded: &str) -> Result<Vec<u8>, String> {
+    let key = STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| "service public key is not valid Base64".to_string())?;
+    if key.len() != 32 {
+        return Err("service public key must contain exactly 32 bytes".into());
+    }
+    Ok(key)
 }
 
 fn default_state_path() -> PathBuf {
@@ -1698,7 +1832,9 @@ mod tests {
             allow_plaintext_state_migration: false,
             planet_controller_url: None,
             planet_relay_endpoints: Vec::new(),
+            planet_relay_identities: Vec::new(),
             planet_roots: Vec::new(),
+            planet_root_identities: Vec::new(),
             planet_stun_servers: Vec::new(),
             command: None,
         }

@@ -6,7 +6,109 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const AUTHORIZATION_MANIFEST_VERSION: u8 = 1;
+pub const AUTHORIZATION_EPOCH_HINT_VERSION: u8 = 1;
 const REFRESH_DOMAIN: &[u8] = b"MeshLake membership refresh v1\0";
+const EPOCH_HINT_DOMAIN: &[u8] = b"MeshLake authorization epoch hint v1\0";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationEpochHint {
+    pub version: u8,
+    pub network_id: NetworkId,
+    pub authorization_epoch: u64,
+    pub network_key_epoch: u64,
+    pub issued_at_unix_seconds: u64,
+    pub expires_at_unix_seconds: u64,
+    pub controller_public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct AuthorizationEpochHintPayload<'a> {
+    version: u8,
+    network_id: NetworkId,
+    authorization_epoch: u64,
+    network_key_epoch: u64,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    controller_public_key: &'a [u8],
+}
+
+impl AuthorizationEpochHint {
+    pub fn sign(
+        network_id: NetworkId,
+        authorization_epoch: u64,
+        network_key_epoch: u64,
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+        signing_key: &SigningKey,
+    ) -> Result<Self, CryptoError> {
+        let controller_public_key = signing_key.verifying_key().to_bytes().to_vec();
+        let payload = AuthorizationEpochHintPayload {
+            version: AUTHORIZATION_EPOCH_HINT_VERSION,
+            network_id,
+            authorization_epoch,
+            network_key_epoch,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            controller_public_key: &controller_public_key,
+        };
+        let mut encoded = Vec::from(EPOCH_HINT_DOMAIN);
+        encoded.extend_from_slice(
+            &serde_json::to_vec(&payload).map_err(|_| CryptoError::CertificateEncodingFailed)?,
+        );
+        Ok(Self {
+            version: AUTHORIZATION_EPOCH_HINT_VERSION,
+            network_id,
+            authorization_epoch,
+            network_key_epoch,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            controller_public_key,
+            signature: signing_key.sign(&encoded).to_bytes().to_vec(),
+        })
+    }
+
+    pub fn verify_from_controller(
+        &self,
+        trusted_controller_public_key: &[u8],
+        now_unix_seconds: u64,
+    ) -> Result<(), CryptoError> {
+        if self.version != AUTHORIZATION_EPOCH_HINT_VERSION
+            || self.controller_public_key != trusted_controller_public_key
+            || now_unix_seconds > self.expires_at_unix_seconds
+            || self.issued_at_unix_seconds > now_unix_seconds.saturating_add(120)
+        {
+            return Err(CryptoError::UntrustedController);
+        }
+        let public_key: [u8; 32] = self
+            .controller_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::InvalidCertificate)?;
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::InvalidCertificate)?;
+        let payload = AuthorizationEpochHintPayload {
+            version: self.version,
+            network_id: self.network_id,
+            authorization_epoch: self.authorization_epoch,
+            network_key_epoch: self.network_key_epoch,
+            issued_at_unix_seconds: self.issued_at_unix_seconds,
+            expires_at_unix_seconds: self.expires_at_unix_seconds,
+            controller_public_key: &self.controller_public_key,
+        };
+        let mut encoded = Vec::from(EPOCH_HINT_DOMAIN);
+        encoded.extend_from_slice(
+            &serde_json::to_vec(&payload).map_err(|_| CryptoError::CertificateEncodingFailed)?,
+        );
+        VerifyingKey::from_bytes(&public_key)
+            .map_err(|_| CryptoError::InvalidCertificate)?
+            .verify(&encoded, &ed25519_dalek::Signature::from_bytes(&signature))
+            .map_err(|_| CryptoError::InvalidCertificate)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizedMembership {
@@ -28,6 +130,8 @@ pub struct NetworkAuthorizationManifest {
     pub expires_at_unix_seconds: u64,
     pub controller_public_key: Vec<u8>,
     pub signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_hint: Option<AuthorizationEpochHint>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +187,14 @@ impl NetworkAuthorizationManifest {
             expires_at_unix_seconds,
             controller_public_key,
             signature: signing_key.sign(&encoded).to_bytes().to_vec(),
+            epoch_hint: Some(AuthorizationEpochHint::sign(
+                network_id,
+                authorization_epoch,
+                network_key_epoch,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+                signing_key,
+            )?),
         })
     }
 
@@ -127,7 +239,17 @@ impl NetworkAuthorizationManifest {
         VerifyingKey::from_bytes(&public_key)
             .map_err(|_| CryptoError::InvalidCertificate)?
             .verify(&encoded, &ed25519_dalek::Signature::from_bytes(&signature))
-            .map_err(|_| CryptoError::InvalidCertificate)
+            .map_err(|_| CryptoError::InvalidCertificate)?;
+        if let Some(hint) = &self.epoch_hint {
+            hint.verify_from_controller(trusted_controller_public_key, now_unix_seconds)?;
+            if hint.network_id != self.network_id
+                || hint.authorization_epoch != self.authorization_epoch
+                || hint.network_key_epoch != self.network_key_epoch
+            {
+                return Err(CryptoError::InvalidCertificate);
+            }
+        }
+        Ok(())
     }
 
     pub fn authorizes(&self, certificate: &MembershipCertificate) -> bool {
@@ -304,5 +426,35 @@ mod tests {
             request.verify(&attacker.verifying_key().to_bytes(), 100, 120),
             Err(CryptoError::InvalidSessionSignature)
         );
+    }
+
+    #[test]
+    fn epoch_hint_is_controller_pinned_short_lived_and_tamper_evident() {
+        let controller = SigningKey::from_bytes(&[52; 32]);
+        let other_controller = SigningKey::from_bytes(&[53; 32]);
+        let hint = AuthorizationEpochHint::sign(
+            NetworkId(Uuid::from_u128(54)),
+            8,
+            3,
+            100,
+            120,
+            &controller,
+        )
+        .unwrap();
+        assert_eq!(
+            hint.verify_from_controller(&controller.verifying_key().to_bytes(), 110),
+            Ok(())
+        );
+        assert!(hint
+            .verify_from_controller(&other_controller.verifying_key().to_bytes(), 110)
+            .is_err());
+        assert!(hint
+            .verify_from_controller(&controller.verifying_key().to_bytes(), 121)
+            .is_err());
+        let mut tampered = hint;
+        tampered.authorization_epoch = 9;
+        assert!(tampered
+            .verify_from_controller(&controller.verifying_key().to_bytes(), 110)
+            .is_err());
     }
 }

@@ -6,15 +6,19 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
+use ed25519_dalek::SigningKey;
 use meshlake_core::{
-    peer_identity_announcement, DeviceId, MembershipCertificate, NetworkId, RootRegistration,
+    load_or_create_service_identity, peer_identity_announcement, AuthorizationEpochHint, DeviceId,
+    MembershipCertificate, NetworkId, RootRegistration, SignedRelayRegistrationAck,
     RELAY_CANDIDATE, RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC, RELAY_PEER,
-    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
+    RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
     RELAY_SESSION_RESPONSE,
 };
 use std::{
     collections::HashMap,
+    env,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::UdpSocket;
@@ -29,6 +33,15 @@ struct Cli {
     /// Base64 Ed25519 controller public key distributed through a trusted channel.
     #[arg(long)]
     controller_public_key_base64: String,
+    /// Persistent Ed25519 Relay service identity. Generated on first start.
+    #[arg(long)]
+    identity_file: Option<PathBuf>,
+    /// Optional next identity used to dual-sign during a Planet V3 rotation window.
+    #[arg(long)]
+    transition_identity_file: Option<PathBuf>,
+    /// Print the public Relay identity document and exit.
+    #[arg(long)]
+    print_identity: bool,
 }
 
 type PeerKey = (NetworkId, DeviceId);
@@ -51,19 +64,50 @@ struct AuthenticatedRegistration {
     certificate: MembershipCertificate,
     nonce: [u8; 16],
     authorization_expires_at_unix_seconds: u64,
+    authorization_hint: Option<AuthorizationEpochHint>,
     candidates: Vec<SocketAddr>,
+}
+
+struct RelayIdentity {
+    relay_id: Uuid,
+    current: SigningKey,
+    next: Option<SigningKey>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let trusted_key = decode_controller_key(&cli.controller_public_key_base64)?;
+    let identity_path = cli.identity_file.unwrap_or_else(default_identity_path);
+    let current = load_or_create_service_identity(&identity_path, None)?;
+    let next = cli
+        .transition_identity_file
+        .as_deref()
+        .map(|path| load_or_create_service_identity(path, Some(current.service_id)))
+        .transpose()?;
+    let identity = RelayIdentity {
+        relay_id: current.service_id,
+        current: current.signing_key,
+        next: next.map(|identity| identity.signing_key),
+    };
+    if cli.print_identity {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "relay_id": identity.relay_id,
+                "current_public_key_base64": STANDARD.encode(identity.current.verifying_key().to_bytes()),
+                "next_public_key_base64": identity.next.as_ref().map(|key| STANDARD.encode(key.verifying_key().to_bytes())),
+            }))?
+        );
+        return Ok(());
+    }
     let socket = UdpSocket::bind(cli.bind).await?;
     println!("MeshLake relay listening on udp://{}", cli.bind);
     println!("The relay forwards encrypted payloads only.");
 
     let mut peers: HashMap<PeerKey, PeerRecord> = HashMap::new();
-    let mut seen_nonces = HashMap::<[u8; 16], Instant>::new();
+    let mut seen_nonces = HashMap::<(NetworkId, DeviceId, [u8; 16]), Instant>::new();
+    let mut authorization_hints = HashMap::<NetworkId, AuthorizationEpochHint>::new();
     let mut buffer = vec![0_u8; u16::MAX as usize];
     loop {
         let (length, remote) = socket.recv_from(&mut buffer).await?;
@@ -79,8 +123,10 @@ async fn main() -> Result<()> {
         handle_packet(
             &socket,
             &trusted_key,
+            &identity,
             &mut peers,
             &mut seen_nonces,
+            &mut authorization_hints,
             remote,
             packet,
         )
@@ -91,8 +137,10 @@ async fn main() -> Result<()> {
 async fn handle_packet(
     socket: &UdpSocket,
     trusted_key: &Vec<u8>,
+    identity: &RelayIdentity,
     peers: &mut HashMap<PeerKey, PeerRecord>,
-    seen_nonces: &mut HashMap<[u8; 16], Instant>,
+    seen_nonces: &mut HashMap<(NetworkId, DeviceId, [u8; 16]), Instant>,
+    authorization_hints: &mut HashMap<NetworkId, AuthorizationEpochHint>,
     remote: SocketAddr,
     packet: &[u8],
 ) -> Result<()> {
@@ -104,10 +152,14 @@ async fn handle_packet(
                     certificate,
                     nonce,
                     authorization_expires_at_unix_seconds,
+                    authorization_hint,
                     candidates: advertised_candidates,
                 } = registration;
                 seen_nonces.retain(|_, seen| seen.elapsed() <= REGISTRATION_NONCE_TTL);
-                if seen_nonces.insert(nonce, Instant::now()).is_some() {
+                if seen_nonces
+                    .insert((key.0, key.1, nonce), Instant::now())
+                    .is_some()
+                {
                     trace_transport(format!(
                         "rejected replayed registration for member {}",
                         key.1 .0
@@ -146,9 +198,35 @@ async fn handle_packet(
                         last_seen: Instant::now(),
                     },
                 );
-                socket
-                    .send_to(&registration_ack(key, nonce), remote)
-                    .await?;
+                if let Some(hint) = authorization_hint {
+                    let replace = authorization_hints.get(&key.0).is_none_or(|current| {
+                        hint.authorization_epoch > current.authorization_epoch
+                    });
+                    if replace {
+                        authorization_hints.insert(key.0, hint);
+                    }
+                }
+                let issued_at = now();
+                let signing_keys = identity
+                    .next
+                    .as_ref()
+                    .map(|next| vec![&identity.current, next])
+                    .unwrap_or_else(|| vec![&identity.current]);
+                let acknowledgement = SignedRelayRegistrationAck::sign(
+                    key.0,
+                    key.1,
+                    identity.relay_id,
+                    nonce,
+                    remote,
+                    issued_at,
+                    issued_at + 15,
+                    authorization_hints.get(&key.0).cloned(),
+                    &signing_keys,
+                )?;
+                let mut acknowledgement_packet = Vec::from(RELAY_MAGIC);
+                acknowledgement_packet.push(RELAY_REGISTER_ACK_SIGNED);
+                acknowledgement_packet.extend_from_slice(&serde_json::to_vec(&acknowledgement)?);
+                socket.send_to(&acknowledgement_packet, remote).await?;
                 trace_transport(format!(
                     "registered member {} for network {} from {remote}",
                     key.1 .0, key.0 .0
@@ -189,16 +267,6 @@ async fn handle_packet(
         _ => {}
     }
     Ok(())
-}
-
-fn registration_ack(peer: PeerKey, nonce: [u8; 16]) -> [u8; 53] {
-    let mut packet = [0_u8; 53];
-    packet[..4].copy_from_slice(&RELAY_MAGIC);
-    packet[4] = RELAY_REGISTER_ACK;
-    packet[5..21].copy_from_slice((peer.0).0.as_bytes());
-    packet[21..37].copy_from_slice((peer.1).0.as_bytes());
-    packet[37..53].copy_from_slice(&nonce);
-    packet
 }
 
 /// Emits routing metadata only when `MESHLAKE_TRACE` is set.  The relay never
@@ -375,6 +443,12 @@ fn parse_signed_registration(
         .iter()
         .find(|authorization| authorization.network_id == certificate.claims.network_id)?
         .expires_at_unix_seconds;
+    let authorization_hint = registration
+        .payload
+        .authorization_manifests
+        .iter()
+        .find(|authorization| authorization.network_id == certificate.claims.network_id)
+        .and_then(|authorization| authorization.epoch_hint.clone());
     let key = (certificate.claims.network_id, certificate.claims.device_id);
     (certificate.claims.device_id == registration.payload.device_id).then_some(
         AuthenticatedRegistration {
@@ -382,6 +456,7 @@ fn parse_signed_registration(
             certificate,
             nonce,
             authorization_expires_at_unix_seconds,
+            authorization_hint,
             candidates,
         },
     )
@@ -404,6 +479,29 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn default_identity_path() -> PathBuf {
+    if let Some(directory) = env::var_os("MESHLAKE_STATE_DIR") {
+        return PathBuf::from(directory).join("relay-identity.json");
+    }
+    if let Some(directory) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(directory)
+            .join("MeshLake")
+            .join("relay-identity.json");
+    }
+    if let Some(directory) = env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(directory)
+            .join("meshlake")
+            .join("relay-identity.json");
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().expect("current directory unavailable"))
+        .join(".local")
+        .join("state")
+        .join("meshlake")
+        .join("relay-identity.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +511,35 @@ mod tests {
         AuthorizedMembership, InitiatorHandshake, MembershipClaims, NetworkAuthorizationManifest,
         NetworkKey, ReplayWindow,
     };
+
+    fn test_relay_identity() -> RelayIdentity {
+        RelayIdentity {
+            relay_id: Uuid::from_u128(0xfeed),
+            current: SigningKey::from_bytes(&[90; 32]),
+            next: None,
+        }
+    }
+
+    async fn handle_packet(
+        socket: &UdpSocket,
+        trusted_key: &Vec<u8>,
+        peers: &mut HashMap<PeerKey, PeerRecord>,
+        seen_nonces: &mut HashMap<(NetworkId, DeviceId, [u8; 16]), Instant>,
+        remote: SocketAddr,
+        packet: &[u8],
+    ) -> Result<()> {
+        super::handle_packet(
+            socket,
+            trusted_key,
+            &test_relay_identity(),
+            peers,
+            seen_nonces,
+            &mut HashMap::new(),
+            remote,
+            packet,
+        )
+        .await
+    }
 
     fn test_certificate(
         controller: &SigningKey,
@@ -639,17 +766,36 @@ mod tests {
     }
 
     #[test]
-    fn registration_ack_echoes_verified_peer_identity_and_signed_nonce() {
+    fn registration_ack_binds_identity_transaction_endpoint_and_time() {
         let peer = (
             NetworkId(Uuid::from_u128(41)),
             DeviceId(Uuid::from_u128(42)),
         );
         let nonce = [43_u8; 16];
-        let packet = registration_ack(peer, nonce);
-        assert_eq!(&packet[..5], b"MLR1\x06");
-        assert_eq!(Uuid::from_slice(&packet[5..21]).unwrap(), peer.0 .0);
-        assert_eq!(Uuid::from_slice(&packet[21..37]).unwrap(), peer.1 .0);
-        assert_eq!(packet[37..53], nonce);
+        let identity = test_relay_identity();
+        let policy = meshlake_core::ServiceIdentityPolicy::stable(
+            identity.relay_id,
+            identity.current.verifying_key().to_bytes().to_vec(),
+        );
+        let acknowledgement = SignedRelayRegistrationAck::sign(
+            peer.0,
+            peer.1,
+            identity.relay_id,
+            nonce,
+            "198.51.100.42:41000".parse().unwrap(),
+            100,
+            115,
+            None,
+            &[&identity.current],
+        )
+        .unwrap();
+        assert_eq!(
+            acknowledgement.verify(&policy, peer.0, peer.1, nonce, 105, 5),
+            Ok(())
+        );
+        assert!(acknowledgement
+            .verify(&policy, peer.0, peer.1, [44; 16], 105, 5)
+            .is_err());
     }
 
     #[test]
@@ -882,7 +1028,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(receive_datagram(&client_one).await[4], RELAY_REGISTER_ACK);
+        assert_eq!(
+            receive_datagram(&client_one).await[4],
+            RELAY_REGISTER_ACK_SIGNED
+        );
 
         let second_certificate = test_certificate(
             &controller,
@@ -901,7 +1050,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(receive_datagram(&client_two).await[4], RELAY_REGISTER_ACK);
+        assert_eq!(
+            receive_datagram(&client_two).await[4],
+            RELAY_REGISTER_ACK_SIGNED
+        );
 
         for client in [&client_one, &client_two] {
             let mut unexpected = [0_u8; 64];
@@ -951,8 +1103,10 @@ mod tests {
         .await
         .unwrap();
         let acknowledgement = receive_datagram(&client_one).await;
-        assert_eq!(acknowledgement[4], RELAY_REGISTER_ACK);
-        assert_eq!(acknowledgement[37..53], registration_nonce);
+        assert_eq!(acknowledgement[4], RELAY_REGISTER_ACK_SIGNED);
+        let signed_ack: SignedRelayRegistrationAck =
+            serde_json::from_slice(&acknowledgement[5..]).unwrap();
+        assert_eq!(signed_ack.payload.request_nonce, registration_nonce);
 
         handle_packet(
             &relay_socket,
@@ -986,7 +1140,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(receive_datagram(&client_two).await[4], RELAY_REGISTER_ACK);
+        assert_eq!(
+            receive_datagram(&client_two).await[4],
+            RELAY_REGISTER_ACK_SIGNED
+        );
         let one_messages = [
             receive_datagram(&client_one).await,
             receive_datagram(&client_one).await,

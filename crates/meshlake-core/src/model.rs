@@ -63,6 +63,9 @@ pub struct NetworkControlPlane {
     /// URL from which the currently verified Planet manifest was obtained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planet_manifest_url: Option<String>,
+    /// Verified Planet wire version. V3 explicitly requires signed Relay acknowledgements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planet_manifest_version: Option<u8>,
     /// Roots copied from a verified Planet manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_roots: Vec<crate::crypto::PlanetRoot>,
@@ -87,6 +90,7 @@ impl NetworkControlPlane {
             && self.pinned_controller_public_key.is_empty()
             && self.controller_tls_ca_pem.is_none()
             && self.planet_manifest_url.is_none()
+            && self.planet_manifest_version.is_none()
             && self.verified_roots.is_empty()
             && self.verified_relays.is_empty()
             && self.verified_stun_servers.is_empty()
@@ -149,6 +153,14 @@ pub struct TransportStatus {
     pub responsive_roots: Vec<SocketAddr>,
     pub configured_relays: Vec<SocketAddr>,
     pub healthy_relays: Vec<SocketAddr>,
+    #[serde(default)]
+    pub relay_confirmations_accepted: u64,
+    #[serde(default)]
+    pub relay_confirmations_rejected: u64,
+    #[serde(default)]
+    pub authorization_hint_refreshes: u64,
+    #[serde(default)]
+    pub registration_backoff_seconds: u64,
     #[serde(default)]
     pub peer_paths: Vec<PeerPathStatus>,
 }
@@ -314,14 +326,17 @@ mod tests {
                     "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n".into(),
                 ),
                 planet_manifest_url: Some("https://planet.example/manifest.json".into()),
+                planet_manifest_version: Some(3),
                 verified_roots: vec![PlanetRoot {
                     public_key: vec![8; 32],
                     endpoints: vec!["203.0.113.1:51819".parse().unwrap()],
                     priority: 10,
+                    identity: None,
                 }],
                 verified_relays: vec![PlanetRelay {
                     endpoint: "203.0.113.2:51820".parse().unwrap(),
                     priority: 20,
+                    identity: None,
                 }],
                 verified_stun_servers: vec!["stun.example:3478".into()],
                 authorization_manifest: Some(NetworkAuthorizationManifest {
@@ -335,6 +350,7 @@ mod tests {
                     expires_at_unix_seconds: 200,
                     controller_public_key: vec![7; 32],
                     signature: vec![6; 64],
+                    epoch_hint: None,
                 }),
                 policy_manifest: None,
             },

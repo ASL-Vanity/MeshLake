@@ -3,13 +3,18 @@
 //! Roots learn public endpoints and controller-authorized network membership,
 //! but never receive a virtual network's traffic key.
 
-use crate::{DeviceId, MembershipCertificate, NetworkAuthorizationManifest, NetworkId};
+use crate::{
+    AuthorizationEpochHint, DeviceId, MembershipCertificate, NetworkAuthorizationManifest,
+    NetworkId, ServiceIdentityError, ServiceIdentityPolicy, ServiceSignature,
+};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const ROOT_PROTOCOL_VERSION: u8 = 1;
+const ROOT_IDENTITY_RESPONSE_DOMAIN: &[u8] = b"MeshLake root identity response v2\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootRegistrationPayload {
@@ -49,6 +54,8 @@ pub enum RootResponse {
         observed_endpoint: SocketAddr,
         peers: Vec<RootPeer>,
         refresh_after_seconds: u32,
+        #[serde(default)]
+        authorization_hints: Vec<AuthorizationEpochHint>,
     },
     Error {
         message: String,
@@ -63,6 +70,14 @@ struct RootResponsePayload<'a> {
     response: &'a RootResponse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RootIdentityResponsePayload<'a> {
+    version: u8,
+    root_id: Uuid,
+    request_nonce: [u8; 16],
+    response: &'a RootResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedRootResponse {
     pub version: u8,
@@ -70,6 +85,10 @@ pub struct SignedRootResponse {
     pub request_nonce: [u8; 16],
     pub response: RootResponse,
     pub signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_signatures: Vec<ServiceSignature>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,6 +113,8 @@ pub enum RootProtocolError {
     RevokedMembership,
     #[error("root protocol message cannot be encoded")]
     EncodingFailed,
+    #[error(transparent)]
+    InvalidServiceIdentity(#[from] ServiceIdentityError),
 }
 
 impl RootRegistration {
@@ -267,6 +288,54 @@ impl SignedRootResponse {
             request_nonce,
             response,
             signature: signing_key.sign(&bytes).to_bytes().to_vec(),
+            root_id: None,
+            identity_signatures: Vec::new(),
+        })
+    }
+
+    pub fn sign_with_identity(
+        request_nonce: [u8; 16],
+        response: RootResponse,
+        root_id: Uuid,
+        signing_keys: &[&SigningKey],
+    ) -> Result<Self, RootProtocolError> {
+        let current = signing_keys
+            .first()
+            .ok_or(RootProtocolError::InvalidIdentityKey)?;
+        let root_public_key = current.verifying_key().to_bytes().to_vec();
+        let legacy_payload = RootResponsePayload {
+            version: ROOT_PROTOCOL_VERSION,
+            root_public_key: &root_public_key,
+            request_nonce,
+            response: &response,
+        };
+        let legacy_bytes =
+            serde_json::to_vec(&legacy_payload).map_err(|_| RootProtocolError::EncodingFailed)?;
+        let identity_payload = RootIdentityResponsePayload {
+            version: ROOT_PROTOCOL_VERSION,
+            root_id,
+            request_nonce,
+            response: &response,
+        };
+        let mut identity_message = Vec::from(ROOT_IDENTITY_RESPONSE_DOMAIN);
+        identity_message.extend_from_slice(
+            &serde_json::to_vec(&identity_payload)
+                .map_err(|_| RootProtocolError::EncodingFailed)?,
+        );
+        Ok(Self {
+            version: ROOT_PROTOCOL_VERSION,
+            root_public_key,
+            request_nonce,
+            response,
+            signature: current.sign(&legacy_bytes).to_bytes().to_vec(),
+            root_id: Some(root_id),
+            identity_signatures: signing_keys
+                .iter()
+                .map(|key| ServiceSignature {
+                    public_key: key.verifying_key().to_bytes().to_vec(),
+                    signature: key.sign(&identity_message).to_bytes().to_vec(),
+                })
+                .collect(),
         })
     }
 
@@ -296,6 +365,31 @@ impl SignedRootResponse {
             .map_err(|_| RootProtocolError::InvalidIdentityKey)?
             .verify(&bytes, &ed25519_dalek::Signature::from_bytes(&signature))
             .map_err(|_| RootProtocolError::InvalidSignature)
+    }
+
+    pub fn verify_identity(
+        &self,
+        identity: &ServiceIdentityPolicy,
+        now_unix_seconds: u64,
+    ) -> Result<(), RootProtocolError> {
+        if self.version != ROOT_PROTOCOL_VERSION
+            || self.root_id != Some(identity.service_id)
+            || self.root_public_key != identity.current_public_key
+        {
+            return Err(RootProtocolError::InvalidIdentityKey);
+        }
+        let payload = RootIdentityResponsePayload {
+            version: self.version,
+            root_id: identity.service_id,
+            request_nonce: self.request_nonce,
+            response: &self.response,
+        };
+        let mut message = Vec::from(ROOT_IDENTITY_RESPONSE_DOMAIN);
+        message.extend_from_slice(
+            &serde_json::to_vec(&payload).map_err(|_| RootProtocolError::EncodingFailed)?,
+        );
+        identity.verify_signatures(&message, &self.identity_signatures, now_unix_seconds)?;
+        Ok(())
     }
 }
 
@@ -469,5 +563,40 @@ mod tests {
         .unwrap();
         assert_eq!(response.verify(&root.verifying_key().to_bytes()), Ok(()));
         assert!(response.verify(&[9_u8; 32]).is_err());
+    }
+
+    #[test]
+    fn root_identity_rotation_requires_dual_signatures_and_revokes_old_keys() {
+        let current = SigningKey::from_bytes(&[21; 32]);
+        let next = SigningKey::from_bytes(&[22; 32]);
+        let root_id = Uuid::from_u128(23);
+        let response = SignedRootResponse::sign_with_identity(
+            [24; 16],
+            RootResponse::Error {
+                message: "bounded".into(),
+            },
+            root_id,
+            &[&current, &next],
+        )
+        .unwrap();
+        let transition = ServiceIdentityPolicy {
+            service_id: root_id,
+            current_public_key: current.verifying_key().to_bytes().to_vec(),
+            next_public_key: Some(next.verifying_key().to_bytes().to_vec()),
+            transition_not_before_unix_seconds: Some(100),
+            transition_not_after_unix_seconds: Some(200),
+            revoked_public_keys: Vec::new(),
+        };
+        assert_eq!(response.verify_identity(&transition, 150), Ok(()));
+
+        let revoked = ServiceIdentityPolicy {
+            service_id: root_id,
+            current_public_key: next.verifying_key().to_bytes().to_vec(),
+            next_public_key: None,
+            transition_not_before_unix_seconds: None,
+            transition_not_after_unix_seconds: None,
+            revoked_public_keys: vec![current.verifying_key().to_bytes().to_vec()],
+        };
+        assert!(response.verify_identity(&revoked, 210).is_err());
     }
 }

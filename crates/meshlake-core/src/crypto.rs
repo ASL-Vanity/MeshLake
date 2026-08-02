@@ -3,7 +3,7 @@
 //! A relay sees the outer routing header but receives only `SealedPacket::ciphertext`.
 //! Network keys must come from the controller enrollment flow and must never be logged.
 
-use crate::{DeviceId, NetworkId, VirtualNetwork};
+use crate::{DeviceId, NetworkId, ServiceIdentityPolicy, VirtualNetwork};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
@@ -127,6 +127,8 @@ pub enum CryptoError {
     UntrustedController,
     #[error("membership certificate cannot be encoded")]
     CertificateEncodingFailed,
+    #[error("Planet service identity policy is invalid or expired")]
+    InvalidServiceIdentity,
 }
 
 /// Controller-signed authorization for a device to participate in one virtual network.
@@ -185,6 +187,8 @@ pub struct PlanetRoot {
     pub endpoints: Vec<SocketAddr>,
     #[serde(default)]
     pub priority: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ServiceIdentityPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +196,8 @@ pub struct PlanetRelay {
     pub endpoint: SocketAddr,
     #[serde(default)]
     pub priority: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ServiceIdentityPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +231,19 @@ struct PlanetManifestPayload<'a> {
 
 #[derive(Serialize)]
 struct PlanetManifestV2Payload<'a> {
+    version: u8,
+    controller_url: &'a str,
+    relay_endpoint: SocketAddr,
+    roots: &'a [PlanetRoot],
+    relays: &'a [PlanetRelay],
+    stun_servers: &'a [String],
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: Option<u64>,
+    controller_public_key: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct PlanetManifestV3Payload<'a> {
     version: u8,
     controller_url: &'a str,
     relay_endpoint: SocketAddr,
@@ -314,6 +333,72 @@ impl PlanetManifest {
         })
     }
 
+    pub fn sign_v3(
+        controller_url: String,
+        mut roots: Vec<PlanetRoot>,
+        mut relays: Vec<PlanetRelay>,
+        stun_servers: Vec<String>,
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: Option<u64>,
+        signing_key: &SigningKey,
+    ) -> Result<Self, CryptoError> {
+        roots.sort_by_key(|root| root.priority);
+        relays.sort_by_key(|relay| relay.priority);
+        if roots.iter().any(|root| root.identity.is_none())
+            || relays.is_empty()
+            || relays.iter().any(|relay| relay.identity.is_none())
+        {
+            return Err(CryptoError::InvalidServiceIdentity);
+        }
+        for root in &roots {
+            let identity = root
+                .identity
+                .as_ref()
+                .ok_or(CryptoError::InvalidServiceIdentity)?;
+            identity
+                .required_public_keys(issued_at_unix_seconds)
+                .map_err(|_| CryptoError::InvalidServiceIdentity)?;
+            if root.public_key != identity.current_public_key {
+                return Err(CryptoError::InvalidServiceIdentity);
+            }
+        }
+        for relay in &relays {
+            relay
+                .identity
+                .as_ref()
+                .ok_or(CryptoError::InvalidServiceIdentity)?
+                .required_public_keys(issued_at_unix_seconds)
+                .map_err(|_| CryptoError::InvalidServiceIdentity)?;
+        }
+        let relay_endpoint = relays[0].endpoint;
+        let controller_public_key = signing_key.verifying_key().to_bytes().to_vec();
+        let payload = PlanetManifestV3Payload {
+            version: 3,
+            controller_url: &controller_url,
+            relay_endpoint,
+            roots: &roots,
+            relays: &relays,
+            stun_servers: &stun_servers,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            controller_public_key: &controller_public_key,
+        };
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|_| CryptoError::CertificateEncodingFailed)?;
+        Ok(Self {
+            version: 3,
+            controller_url,
+            relay_endpoint,
+            roots,
+            relays,
+            stun_servers,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            controller_public_key,
+            signature: signing_key.sign(&bytes).to_bytes().to_vec(),
+        })
+    }
+
     /// Validates both the signature and the out-of-band pinned controller key.
     /// A manifest downloaded from an arbitrary web server is never trusted just
     /// because it is self-consistent.
@@ -322,7 +407,7 @@ impl PlanetManifest {
         trusted_controller_public_key: &[u8],
         now_unix_seconds: u64,
     ) -> Result<(), CryptoError> {
-        if !matches!(self.version, 1 | 2)
+        if !matches!(self.version, 1 | 2 | 3)
             || self.controller_public_key != trusted_controller_public_key
         {
             return Err(CryptoError::UntrustedController);
@@ -343,6 +428,40 @@ impl PlanetManifest {
             .as_slice()
             .try_into()
             .map_err(|_| CryptoError::InvalidCertificate)?;
+        if self.version < 3
+            && (self.roots.iter().any(|root| root.identity.is_some())
+                || self.relays.iter().any(|relay| relay.identity.is_some()))
+        {
+            return Err(CryptoError::InvalidServiceIdentity);
+        }
+        if self.version == 3 {
+            if self.roots.iter().any(|root| root.identity.is_none())
+                || self.relays.is_empty()
+                || self.relays.iter().any(|relay| relay.identity.is_none())
+            {
+                return Err(CryptoError::InvalidServiceIdentity);
+            }
+            for root in &self.roots {
+                let identity = root
+                    .identity
+                    .as_ref()
+                    .ok_or(CryptoError::InvalidServiceIdentity)?;
+                identity
+                    .required_public_keys(now_unix_seconds)
+                    .map_err(|_| CryptoError::InvalidServiceIdentity)?;
+                if root.public_key != identity.current_public_key {
+                    return Err(CryptoError::InvalidServiceIdentity);
+                }
+            }
+            for relay in &self.relays {
+                relay
+                    .identity
+                    .as_ref()
+                    .ok_or(CryptoError::InvalidServiceIdentity)?
+                    .required_public_keys(now_unix_seconds)
+                    .map_err(|_| CryptoError::InvalidServiceIdentity)?;
+            }
+        }
         let bytes = if self.version == 1 {
             serde_json::to_vec(&PlanetManifestPayload {
                 version: self.version,
@@ -353,8 +472,20 @@ impl PlanetManifest {
                 expires_at_unix_seconds: self.expires_at_unix_seconds,
                 controller_public_key: &self.controller_public_key,
             })
-        } else {
+        } else if self.version == 2 {
             serde_json::to_vec(&PlanetManifestV2Payload {
+                version: self.version,
+                controller_url: &self.controller_url,
+                relay_endpoint: self.relay_endpoint,
+                roots: &self.roots,
+                relays: &self.relays,
+                stun_servers: &self.stun_servers,
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                expires_at_unix_seconds: self.expires_at_unix_seconds,
+                controller_public_key: &self.controller_public_key,
+            })
+        } else {
+            serde_json::to_vec(&PlanetManifestV3Payload {
                 version: self.version,
                 controller_url: &self.controller_url,
                 relay_endpoint: self.relay_endpoint,
@@ -546,10 +677,12 @@ mod tests {
                 public_key: vec![7; 32],
                 endpoints: vec!["203.0.113.5:51819".parse().unwrap()],
                 priority: 0,
+                identity: None,
             }],
             vec![PlanetRelay {
                 endpoint: "203.0.113.6:51820".parse().unwrap(),
                 priority: 0,
+                identity: None,
             }],
             vec!["stun.example:3478".into()],
             20,
@@ -562,6 +695,49 @@ mod tests {
         assert_eq!(
             manifest.verify_from_controller(&signing_key.verifying_key().to_bytes(), 30),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn planet_v3_requires_explicit_service_identities() {
+        let controller = SigningKey::from_bytes(&[5; 32]);
+        let root = SigningKey::from_bytes(&[6; 32]);
+        let relay = SigningKey::from_bytes(&[7; 32]);
+        let manifest = PlanetManifest::sign_v3(
+            "https://planet.example".into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec!["203.0.113.7:51819".parse().unwrap()],
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    uuid::Uuid::from_u128(8),
+                    root.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![PlanetRelay {
+                endpoint: "203.0.113.8:51820".parse().unwrap(),
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    uuid::Uuid::from_u128(9),
+                    relay.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![],
+            100,
+            Some(200),
+            &controller,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Ok(())
+        );
+
+        let mut downgraded = manifest;
+        downgraded.version = 2;
+        assert_eq!(
+            downgraded.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Err(CryptoError::InvalidServiceIdentity)
         );
     }
 }

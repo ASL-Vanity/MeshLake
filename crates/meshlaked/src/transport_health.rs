@@ -7,6 +7,29 @@ use std::{
 
 const RELAY_ACKNOWLEDGEMENT_TTL: Duration = Duration::from_secs(45);
 const ROOT_RESPONSE_TTL: Duration = Duration::from_secs(90);
+const REGISTRATION_BASE_DELAY: Duration = Duration::from_secs(20);
+const REGISTRATION_MAX_DELAY: Duration = Duration::from_secs(120);
+
+/// Exponential retry with deterministic 0-25% jitter. The stable per-device
+/// seed spreads a recovering fleet without relying on test-host randomness.
+pub(crate) fn registration_retry_delay(seed: &[u8], consecutive_failures: u8) -> Duration {
+    let exponent = consecutive_failures.min(3) as u32;
+    let base_seconds = REGISTRATION_BASE_DELAY
+        .as_secs()
+        .saturating_mul(1_u64 << exponent)
+        .min(REGISTRATION_MAX_DELAY.as_secs());
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ consecutive_failures as u64;
+    for byte in seed {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let jitter_limit = (base_seconds / 4).max(1);
+    Duration::from_secs(
+        base_seconds
+            .saturating_add(hash % (jitter_limit + 1))
+            .min(REGISTRATION_MAX_DELAY.as_secs()),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NetworkEndpoint {
@@ -130,12 +153,17 @@ pub(crate) fn select_relay_endpoint(
     configured: &[SocketAddr],
     health: &EndpointHealthTable,
     now: Instant,
+    require_authenticated_health: bool,
 ) -> Option<SocketAddr> {
-    configured
+    let healthy = configured
         .iter()
         .copied()
-        .find(|endpoint| health.relay_is_healthy(network_id, *endpoint, now))
-        .or_else(|| configured.first().copied())
+        .find(|endpoint| health.relay_is_healthy(network_id, *endpoint, now));
+    healthy.or_else(|| {
+        (!require_authenticated_health)
+            .then(|| configured.first().copied())
+            .flatten()
+    })
 }
 
 #[cfg(test)]
@@ -161,7 +189,13 @@ mod tests {
         assert!(health.relay_is_healthy(first_network, shared, now));
         assert!(!health.relay_is_healthy(second_network, shared, now));
         assert_eq!(
-            select_relay_endpoint(second_network, &[second_primary, shared], &health, now),
+            select_relay_endpoint(
+                second_network,
+                &[second_primary, shared],
+                &health,
+                now,
+                false,
+            ),
             Some(second_primary)
         );
     }
@@ -177,7 +211,7 @@ mod tests {
         health.mark_relay_acknowledged(network, primary, now);
 
         assert_eq!(
-            select_relay_endpoint(network, &[primary, secondary], &health, now),
+            select_relay_endpoint(network, &[primary, secondary], &health, now, false),
             Some(primary)
         );
     }
@@ -194,7 +228,7 @@ mod tests {
         health.mark_relay_acknowledged(network, secondary, now);
 
         assert_eq!(
-            select_relay_endpoint(network, &[primary, secondary], &health, now),
+            select_relay_endpoint(network, &[primary, secondary], &health, now, false),
             Some(secondary)
         );
     }
@@ -209,15 +243,19 @@ mod tests {
         let mut health = EndpointHealthTable::default();
 
         assert_eq!(
-            select_relay_endpoint(network, &[primary, secondary], &health, started),
+            select_relay_endpoint(network, &[primary, secondary], &health, started, false),
             Some(primary)
         );
 
         health.mark_relay_acknowledged(network, secondary, started);
         health.mark_relay_acknowledged(network, primary, started);
         assert_eq!(
-            select_relay_endpoint(network, &[primary, secondary], &health, later),
+            select_relay_endpoint(network, &[primary, secondary], &health, later, false),
             Some(primary)
+        );
+        assert_eq!(
+            select_relay_endpoint(network, &[primary, secondary], &health, later, true),
+            None
         );
     }
 
@@ -268,6 +306,24 @@ mod tests {
         assert_eq!(
             health.responsive_root_endpoints(&root_requirements, now),
             vec![root]
+        );
+    }
+
+    #[test]
+    fn registration_backoff_is_deterministic_bounded_and_resets() {
+        let first = registration_retry_delay(b"device-a", 2);
+        assert_eq!(first, registration_retry_delay(b"device-a", 2));
+        assert!(first >= Duration::from_secs(80));
+        assert!(first <= REGISTRATION_MAX_DELAY);
+        assert!(registration_retry_delay(b"device-a", 20) <= REGISTRATION_MAX_DELAY);
+        assert!(registration_retry_delay(b"device-a", 0) < first);
+    }
+
+    #[test]
+    fn registration_jitter_spreads_distinct_devices() {
+        assert_ne!(
+            registration_retry_delay(b"device-a", 1),
+            registration_retry_delay(b"device-b", 1)
         );
     }
 }

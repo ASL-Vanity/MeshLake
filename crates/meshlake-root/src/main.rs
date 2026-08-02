@@ -8,8 +8,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
-    DeviceId, MembershipCertificate, NetworkId, RootPeer, RootRegistration, RootResponse,
-    SignedRootResponse,
+    AuthorizationEpochHint, DeviceId, MembershipCertificate, NetworkId, RootPeer, RootRegistration,
+    RootResponse, SignedRootResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::UdpSocket;
+use uuid::Uuid;
 
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const MAX_CERTIFICATES_PER_REGISTRATION: usize = 64;
@@ -43,6 +44,9 @@ struct Cli {
     /// Persistent Ed25519 root identity. Generated on first start.
     #[arg(long)]
     identity_file: Option<PathBuf>,
+    /// Optional next identity used to dual-sign during a Planet V3 rotation window.
+    #[arg(long)]
+    transition_identity_file: Option<PathBuf>,
     /// Trusted controller public key in Base64. Repeat for multiple controllers.
     #[arg(long = "controller-public-key-base64")]
     controller_public_keys_base64: Vec<String>,
@@ -58,6 +62,9 @@ struct Cli {
     /// Print the root public key and exit.
     #[arg(long)]
     print_public_key: bool,
+    /// Print the public Root service identity document and exit.
+    #[arg(long)]
+    print_identity: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -104,7 +111,14 @@ impl Default for RootConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedIdentity {
     schema_version: u32,
+    #[serde(default)]
+    service_id: Option<Uuid>,
     secret_key: Vec<u8>,
+}
+
+struct LoadedRootIdentity {
+    service_id: Uuid,
+    signing_key: SigningKey,
 }
 
 #[derive(Debug, Clone)]
@@ -154,10 +168,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let identity_path = config.identity_file.clone();
-    let signing_key = load_or_create_identity(&identity_path)?;
-    let root_public_key = STANDARD.encode(signing_key.verifying_key().to_bytes());
+    let current_identity = load_or_create_identity(&identity_path, None)?;
+    let transition_identity = cli
+        .transition_identity_file
+        .as_deref()
+        .map(|path| load_or_create_identity(path, Some(current_identity.service_id)))
+        .transpose()?;
+    let root_public_key = STANDARD.encode(current_identity.signing_key.verifying_key().to_bytes());
     if cli.print_public_key {
         println!("{root_public_key}");
+        return Ok(());
+    }
+    if cli.print_identity {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "root_id": current_identity.service_id,
+                "current_public_key_base64": root_public_key,
+                "next_public_key_base64": transition_identity.as_ref().map(|identity| STANDARD.encode(identity.signing_key.verifying_key().to_bytes())),
+            }))?
+        );
         return Ok(());
     }
     if config.controller_public_keys_base64.is_empty() {
@@ -175,6 +205,7 @@ async fn main() -> Result<()> {
     let maximum_clock_skew_seconds = config.maximum_clock_skew_seconds.clamp(30, 600);
     let mut peers = HashMap::<PeerKey, PeerRecord>::new();
     let mut seen_nonces = HashMap::<[u8; 16], Instant>::new();
+    let mut authorization_hints = HashMap::<NetworkId, AuthorizationEpochHint>::new();
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
     loop {
         let (size, remote) = socket.recv_from(&mut buffer).await?;
@@ -190,13 +221,23 @@ async fn main() -> Result<()> {
             peer_ttl,
             &mut peers,
             &mut seen_nonces,
+            &mut authorization_hints,
         ) {
             Ok(response) => response,
             Err(error) => RootResponse::Error {
                 message: error.to_string(),
             },
         };
-        let signed = SignedRootResponse::sign(nonce, response, &signing_key)?;
+        let signing_keys = transition_identity
+            .as_ref()
+            .map(|next| vec![&current_identity.signing_key, &next.signing_key])
+            .unwrap_or_else(|| vec![&current_identity.signing_key]);
+        let signed = SignedRootResponse::sign_with_identity(
+            nonce,
+            response,
+            current_identity.service_id,
+            &signing_keys,
+        )?;
         let encoded = serde_json::to_vec(&signed)?;
         if encoded.len() <= MAX_DATAGRAM_SIZE {
             socket.send_to(&encoded, remote).await?;
@@ -212,6 +253,7 @@ fn process_registration(
     peer_ttl: Duration,
     peers: &mut HashMap<PeerKey, PeerRecord>,
     seen_nonces: &mut HashMap<[u8; 16], Instant>,
+    authorization_hints: &mut HashMap<NetworkId, AuthorizationEpochHint>,
 ) -> Result<RootResponse> {
     if registration.payload.certificates.len() > MAX_CERTIFICATES_PER_REGISTRATION {
         bail!("registration contains too many memberships");
@@ -247,6 +289,16 @@ fn process_registration(
     candidates.truncate(MAX_CANDIDATES_PER_PEER);
 
     let mut memberships = HashMap::<NetworkId, (Vec<IpAddr>, MembershipCertificate, u64)>::new();
+    for authorization in &registration.payload.authorization_manifests {
+        if let Some(hint) = authorization.epoch_hint.clone() {
+            let replace = authorization_hints
+                .get(&hint.network_id)
+                .is_none_or(|current| hint.authorization_epoch > current.authorization_epoch);
+            if replace {
+                authorization_hints.insert(hint.network_id, hint);
+            }
+        }
+    }
     for certificate in &registration.payload.certificates {
         if certificate.claims.assigned_addresses.len() > MAX_ADDRESSES_PER_PEER {
             bail!("membership contains too many virtual addresses");
@@ -317,6 +369,10 @@ fn process_registration(
         .take(MAX_PEERS_PER_RESPONSE)
         .collect::<Vec<_>>();
     discovered.sort_by_key(|peer| (peer.network_id.0, peer.device_id.0));
+    let response_hints = memberships
+        .keys()
+        .filter_map(|network_id| authorization_hints.get(network_id).cloned())
+        .collect();
 
     for (network_id, (assigned_addresses, certificate, authorization_expires_at_unix_seconds)) in
         memberships
@@ -336,6 +392,7 @@ fn process_registration(
         observed_endpoint,
         peers: discovered,
         refresh_after_seconds: (peer_ttl.as_secs() / 3).clamp(10, 60) as u32,
+        authorization_hints: response_hints,
     })
 }
 
@@ -369,18 +426,36 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn load_or_create_identity(path: &Path) -> Result<SigningKey> {
+fn load_or_create_identity(
+    path: &Path,
+    expected_service_id: Option<Uuid>,
+) -> Result<LoadedRootIdentity> {
     if path.exists() {
-        let identity: PersistedIdentity = serde_json::from_slice(
+        let mut identity: PersistedIdentity = serde_json::from_slice(
             &fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
         )
         .with_context(|| format!("invalid root identity {}", path.display()))?;
+        let service_id = identity
+            .service_id
+            .unwrap_or_else(|| expected_service_id.unwrap_or_else(Uuid::new_v4));
+        if expected_service_id.is_some_and(|expected| expected != service_id) {
+            bail!("transition Root identity belongs to a different root ID");
+        }
+        if identity.service_id.is_none() {
+            identity.service_id = Some(service_id);
+            identity.schema_version = 2;
+            write_json(path, &identity)?;
+            restrict_identity_permissions(path)?;
+        }
         let bytes: [u8; 32] = identity
             .secret_key
             .as_slice()
             .try_into()
             .context("root identity secret key must contain exactly 32 bytes")?;
-        return Ok(SigningKey::from_bytes(&bytes));
+        return Ok(LoadedRootIdentity {
+            service_id,
+            signing_key: SigningKey::from_bytes(&bytes),
+        });
     }
     let mut secret_key = [0_u8; 32];
     getrandom::fill(&mut secret_key)
@@ -389,16 +464,20 @@ fn load_or_create_identity(path: &Path) -> Result<SigningKey> {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
-    fs::write(
+    let service_id = expected_service_id.unwrap_or_else(Uuid::new_v4);
+    write_json(
         path,
-        serde_json::to_vec_pretty(&PersistedIdentity {
-            schema_version: 1,
+        &PersistedIdentity {
+            schema_version: 2,
+            service_id: Some(service_id),
             secret_key: secret_key.to_vec(),
-        })?,
-    )
-    .with_context(|| format!("cannot write {}", path.display()))?;
+        },
+    )?;
     restrict_identity_permissions(path)?;
-    Ok(SigningKey::from_bytes(&secret_key))
+    Ok(LoadedRootIdentity {
+        service_id,
+        signing_key: SigningKey::from_bytes(&secret_key),
+    })
 }
 
 #[cfg(unix)]
@@ -704,6 +783,7 @@ mod tests {
             Duration::from_secs(90),
             &mut peers,
             &mut seen_nonces,
+            &mut HashMap::new(),
         )
         .unwrap();
         let RootResponse::Registered {
@@ -772,6 +852,7 @@ mod tests {
             Duration::from_secs(90),
             &mut peers,
             &mut seen_nonces,
+            &mut HashMap::new(),
         )
         .is_err());
     }
@@ -809,6 +890,7 @@ mod tests {
             Duration::from_secs(90),
             &mut peers,
             &mut seen_nonces,
+            &mut HashMap::new(),
         )
         .unwrap();
         assert!(process_registration(
@@ -819,6 +901,7 @@ mod tests {
             Duration::from_secs(90),
             &mut peers,
             &mut seen_nonces,
+            &mut HashMap::new(),
         )
         .is_err());
         assert_eq!(
@@ -843,6 +926,7 @@ mod tests {
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
+            &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
         )
