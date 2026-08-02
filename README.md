@@ -196,4 +196,6 @@ meshlake-cli network join `
 
 ## 下一步
 
-下一阶段将重点完成提权真实 Windows/Linux 主机上的双栈直连、直连转 Relay、Root/Relay 故障切换、吊销、daemon 重启、路由/DNS 回滚验收，并继续推进出口节点、Linux Secret Service/TPM 与移动客户端。阶段 2 的并行开发、主线审查和剩余风险记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。
+阶段 3 定为“生产化验收与运维安全”：先移除 argv/日志中的秘密输入风险，再把离线系统测试计划器扩展为带强制安全护栏的执行器，并加固 Root/Relay 身份与授权 epoch 收敛。只有用户明确授权后，才会连接指定的可丢弃 Windows/Linux 测试主机执行跨主机、故障注入和路由/DNS 回滚验收。完整任务拆分、合并顺序和完成标准见 [`docs/stage3-development-plan.md`](docs/stage3-development-plan.md)。
+
+出口节点、默认路由、自动 IP forwarding/NAT 和 TURN 数据面推迟到阶段 4；移动客户端和完整 GUI 产品化推迟到阶段 5。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。阶段 2 的合并记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。
