@@ -1,10 +1,13 @@
 //! Linux TUN adapter implementation used by the headless MeshLake agent.
 
 use anyhow::{anyhow, bail, Context, Result};
+use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::JoinedNetwork;
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{ErrorKind, Read, Write},
+    net::IpAddr,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::PathBuf,
     process::Command,
@@ -21,6 +24,27 @@ struct TunIfReq {
     name: [libc::c_char; libc::IFNAMSIZ],
     flags: libc::c_short,
     padding: [u8; 22],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlannedAddress {
+    address: IpAddr,
+    prefix_length: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressOperation {
+    Replace,
+    Delete,
+}
+
+impl AddressOperation {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Delete => "del",
+        }
+    }
 }
 
 pub struct AdapterController {
@@ -74,9 +98,8 @@ impl AdapterController {
                 std::io::Error::last_os_error()
             ));
         }
-        *guard = Some(file);
-        run_ip(&["link", "set", "dev", INTERFACE_NAME, "up"])?;
-        Ok(())
+        let command = interface_up_command();
+        publish_session_after_interface_up(&mut guard, file, || run_ip(&command))
     }
 
     pub fn deactivate(&self) {
@@ -123,26 +146,8 @@ impl AdapterController {
         if !self.is_active() {
             bail!("MeshLake adapter is not active");
         }
-        for joined in networks {
-            for address in &joined.assigned_addresses {
-                let prefix_length = match address {
-                    std::net::IpAddr::V4(_) => prefix_length(&joined.network.ipv4_prefix)?,
-                    std::net::IpAddr::V6(_) => joined
-                        .network
-                        .ipv6_prefix
-                        .as_deref()
-                        .map(prefix_length)
-                        .transpose()?
-                        .unwrap_or(128),
-                };
-                run_ip(&[
-                    "address",
-                    "replace",
-                    &format!("{address}/{prefix_length}"),
-                    "dev",
-                    INTERFACE_NAME,
-                ])?;
-            }
+        for command in address_commands(networks, AddressOperation::Replace)? {
+            run_ip(&command)?;
         }
         Ok(())
     }
@@ -151,37 +156,122 @@ impl AdapterController {
         if !self.is_active() {
             return Ok(());
         }
-        for address in &joined.assigned_addresses {
-            let prefix_length = match address {
-                std::net::IpAddr::V4(_) => prefix_length(&joined.network.ipv4_prefix)?,
-                std::net::IpAddr::V6(_) => joined
-                    .network
-                    .ipv6_prefix
-                    .as_deref()
-                    .map(prefix_length)
-                    .transpose()?
-                    .unwrap_or(128),
-            };
-            let _ = run_ip(&[
-                "address",
-                "del",
-                &format!("{address}/{prefix_length}"),
-                "dev",
-                INTERFACE_NAME,
-            ]);
+        for command in address_commands(std::slice::from_ref(joined), AddressOperation::Delete)? {
+            let _ = run_ip(&command);
         }
         Ok(())
     }
 }
 
-fn prefix_length(prefix: &str) -> Result<u8> {
-    prefix
-        .split_once('/')
-        .and_then(|(_, length)| length.parse::<u8>().ok())
-        .ok_or_else(|| anyhow!("invalid network prefix: {prefix}"))
+fn publish_session_after_interface_up<T>(
+    slot: &mut Option<T>,
+    session: T,
+    bring_interface_up: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    bring_interface_up()?;
+    *slot = Some(session);
+    Ok(())
 }
 
-fn run_ip(arguments: &[&str]) -> Result<()> {
+fn interface_up_command() -> Vec<String> {
+    ["link", "set", "dev", INTERFACE_NAME, "up"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn address_commands(
+    networks: &[JoinedNetwork],
+    operation: AddressOperation,
+) -> Result<Vec<Vec<String>>> {
+    Ok(planned_addresses(networks)?
+        .into_iter()
+        .map(|planned| {
+            vec![
+                "address".to_owned(),
+                operation.argument().to_owned(),
+                format!("{}/{}", planned.address, planned.prefix_length),
+                "dev".to_owned(),
+                INTERFACE_NAME.to_owned(),
+            ]
+        })
+        .collect())
+}
+
+fn planned_addresses(networks: &[JoinedNetwork]) -> Result<Vec<PlannedAddress>> {
+    let mut addresses = BTreeMap::<IpAddr, (meshlake_core::NetworkId, u8)>::new();
+    for joined in networks {
+        for address in &joined.assigned_addresses {
+            let prefix_length = assigned_prefix_length(joined, *address)?;
+            match addresses.get(address) {
+                Some((existing_network, _)) if *existing_network != joined.network.id => {
+                    bail!(
+                        "assigned address {address} belongs to both network {} and network {}; refusing cross-network address reuse",
+                        existing_network.0,
+                        joined.network.id.0
+                    );
+                }
+                Some((_, existing_prefix)) if *existing_prefix != prefix_length => {
+                    bail!(
+                        "assigned address {address} has conflicting prefix lengths {existing_prefix} and {prefix_length}"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    addresses.insert(*address, (joined.network.id, prefix_length));
+                }
+            }
+        }
+    }
+    Ok(addresses
+        .into_iter()
+        .map(|(address, (_, prefix_length))| PlannedAddress {
+            address,
+            prefix_length,
+        })
+        .collect())
+}
+
+fn assigned_prefix_length(joined: &JoinedNetwork, address: IpAddr) -> Result<u8> {
+    match address {
+        IpAddr::V4(address) => {
+            let prefix = joined
+                .network
+                .ipv4_prefix
+                .parse::<Ipv4Net>()
+                .with_context(|| {
+                    format!(
+                        "invalid IPv4 prefix for network {}: {}",
+                        joined.network.id.0, joined.network.ipv4_prefix
+                    )
+                })?;
+            if !prefix.contains(&address) {
+                bail!("assigned IPv4 address {address} is outside network prefix {prefix}");
+            }
+            Ok(prefix.prefix_len())
+        }
+        IpAddr::V6(address) => {
+            let raw_prefix = joined.network.ipv6_prefix.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "network {} assigns IPv6 address {address} without an IPv6 prefix",
+                    joined.network.id.0
+                )
+            })?;
+            let prefix = raw_prefix.parse::<Ipv6Net>().with_context(|| {
+                format!(
+                    "invalid IPv6 prefix for network {}: {raw_prefix}",
+                    joined.network.id.0
+                )
+            })?;
+            if !prefix.contains(&address) {
+                bail!("assigned IPv6 address {address} is outside network prefix {prefix}");
+            }
+            Ok(prefix.prefix_len())
+        }
+    }
+}
+
+fn run_ip(arguments: &[String]) -> Result<()> {
     let output = Command::new("ip")
         .args(arguments)
         .output()
@@ -205,11 +295,156 @@ pub fn default_wintun_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_length;
+    use super::*;
+    use meshlake_core::{NetworkControlPlane, NetworkId, RelayPolicy, VirtualNetwork};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use uuid::Uuid;
+
+    fn joined_network(
+        id: u128,
+        ipv4_prefix: &str,
+        ipv6_prefix: Option<&str>,
+        assigned_addresses: &[&str],
+    ) -> JoinedNetwork {
+        JoinedNetwork {
+            network: VirtualNetwork {
+                id: NetworkId(Uuid::from_u128(id)),
+                name: format!("network-{id}"),
+                ipv4_prefix: ipv4_prefix.to_owned(),
+                ipv6_prefix: ipv6_prefix.map(str::to_owned),
+                relay_policy: RelayPolicy::Preferred,
+            },
+            assigned_addresses: assigned_addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect(),
+            certificate: None,
+            network_key: Vec::new(),
+            control_plane: NetworkControlPlane::default(),
+        }
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
-    fn parses_linux_interface_prefixes() {
-        assert_eq!(prefix_length("100.64.0.0/24").unwrap(), 24);
-        assert_eq!(prefix_length("fd00::/64").unwrap(), 64);
+    fn activation_failure_does_not_publish_the_session() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut slot = None;
+        let result =
+            publish_session_after_interface_up(&mut slot, DropProbe(Arc::clone(&dropped)), || {
+                Err(anyhow!("simulated ip link failure"))
+            });
+        assert!(result.is_err());
+        assert!(slot.is_none());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn plans_deduplicated_dual_stack_addresses() {
+        let network = joined_network(
+            1,
+            "100.64.0.0/24",
+            Some("fd00::/64"),
+            &["100.64.0.1", "fd00::1", "100.64.0.1", "fd00::1"],
+        );
+        assert_eq!(
+            planned_addresses(&[network]).unwrap(),
+            vec![
+                PlannedAddress {
+                    address: "100.64.0.1".parse().unwrap(),
+                    prefix_length: 24,
+                },
+                PlannedAddress {
+                    address: "fd00::1".parse().unwrap(),
+                    prefix_length: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_replace_and_delete_commands() {
+        let network = joined_network(
+            2,
+            "100.64.2.0/24",
+            Some("fd00:2::/64"),
+            &["100.64.2.1", "fd00:2::1"],
+        );
+        assert_eq!(
+            address_commands(std::slice::from_ref(&network), AddressOperation::Replace).unwrap(),
+            vec![
+                vec!["address", "replace", "100.64.2.1/24", "dev", "meshlake0"],
+                vec!["address", "replace", "fd00:2::1/64", "dev", "meshlake0"],
+            ]
+        );
+        assert_eq!(
+            address_commands(&[network], AddressOperation::Delete).unwrap(),
+            vec![
+                vec!["address", "del", "100.64.2.1/24", "dev", "meshlake0"],
+                vec!["address", "del", "fd00:2::1/64", "dev", "meshlake0"],
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_mismatched_and_out_of_network_prefixes() {
+        for network in [
+            joined_network(3, "100.64.3.0/33", None, &["100.64.3.1"]),
+            joined_network(4, "fd00:4::/64", None, &["100.64.4.1"]),
+            joined_network(5, "100.64.5.0/24", Some("fd00:5::/129"), &["fd00:5::1"]),
+            joined_network(6, "100.64.6.0/24", Some("100.64.6.0/24"), &["fd00:6::1"]),
+            joined_network(7, "100.64.7.0/24", None, &["fd00:7::1"]),
+            joined_network(8, "100.64.8.0/24", None, &["100.64.9.1"]),
+            joined_network(9, "100.64.9.0/24", Some("fd00:9::/64"), &["fd00:10::1"]),
+        ] {
+            assert!(planned_addresses(&[network]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_prefixes_for_the_same_address() {
+        let first = joined_network(10, "100.64.10.0/24", None, &["100.64.10.1"]);
+        let second = joined_network(10, "100.64.10.0/25", None, &["100.64.10.1"]);
+        assert!(planned_addresses(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn deduplicates_the_same_address_for_the_same_network_id() {
+        let first = joined_network(
+            11,
+            "100.64.11.0/24",
+            Some("fd00:11::/64"),
+            &["100.64.11.1", "fd00:11::1"],
+        );
+        let duplicate = first.clone();
+        assert_eq!(
+            planned_addresses(&[first, duplicate]).unwrap(),
+            vec![
+                PlannedAddress {
+                    address: "100.64.11.1".parse().unwrap(),
+                    prefix_length: 24,
+                },
+                PlannedAddress {
+                    address: "fd00:11::1".parse().unwrap(),
+                    prefix_length: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_the_same_address_from_distinct_networks_with_the_same_prefix() {
+        let first = joined_network(12, "100.64.12.0/24", None, &["100.64.12.1"]);
+        let second = joined_network(13, "100.64.12.0/24", None, &["100.64.12.1"]);
+        assert!(planned_addresses(&[first, second]).is_err());
     }
 }
