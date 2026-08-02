@@ -1,6 +1,7 @@
 mod adapter;
 mod data_plane;
 mod port_mapping;
+mod transport_health;
 mod upnp;
 
 use anyhow::{Context, Result};
@@ -47,6 +48,7 @@ use tokio::{
     net::UdpSocket,
     sync::{Notify, RwLock},
 };
+use transport_health::{select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
 
 const LOCAL_API: &str = "127.0.0.1:51821";
@@ -267,8 +269,7 @@ impl TransportConfiguration {
 
 #[derive(Default)]
 struct TransportHealth {
-    relay_acknowledgements: HashMap<SocketAddr, Instant>,
-    root_responses: HashMap<SocketAddr, Instant>,
+    endpoints: EndpointHealthTable,
     peer_paths: Vec<PeerPathStatus>,
 }
 
@@ -350,6 +351,27 @@ impl Agent {
         let device_id = state.device_id;
         let networks = state.networks.clone();
         let transport_configuration = transport_configuration_from_state(&state);
+        let relay_health_requirements = transport_configuration
+            .networks
+            .iter()
+            .flat_map(|(network_id, configuration)| {
+                configuration
+                    .relay_endpoints
+                    .iter()
+                    .map(|endpoint| (*network_id, *endpoint))
+            })
+            .collect::<Vec<_>>();
+        let root_health_requirements = transport_configuration
+            .networks
+            .iter()
+            .flat_map(|(network_id, configuration)| {
+                configuration.root_servers.iter().flat_map(|root| {
+                    root.endpoints
+                        .iter()
+                        .map(|endpoint| (*network_id, *endpoint))
+                })
+            })
+            .collect::<Vec<_>>();
         let mut configured_roots = transport_configuration
             .root_servers
             .iter()
@@ -363,22 +385,17 @@ impl Agent {
         drop(state);
         let health = self.transport_health.read().await;
         let peer_paths = health.peer_paths.clone();
+        let health_time = Instant::now();
         let mut responsive_roots = health
-            .root_responses
-            .iter()
-            .filter_map(|(endpoint, seen)| {
-                (seen.elapsed() < Duration::from_secs(90)).then_some(*endpoint)
-            })
-            .collect::<Vec<_>>();
+            .endpoints
+            .responsive_root_endpoints(&root_health_requirements, health_time);
         responsive_roots.sort_unstable();
+        responsive_roots.dedup();
         let mut healthy_relays = health
-            .relay_acknowledgements
-            .iter()
-            .filter_map(|(endpoint, seen)| {
-                (seen.elapsed() < Duration::from_secs(45)).then_some(*endpoint)
-            })
-            .collect::<Vec<_>>();
+            .endpoints
+            .healthy_relay_endpoints(&relay_health_requirements, health_time);
         healthy_relays.sort_unstable();
+        healthy_relays.dedup();
         AgentStatus {
             device_id,
             identity_public_key,
@@ -395,20 +412,20 @@ impl Agent {
         }
     }
 
-    async fn mark_relay_acknowledged(&self, endpoint: SocketAddr) {
+    async fn mark_relay_acknowledged(&self, network_id: NetworkId, endpoint: SocketAddr) {
         self.transport_health
             .write()
             .await
-            .relay_acknowledgements
-            .insert(endpoint, Instant::now());
+            .endpoints
+            .mark_relay_acknowledged(network_id, endpoint, Instant::now());
     }
 
-    async fn mark_root_responsive(&self, endpoint: SocketAddr) {
+    async fn mark_root_responsive(&self, network_id: NetworkId, endpoint: SocketAddr) {
         self.transport_health
             .write()
             .await
-            .root_responses
-            .insert(endpoint, Instant::now());
+            .endpoints
+            .mark_root_responsive(network_id, endpoint, Instant::now());
     }
 
     async fn update_peer_paths(&self, peers: &HashMap<PeerKey, PeerRoute>, now: Instant) {
@@ -2227,7 +2244,7 @@ fn prepare_outbound_peer_packet(
 async fn send_peer_routed_packet(
     sockets: &TransportSockets,
     relay_endpoints: &[SocketAddr],
-    relay_health: &HashMap<SocketAddr, RelayHealth>,
+    endpoint_health: &EndpointHealthTable,
     network: &JoinedNetwork,
     route: &PeerRoute,
     target_device: DeviceId,
@@ -2248,7 +2265,12 @@ async fn send_peer_routed_packet(
     if matches!(network.network.relay_policy, RelayPolicy::Disabled) {
         return false;
     }
-    let Some(relay_endpoint) = select_relay_endpoint(relay_endpoints, relay_health) else {
+    let Some(relay_endpoint) = select_relay_endpoint(
+        network.network.id,
+        relay_endpoints,
+        endpoint_health,
+        Instant::now(),
+    ) else {
         return false;
     };
     if sockets.send_to(packet, relay_endpoint).await {
@@ -2268,14 +2290,10 @@ struct StunTransaction {
 }
 
 struct RootTransaction {
+    network_id: NetworkId,
     endpoint: SocketAddr,
     public_key: Vec<u8>,
     issued_at: Instant,
-}
-
-#[derive(Default)]
-struct RelayHealth {
-    last_acknowledged: Option<Instant>,
 }
 
 struct TransportSockets {
@@ -2415,11 +2433,7 @@ async fn run_relay_worker(
     let mut seen_handshakes = HashMap::<(PeerKey, [u8; 16]), Instant>::new();
     let mut stun_transactions = HashMap::<[u8; 12], StunTransaction>::new();
     let mut root_transactions = HashMap::<[u8; 16], RootTransaction>::new();
-    let mut relay_health = relay_endpoints
-        .iter()
-        .copied()
-        .map(|endpoint| (endpoint, RelayHealth::default()))
-        .collect::<HashMap<_, _>>();
+    let mut endpoint_health = EndpointHealthTable::default();
     let mut incoming_ipv4 = vec![0_u8; u16::MAX as usize];
     let mut incoming_ipv6 = vec![0_u8; u16::MAX as usize];
     let mut tick = tokio::time::interval(Duration::from_millis(5));
@@ -2447,7 +2461,7 @@ async fn run_relay_worker(
                     &mut stun_transactions,
                     &mut root_transactions,
                     &mut advertised_candidates,
-                    &mut relay_health,
+                    &mut endpoint_health,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -2465,7 +2479,7 @@ async fn run_relay_worker(
                     &mut stun_transactions,
                     &mut root_transactions,
                     &mut advertised_candidates,
-                    &mut relay_health,
+                    &mut endpoint_health,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -2549,7 +2563,7 @@ async fn run_relay_worker(
                         send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network_id),
-                            &relay_health,
+                            &endpoint_health,
                             network,
                             route,
                             target_device,
@@ -2636,6 +2650,7 @@ async fn run_relay_worker(
                                     root_transactions.insert(
                                         nonce,
                                         RootTransaction {
+                                            network_id: certificate.claims.network_id,
                                             endpoint: root_endpoint,
                                             public_key: root.public_key.clone(),
                                             issued_at: Instant::now(),
@@ -2703,7 +2718,7 @@ async fn run_relay_worker(
                         send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network.network.id),
-                            &relay_health,
+                            &endpoint_health,
                             network,
                             &route,
                             target_device,
@@ -2732,7 +2747,7 @@ async fn receive_udp_packet(
     stun_transactions: &mut HashMap<[u8; 12], StunTransaction>,
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
-    relay_health: &mut HashMap<SocketAddr, RelayHealth>,
+    endpoint_health: &mut EndpointHealthTable,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     let root_servers = configuration.root_servers.as_slice();
@@ -2784,15 +2799,20 @@ async fn receive_udp_packet(
             let Some((network, device)) = parse_registration_ack(packet) else {
                 return Ok(());
             };
+            if !configuration.relay_endpoints_for(network).contains(&remote) {
+                return Ok(());
+            }
             let (self_id, networks) = agent.relay_snapshot().await;
             if device != self_id || !networks.iter().any(|entry| entry.network.id == network) {
                 return Ok(());
             }
-            if let Some(health) = relay_health.get_mut(&remote) {
-                health.last_acknowledged = Some(Instant::now());
-                agent.mark_relay_acknowledged(remote).await;
-                trace_transport(format!("relay {remote} registration acknowledged"));
-            }
+            let acknowledged = Instant::now();
+            endpoint_health.mark_relay_acknowledged(network, remote, acknowledged);
+            agent.mark_relay_acknowledged(network, remote).await;
+            trace_transport(format!(
+                "relay {remote} registration acknowledged for network {}",
+                network.0
+            ));
         }
         RELAY_PEER_IDENTITY if relay_endpoints.contains(&remote) => {
             let Some(certificate) = parse_peer_identity(packet) else {
@@ -2957,13 +2977,16 @@ async fn handle_root_response(
             peers: discovered,
             ..
         } => {
-            agent.mark_root_responsive(remote).await;
+            agent
+                .mark_root_responsive(transaction.network_id, remote)
+                .await;
             trace_transport(format!(
                 "authenticated root {remote} observed this node at {observed_endpoint}"
             ));
             let (self_id, networks) = agent.relay_snapshot().await;
             for peer in discovered {
-                if peer.device_id == self_id
+                if peer.network_id != transaction.network_id
+                    || peer.device_id == self_id
                     || !networks
                         .iter()
                         .any(|network| network.network.id == peer.network_id)
@@ -3498,22 +3521,6 @@ fn parse_registration_ack(packet: &[u8]) -> Option<(NetworkId, DeviceId)> {
     ))
 }
 
-fn select_relay_endpoint(
-    configured: &[SocketAddr],
-    health: &HashMap<SocketAddr, RelayHealth>,
-) -> Option<SocketAddr> {
-    configured
-        .iter()
-        .copied()
-        .find(|endpoint| {
-            health
-                .get(endpoint)
-                .and_then(|entry| entry.last_acknowledged)
-                .is_some_and(|acknowledged| acknowledged.elapsed() < Duration::from_secs(45))
-        })
-        .or_else(|| configured.first().copied())
-}
-
 fn parse_peer_announcement(packet: &[u8]) -> Option<(NetworkId, DeviceId, SocketAddr)> {
     if packet.len() < 40 || packet[..4] != RELAY_MAGIC || packet[4] != RELAY_PEER {
         return None;
@@ -3622,7 +3629,7 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use meshlake_core::{
-        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy,
+        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy, RootPeer,
     };
 
     fn suffixed_state_path(path: &FsPath, suffix: &str) -> PathBuf {
@@ -4143,22 +4150,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_selection_uses_priority_then_healthy_failover() {
-        let primary: SocketAddr = "203.0.113.10:51820".parse().unwrap();
-        let secondary: SocketAddr = "203.0.113.11:51820".parse().unwrap();
-        let configured = [primary, secondary];
-        let mut health = HashMap::from([
-            (primary, RelayHealth::default()),
-            (secondary, RelayHealth::default()),
-        ]);
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(primary));
-        health.get_mut(&secondary).unwrap().last_acknowledged = Some(Instant::now());
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(secondary));
-        health.get_mut(&primary).unwrap().last_acknowledged = Some(Instant::now());
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(primary));
-    }
-
-    #[test]
     fn parses_authenticated_relay_acknowledgement() {
         let network = NetworkId(Uuid::from_u128(51));
         let device = DeviceId(Uuid::from_u128(52));
@@ -4167,6 +4158,154 @@ mod tests {
         packet.extend_from_slice(network.0.as_bytes());
         packet.extend_from_slice(device.0.as_bytes());
         assert_eq!(parse_registration_ack(&packet), Some((network, device)));
+    }
+
+    #[tokio::test]
+    async fn root_response_cannot_inject_a_peer_from_another_network() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-root-scope-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let state = agent.state.read().await;
+        let local_device = state.device_id;
+        let local_identity = identity_signing_key(&state).unwrap();
+        drop(state);
+
+        let controller = SigningKey::from_bytes(&[51_u8; 32]);
+        let root_identity = SigningKey::from_bytes(&[52_u8; 32]);
+        let peer_identity = SigningKey::from_bytes(&[53_u8; 32]);
+        let requested_network = NetworkId(Uuid::from_u128(510));
+        let foreign_network = NetworkId(Uuid::from_u128(520));
+        let peer_device = DeviceId(Uuid::from_u128(521));
+        let requested = joined_network_with_authorization(
+            &controller,
+            &local_identity,
+            local_device,
+            requested_network,
+            Uuid::from_u128(511),
+            1,
+            1,
+            String::new(),
+        );
+        let mut foreign = joined_network_with_authorization(
+            &controller,
+            &local_identity,
+            local_device,
+            foreign_network,
+            Uuid::from_u128(522),
+            1,
+            1,
+            String::new(),
+        );
+        let timestamp = now();
+        let peer_certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: foreign_network,
+                device_id: peer_device,
+                device_public_key: peer_identity.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.90.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.90.0/24".into()],
+                issued_at_unix_seconds: timestamp,
+                expires_at_unix_seconds: Some(timestamp + 86_400),
+            },
+            Uuid::from_u128(523),
+            1,
+            &controller,
+        )
+        .unwrap();
+        let local_foreign_certificate = foreign.certificate.as_ref().unwrap();
+        foreign.control_plane.authorization_manifest = Some(
+            NetworkAuthorizationManifest::sign(
+                foreign_network,
+                2,
+                1,
+                vec![
+                    AuthorizedMembership {
+                        device_id: local_foreign_certificate.claims.device_id,
+                        certificate_id: local_foreign_certificate.certificate_id,
+                        device_public_key: local_foreign_certificate
+                            .claims
+                            .device_public_key
+                            .clone(),
+                        network_key_epoch: local_foreign_certificate.network_key_epoch,
+                    },
+                    AuthorizedMembership {
+                        device_id: peer_device,
+                        certificate_id: peer_certificate.certificate_id,
+                        device_public_key: peer_certificate.claims.device_public_key.clone(),
+                        network_key_epoch: peer_certificate.network_key_epoch,
+                    },
+                ],
+                vec![],
+                timestamp,
+                timestamp + 90,
+                &controller,
+            )
+            .unwrap(),
+        );
+        agent.state.write().await.networks = vec![requested, foreign];
+
+        let root_endpoint: SocketAddr = "127.0.0.1:51819".parse().unwrap();
+        let nonce = [54_u8; 16];
+        let response = SignedRootResponse::sign(
+            nonce,
+            RootResponse::Registered {
+                observed_endpoint: "198.51.100.54:40000".parse().unwrap(),
+                peers: vec![RootPeer {
+                    network_id: foreign_network,
+                    device_id: peer_device,
+                    candidates: vec!["127.0.0.1:52000".parse().unwrap()],
+                    assigned_addresses: peer_certificate.claims.assigned_addresses.clone(),
+                    certificate: Some(peer_certificate),
+                }],
+                refresh_after_seconds: 20,
+            },
+            &root_identity,
+        )
+        .unwrap();
+        let mut root_transactions = HashMap::from([(
+            nonce,
+            RootTransaction {
+                network_id: requested_network,
+                endpoint: root_endpoint,
+                public_key: root_identity.verifying_key().to_bytes().to_vec(),
+                issued_at: Instant::now(),
+            },
+        )]);
+        let roots = vec![PlanetRoot {
+            public_key: root_identity.verifying_key().to_bytes().to_vec(),
+            endpoints: vec![root_endpoint],
+            priority: 0,
+        }];
+        let sockets = TransportSockets::bind().await.unwrap();
+        let mut peers = HashMap::<PeerKey, PeerRoute>::new();
+        let mut sessions = HashMap::<PeerKey, PeerSessionState>::new();
+
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &serde_json::to_vec(&response).unwrap(),
+            &mut peers,
+            &mut sessions,
+            &roots,
+            &mut root_transactions,
+        )
+        .await
+        .unwrap());
+        assert!(!peers.contains_key(&(foreign_network, peer_device)));
+        let health = agent.transport_health.read().await;
+        let health_time = Instant::now();
+        assert!(health
+            .endpoints
+            .root_is_responsive(requested_network, root_endpoint, health_time));
+        assert!(!health
+            .endpoints
+            .root_is_responsive(foreign_network, root_endpoint, health_time));
+        drop(health);
+        drop(sockets);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[test]
