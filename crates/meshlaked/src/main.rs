@@ -351,6 +351,27 @@ impl Agent {
         let device_id = state.device_id;
         let networks = state.networks.clone();
         let transport_configuration = transport_configuration_from_state(&state);
+        let relay_health_requirements = transport_configuration
+            .networks
+            .iter()
+            .flat_map(|(network_id, configuration)| {
+                configuration
+                    .relay_endpoints
+                    .iter()
+                    .map(|endpoint| (*network_id, *endpoint))
+            })
+            .collect::<Vec<_>>();
+        let root_health_requirements = transport_configuration
+            .networks
+            .iter()
+            .flat_map(|(network_id, configuration)| {
+                configuration.root_servers.iter().flat_map(|root| {
+                    root.endpoints
+                        .iter()
+                        .map(|endpoint| (*network_id, *endpoint))
+                })
+            })
+            .collect::<Vec<_>>();
         let mut configured_roots = transport_configuration
             .root_servers
             .iter()
@@ -365,10 +386,14 @@ impl Agent {
         let health = self.transport_health.read().await;
         let peer_paths = health.peer_paths.clone();
         let health_time = Instant::now();
-        let mut responsive_roots = health.endpoints.responsive_root_endpoints(health_time);
+        let mut responsive_roots = health
+            .endpoints
+            .responsive_root_endpoints(&root_health_requirements, health_time);
         responsive_roots.sort_unstable();
         responsive_roots.dedup();
-        let mut healthy_relays = health.endpoints.healthy_relay_endpoints(health_time);
+        let mut healthy_relays = health
+            .endpoints
+            .healthy_relay_endpoints(&relay_health_requirements, health_time);
         healthy_relays.sort_unstable();
         healthy_relays.dedup();
         AgentStatus {

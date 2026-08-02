@@ -75,25 +75,51 @@ impl EndpointHealthTable {
             .is_some_and(|seen| now.saturating_duration_since(*seen) < ROOT_RESPONSE_TTL)
     }
 
-    pub(crate) fn healthy_relay_endpoints(&self, now: Instant) -> Vec<SocketAddr> {
-        self.relay_acknowledgements
-            .iter()
-            .filter_map(|(key, _)| {
-                self.relay_is_healthy(key.network_id, key.endpoint, now)
-                    .then_some(key.endpoint)
-            })
-            .collect()
+    pub(crate) fn healthy_relay_endpoints(
+        &self,
+        configured: &[(NetworkId, SocketAddr)],
+        now: Instant,
+    ) -> Vec<SocketAddr> {
+        aggregate_configured_endpoints(configured, |network_id, endpoint| {
+            self.relay_is_healthy(network_id, endpoint, now)
+        })
     }
 
-    pub(crate) fn responsive_root_endpoints(&self, now: Instant) -> Vec<SocketAddr> {
-        self.root_responses
-            .iter()
-            .filter_map(|(key, _)| {
-                self.root_is_responsive(key.network_id, key.endpoint, now)
-                    .then_some(key.endpoint)
-            })
-            .collect()
+    pub(crate) fn responsive_root_endpoints(
+        &self,
+        configured: &[(NetworkId, SocketAddr)],
+        now: Instant,
+    ) -> Vec<SocketAddr> {
+        aggregate_configured_endpoints(configured, |network_id, endpoint| {
+            self.root_is_responsive(network_id, endpoint, now)
+        })
     }
+}
+
+/// The public status API predates per-network endpoint health and exposes only
+/// a flat endpoint list. Report a shared endpoint as healthy only when every
+/// configured network using it has current authenticated liveness. This avoids
+/// presenting network A's acknowledgement as evidence for network B.
+fn aggregate_configured_endpoints(
+    configured: &[(NetworkId, SocketAddr)],
+    mut is_healthy: impl FnMut(NetworkId, SocketAddr) -> bool,
+) -> Vec<SocketAddr> {
+    let mut requirements = HashMap::<SocketAddr, Vec<NetworkId>>::new();
+    for (network_id, endpoint) in configured {
+        let networks = requirements.entry(*endpoint).or_default();
+        if !networks.contains(network_id) {
+            networks.push(*network_id);
+        }
+    }
+    requirements
+        .into_iter()
+        .filter_map(|(endpoint, networks)| {
+            networks
+                .into_iter()
+                .all(|network_id| is_healthy(network_id, endpoint))
+                .then_some(endpoint)
+        })
+        .collect()
 }
 
 /// Select the highest-priority healthy relay for one network. Planet order is
@@ -211,5 +237,37 @@ mod tests {
             root,
             started + ROOT_RESPONSE_TTL + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn global_status_hides_a_shared_endpoint_until_every_network_is_healthy() {
+        let first_network = network(8);
+        let second_network = network(9);
+        let relay: SocketAddr = "203.0.113.60:51820".parse().unwrap();
+        let root: SocketAddr = "203.0.113.60:51819".parse().unwrap();
+        let now = Instant::now();
+        let relay_requirements = [(first_network, relay), (second_network, relay)];
+        let root_requirements = [(first_network, root), (second_network, root)];
+        let mut health = EndpointHealthTable::default();
+
+        health.mark_relay_acknowledged(first_network, relay, now);
+        health.mark_root_responsive(first_network, root, now);
+        assert!(health
+            .healthy_relay_endpoints(&relay_requirements, now)
+            .is_empty());
+        assert!(health
+            .responsive_root_endpoints(&root_requirements, now)
+            .is_empty());
+
+        health.mark_relay_acknowledged(second_network, relay, now);
+        health.mark_root_responsive(second_network, root, now);
+        assert_eq!(
+            health.healthy_relay_endpoints(&relay_requirements, now),
+            vec![relay]
+        );
+        assert_eq!(
+            health.responsive_root_endpoints(&root_requirements, now),
+            vec![root]
+        );
     }
 }
