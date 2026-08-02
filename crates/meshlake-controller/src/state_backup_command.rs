@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use meshlake_core::{
-    cleanup_stale_state_backup, decode_protected_state, decode_state_backup, encode_state_backup,
-    recover_protected_state_file, resolve_state_backup_path, restrict_state_file_permissions,
-    write_state_backup_file, StateBackupKind, StateFileLock, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    cleanup_stale_state_backup, decode_protected_state_with, decode_state_backup,
+    encode_state_backup, recover_protected_state_file, resolve_state_backup_path,
+    restrict_state_file_permissions, write_state_backup_file, StateBackupKind, StateFileLock,
+    StateProtection, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use std::{
     fs,
@@ -12,7 +13,10 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-use super::{migrate_and_validate_controller_state, write_state, ControllerState};
+use super::{migrate_and_validate_controller_state, write_state_with_protection, ControllerState};
+
+#[cfg(test)]
+use super::write_state;
 
 #[derive(Subcommand)]
 pub(crate) enum StateCommand {
@@ -40,7 +44,11 @@ pub(crate) enum StateCommand {
     },
 }
 
-pub(crate) fn run(command: StateCommand, state_path: &Path) -> Result<()> {
+pub(crate) fn run(
+    command: StateCommand,
+    state_path: &Path,
+    protection: &StateProtection,
+) -> Result<()> {
     match command {
         StateCommand::Backup {
             output,
@@ -48,7 +56,13 @@ pub(crate) fn run(command: StateCommand, state_path: &Path) -> Result<()> {
             force,
         } => {
             let password = read_password(password_stdin, true)?;
-            backup_with_password(state_path, &output, password.as_bytes(), force)?;
+            backup_with_password_with_protection(
+                state_path,
+                &output,
+                password.as_bytes(),
+                force,
+                protection,
+            )?;
             println!("Controller state backup written to {}", output.display());
         }
         StateCommand::Restore {
@@ -57,18 +71,41 @@ pub(crate) fn run(command: StateCommand, state_path: &Path) -> Result<()> {
             force,
         } => {
             let password = read_password(password_stdin, false)?;
-            restore_with_password(state_path, &input, password.as_bytes(), force)?;
+            restore_with_password_with_protection(
+                state_path,
+                &input,
+                password.as_bytes(),
+                force,
+                protection,
+            )?;
             println!("Controller state restored to {}", state_path.display());
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn backup_with_password(
     state_path: &Path,
     output: &Path,
     password: &[u8],
     force: bool,
+) -> Result<()> {
+    backup_with_password_with_protection(
+        state_path,
+        output,
+        password,
+        force,
+        &StateProtection::platform_default(),
+    )
+}
+
+fn backup_with_password_with_protection(
+    state_path: &Path,
+    output: &Path,
+    password: &[u8],
+    force: bool,
+    protection: &StateProtection,
 ) -> Result<()> {
     let _state_lock = StateFileLock::acquire(state_path)?;
     let output = resolve_state_backup_path(state_path, output)?;
@@ -83,7 +120,7 @@ pub(crate) fn backup_with_password(
     let bytes = fs::read(state_path)
         .with_context(|| format!("cannot read controller state {}", state_path.display()))?;
     let mut state: ControllerState =
-        decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE)
+        decode_protected_state_with(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE, protection)
             .with_context(|| {
                 format!(
                     "invalid or unreadable controller state {}",
@@ -102,11 +139,28 @@ pub(crate) fn backup_with_password(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn restore_with_password(
     state_path: &Path,
     input: &Path,
     password: &[u8],
     force: bool,
+) -> Result<()> {
+    restore_with_password_with_protection(
+        state_path,
+        input,
+        password,
+        force,
+        &StateProtection::platform_default(),
+    )
+}
+
+fn restore_with_password_with_protection(
+    state_path: &Path,
+    input: &Path,
+    password: &[u8],
+    force: bool,
+    protection: &StateProtection,
 ) -> Result<()> {
     let _state_lock = StateFileLock::acquire(state_path)?;
     let input = resolve_state_backup_path(state_path, input)?;
@@ -122,7 +176,7 @@ pub(crate) fn restore_with_password(
             state_path.display()
         );
     }
-    write_state(state_path, &state)?;
+    write_state_with_protection(state_path, &state, protection)?;
     Ok(())
 }
 

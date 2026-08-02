@@ -297,13 +297,14 @@ async fn main() -> Result<()> {
                 ipv6_prefix,
                 relay_policy: relay_policy.into(),
             };
-            let network: VirtualNetwork = ensure_success(
+            let network: VirtualNetwork = ensure_sensitive_success(
                 client
                     .post(format!("{controller_url}/v1/networks"))
                     .header("x-meshlake-admin-token", admin_token.as_str())
                     .json(&request)
                     .send()
                     .await?,
+                "controller network creation",
             )
             .await?
             .json()
@@ -347,12 +348,13 @@ async fn main() -> Result<()> {
         } => {
             let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
-            ensure_success(
+            ensure_sensitive_success(
                 client
                     .delete(format!("{controller_url}/v1/networks/{network}"))
                     .header("x-meshlake-admin-token", admin_token.as_str())
                     .send()
                     .await?,
+                "controller network deletion",
             )
             .await?;
             println!("Controller network {network} deleted.");
@@ -387,7 +389,7 @@ async fn main() -> Result<()> {
         } => {
             let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
-            let response: serde_json::Value = ensure_success(
+            let response: serde_json::Value = ensure_sensitive_success(
                 client
                     .post(format!(
                         "{controller_url}/v1/networks/{network}/enrollment-tokens"
@@ -398,6 +400,7 @@ async fn main() -> Result<()> {
                     }))
                     .send()
                     .await?,
+                "controller invitation creation",
             )
             .await?
             .json()
@@ -663,7 +666,7 @@ async fn join_network(
             .json()
             .await?;
     let controller_url = controller.trim_end_matches('/');
-    let enrollment: EnrollmentResponse = ensure_success(
+    let enrollment: EnrollmentResponse = ensure_sensitive_success(
         client
             .post(format!("{controller_url}/v1/enroll"))
             .json(&serde_json::json!({
@@ -674,13 +677,14 @@ async fn join_network(
             }))
             .send()
             .await?,
+        "controller enrollment",
     )
     .await?
     .json()
     .await?;
     let enrollment = serde_json::to_value(enrollment)
         .context("could not serialize controller enrollment for the local agent")?;
-    print_network(
+    let response = ensure_sensitive_success(
         client
             .post(format!("{LOCAL_API}/networks/enroll"))
             .json(&local_enrollment_request(
@@ -690,8 +694,10 @@ async fn join_network(
             ))
             .send()
             .await?,
+        "local enrollment persistence",
     )
-    .await
+    .await?;
+    print_network(response).await
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -707,6 +713,19 @@ async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response
         bail!("agent rejected request ({status}): {body}");
     }
     bail!("agent request failed ({status}): {body}")
+}
+
+async fn ensure_sensitive_success(
+    response: reqwest::Response,
+    operation: &'static str,
+) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    bail!(
+        "{operation} failed ({status}); response body omitted because the request contained secret material"
+    )
 }
 
 fn load_tls_ca_file(path: Option<&std::path::Path>) -> Result<Option<NormalizedTlsCa>> {
@@ -1307,6 +1326,39 @@ mod tests {
         ))
         .unwrap();
         assert!(!format!("{invite:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn sensitive_request_errors_omit_reflected_response_bodies() {
+        use std::io::{Read, Write};
+
+        let secret = "reflected-administrator-token";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = format!("controller reflected {secret}");
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let response = Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let error = ensure_sensitive_success(response, "test secret request")
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(!error.to_string().contains(secret));
+        assert!(error.to_string().contains("response body omitted"));
     }
 
     #[test]

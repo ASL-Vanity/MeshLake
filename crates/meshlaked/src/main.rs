@@ -23,19 +23,20 @@ use data_plane::ip::{
 };
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
-    accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state,
+    accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state_with,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
-    restrict_state_file_permissions, session_handshake_id, write_protected_state_file, AgentStatus,
-    DeviceId, EnrollmentResponse, InitiatorHandshake, JoinedNetwork, MembershipCertificate,
-    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
-    NetworkControlPlane, NetworkId, NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys,
-    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
-    RootRegistration, RootResponse, SessionList, SessionPath, SessionQueueCounters,
-    SessionSecurityCounters, SessionState, SignedRootResponse, StateFileLock, TransportStatus,
-    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
-    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
-    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
-    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    restrict_state_file_permissions, session_handshake_id, write_protected_state_file,
+    write_protected_state_file_with, AgentStatus, DeviceId, EnrollmentResponse, InitiatorHandshake,
+    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
+    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey,
+    NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay,
+    PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration, RootResponse, SessionList,
+    SessionPath, SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRootResponse,
+    StateFileLock, StateKeyProvider, StateProtection, TransportStatus, UpsertNetworkRequest,
+    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
+    RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,9 @@ use tokio::{
 };
 use transport_health::{select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
+
+#[cfg(test)]
+use meshlake_core::decode_protected_state;
 
 use session_observability::{SessionObservability, SessionTelemetry};
 
@@ -82,6 +86,20 @@ struct Cli {
     /// Path to local agent state. The default is %LOCALAPPDATA%\\MeshLake\\agent.json.
     #[arg(long)]
     state_file: Option<PathBuf>,
+    /// Linux: encrypt state using exactly 32 raw bytes from this restricted external file.
+    #[arg(
+        long,
+        value_name = "MASTER_KEY_FILE",
+        conflicts_with = "state_key_systemd_credential"
+    )]
+    state_key_file: Option<PathBuf>,
+    /// Linux: encrypt state using a named file from systemd's CREDENTIALS_DIRECTORY.
+    #[arg(
+        long,
+        value_name = "CREDENTIAL_NAME",
+        conflicts_with = "state_key_file"
+    )]
+    state_key_systemd_credential: Option<String>,
     /// Path to the signed Wintun DLL. Defaults to wintun.dll beside meshlaked.exe.
     #[arg(long)]
     wintun_dll: Option<PathBuf>,
@@ -207,6 +225,7 @@ impl PersistedState {
 
 struct Agent {
     path: PathBuf,
+    state_protection: StateProtection,
     _state_lock: StateFileLock,
     state: RwLock<PersistedState>,
     adapter: adapter::AdapterController,
@@ -294,7 +313,16 @@ struct TransportHealth {
 }
 
 impl Agent {
+    #[cfg(test)]
     fn open(path: PathBuf, wintun_dll: PathBuf) -> Result<Self> {
+        Self::open_with_protection(path, wintun_dll, StateProtection::platform_default())
+    }
+
+    fn open_with_protection(
+        path: PathBuf,
+        wintun_dll: PathBuf,
+        state_protection: StateProtection,
+    ) -> Result<Self> {
         let state_lock = StateFileLock::acquire(&path)?;
         recover_protected_state_file(&path)?;
         if path.exists() {
@@ -303,23 +331,28 @@ impl Agent {
         let (mut state, mut state_changed) = if path.exists() {
             let bytes =
                 fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-            let decoded = decode_protected_state(&bytes, AGENT_STATE_PROTECTION_PURPOSE)
-                .with_context(|| format!("invalid or unreadable state file {}", path.display()))?;
+            let decoded = decode_protected_state_with(
+                &bytes,
+                AGENT_STATE_PROTECTION_PURPOSE,
+                &state_protection,
+            )
+            .with_context(|| format!("invalid or unreadable state file {}", path.display()))?;
             (decoded.value, decoded.needs_protection_upgrade)
         } else {
             let state = PersistedState::new();
-            write_state(&path, &state)?;
+            write_state_with_protection(&path, &state, &state_protection)?;
             (state, false)
         };
         state_changed |= migrate_and_validate_agent_state(&mut state)?;
         if state_changed {
-            write_state(&path, &state)?;
+            write_state_with_protection(&path, &state, &state_protection)?;
         }
         cleanup_stale_state_backup(&path)?;
         let session_observability = SessionObservability::default();
         session_observability.reset(1);
         Ok(Self {
             path,
+            state_protection,
             _state_lock: state_lock,
             state: RwLock::new(state),
             adapter: adapter::AdapterController::new(wintun_dll),
@@ -452,7 +485,8 @@ impl Agent {
             .filter(|server| !server.is_empty())
             .take(8)
             .collect();
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         drop(state);
         self.request_transport_reload();
         Ok(())
@@ -523,7 +557,8 @@ impl Agent {
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
             controller_tls_ca_pem: tls_ca_pem,
         });
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         drop(state);
         self.request_transport_reload();
         Ok(())
@@ -677,7 +712,7 @@ impl Agent {
                 }
             }
         }
-        write_state(&self.path, &state)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)?;
         drop(state);
 
         if reload_transport {
@@ -819,7 +854,7 @@ impl Agent {
             return Ok(());
         }
         state.networks[index].control_plane.policy_manifest = Some(policy);
-        write_state(&self.path, &state)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
         if let Err(error) = self.adapter.configure_policy(&networks) {
@@ -831,7 +866,7 @@ impl Agent {
             {
                 joined.control_plane.policy_manifest = previous;
             }
-            write_state(&self.path, &state)?;
+            write_state_with_protection(&self.path, &state, &self.state_protection)?;
             let rollback_networks = state.networks.clone();
             drop(state);
             if let Err(rollback_error) = self.adapter.configure_policy(&rollback_networks) {
@@ -872,7 +907,7 @@ impl Agent {
         if !changed {
             return Ok(());
         }
-        write_state(&self.path, &state)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
         self.adapter.configure_policy(&networks)?;
@@ -988,7 +1023,8 @@ impl Agent {
             control_plane: NetworkControlPlane::default(),
         };
         state.networks.push(joined.clone());
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         Ok(joined)
     }
 
@@ -1006,7 +1042,8 @@ impl Agent {
             .map_err(ApiError::internal)?;
         state.networks.retain(|entry| entry.network.id != id);
         state.authorizations.remove(&id);
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         let networks = state.networks.clone();
         drop(state);
         self.adapter
@@ -1110,7 +1147,8 @@ impl Agent {
             state.networks.push(joined.clone());
             None
         };
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         drop(state);
         if self.adapter.is_active() {
             if let Some(previous) = &previous {
@@ -1789,6 +1827,15 @@ fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
     write_protected_state_file(path, state, AGENT_STATE_PROTECTION_PURPOSE).map_err(Into::into)
 }
 
+fn write_state_with_protection(
+    path: &FsPath,
+    state: &PersistedState,
+    protection: &StateProtection,
+) -> Result<()> {
+    write_protected_state_file_with(path, state, AGENT_STATE_PROTECTION_PURPOSE, protection)
+        .map_err(Into::into)
+}
+
 fn migrate_and_validate_agent_state(state: &mut PersistedState) -> Result<bool> {
     if state.schema_version > AGENT_STATE_SCHEMA_VERSION {
         anyhow::bail!(
@@ -1921,20 +1968,49 @@ async fn shutdown_agent(State(agent): State<Arc<Agent>>) -> StatusCode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = cli.state_file.unwrap_or_else(default_state_path);
-    let wintun_dll = cli.wintun_dll.unwrap_or_else(adapter::default_wintun_path);
-    match cli.command {
+    let path = cli.state_file.clone().unwrap_or_else(default_state_path);
+    let wintun_dll = cli
+        .wintun_dll
+        .clone()
+        .unwrap_or_else(adapter::default_wintun_path);
+    let state_key_provider = cli
+        .state_key_file
+        .clone()
+        .map(StateKeyProvider::RestrictedFile)
+        .or_else(|| {
+            cli.state_key_systemd_credential
+                .clone()
+                .map(StateKeyProvider::SystemdCredential)
+        });
+    let command = match cli.command {
         Some(Command::PrintStatePath) => {
             println!("{}", path.display());
             return Ok(());
         }
         Some(Command::Autostart { command }) => {
-            return manage_autostart(command, &path, &wintun_dll)
+            return manage_autostart(command, &path, &wintun_dll, state_key_provider.as_ref())
         }
-        Some(Command::State { command }) => return state_backup_command::run(command, &path),
+        command => command,
+    };
+    let state_protection = match state_key_provider {
+        Some(provider) => StateProtection::from_provider(&path, provider)?,
+        None => StateProtection::platform_default(),
+    };
+    eprintln!("State protection: {}", state_protection.level());
+    match command {
+        Some(Command::State { command }) => {
+            return state_backup_command::run(command, &path, &state_protection)
+        }
         Some(Command::Run) | None => {}
+        Some(Command::PrintStatePath) | Some(Command::Autostart { .. }) => {
+            unreachable!("handled before loading state protection")
+        }
     }
-    let agent = Arc::new(Agent::open(path.clone(), wintun_dll.clone())?);
+    let agent = Arc::new(Agent::open_with_protection(
+        path.clone(),
+        wintun_dll.clone(),
+        state_protection,
+    )?);
     // A headless installation must become usable again after logon or a service
     // restart. Wintun sessions are process-local, so an adapter that was active
     // before shutdown has to be opened and configured again here.  Keep serving
@@ -1996,6 +2072,7 @@ fn manage_autostart(
     command: AutostartCommand,
     state_path: &FsPath,
     wintun_dll: &FsPath,
+    _state_key_provider: Option<&StateKeyProvider>,
 ) -> Result<()> {
     const TASK_NAME: &str = "MeshLake Agent";
     match command {
@@ -2072,16 +2149,29 @@ fn manage_autostart(
 #[cfg(unix)]
 fn manage_autostart(
     command: AutostartCommand,
-    _state_path: &FsPath,
+    state_path: &FsPath,
     _wintun_dll: &FsPath,
+    state_key_provider: Option<&StateKeyProvider>,
 ) -> Result<()> {
     const UNIT_PATH: &str = "/etc/systemd/system/meshlaked.service";
     match command {
         AutostartCommand::Install => {
             let executable = env::current_exe().context("cannot locate meshlaked executable")?;
+            let (credential_directive, provider_argument) = match state_key_provider {
+                Some(StateKeyProvider::SystemdCredential(name)) => (
+                    format!("LoadCredential={name}\n"),
+                    format!(" --state-key-systemd-credential \"{name}\""),
+                ),
+                Some(StateKeyProvider::RestrictedFile(path)) => (
+                    String::new(),
+                    format!(" --state-key-file \"{}\"", path.display()),
+                ),
+                None => (String::new(), String::new()),
+            };
             let unit = format!(
-                "[Unit]\nDescription=MeshLake virtual LAN agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" --state-file /var/lib/meshlake/agent.json run\nRestart=on-failure\nRestartSec=3\nStateDirectory=meshlake\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
-                executable.display()
+                "[Unit]\nDescription=MeshLake virtual LAN agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\n{credential_directive}ExecStart=\"{}\" --state-file \"{}\"{provider_argument} run\nRestart=on-failure\nRestartSec=3\nStateDirectory=meshlake\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
+                executable.display(),
+                state_path.display(),
             );
             fs::write(UNIT_PATH, unit)
                 .context("cannot install systemd unit; run this command as root")?;
@@ -6575,5 +6665,53 @@ mod tests {
 
         drop(agent);
         cleanup_test_state(&path, &directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_provider_migrates_agent_plaintext_without_rotating_identity() {
+        use meshlake_core::{
+            create_restricted_secret_file, decode_protected_state_with, StateKeyProvider,
+        };
+
+        let directory =
+            env::temp_dir().join(format!("meshlake-agent-linux-provider-{}", Uuid::new_v4()));
+        let state_directory = directory.join("state");
+        let key_directory = directory.join("keys");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::create_dir_all(&key_directory).unwrap();
+        let path = state_directory.join("agent.json");
+        let key_path = key_directory.join("state.key");
+        let original = PersistedState::new();
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        create_restricted_secret_file(&key_path, &[13; 32]).unwrap();
+
+        let protection = StateProtection::from_provider(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        let agent =
+            Agent::open_with_protection(path.clone(), adapter::default_wintun_path(), protection)
+                .unwrap();
+        drop(agent);
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(matches!(
+            decode_protected_state::<PersistedState>(&bytes, AGENT_STATE_PROTECTION_PURPOSE),
+            Err(meshlake_core::StateProtectionError::MissingMasterKey)
+        ));
+        let protection =
+            StateProtection::from_provider(&path, StateKeyProvider::RestrictedFile(key_path))
+                .unwrap();
+        let decoded: meshlake_core::DecodedState<PersistedState> =
+            decode_protected_state_with(&bytes, AGENT_STATE_PROTECTION_PURPOSE, &protection)
+                .unwrap();
+        assert_eq!(decoded.value.device_id, original.device_id);
+        assert_eq!(
+            decoded.value.identity_secret_key,
+            original.identity_secret_key
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

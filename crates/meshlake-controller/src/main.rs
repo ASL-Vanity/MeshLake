@@ -15,13 +15,13 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use meshlake_core::{
-    cleanup_stale_state_backup, create_restricted_secret_file, decode_protected_state,
-    recover_protected_state_file, restrict_state_file_permissions, write_protected_state_file,
-    AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse, MembershipCertificate,
-    MembershipClaims, MembershipRefreshRequest, MembershipRefreshResponse,
+    cleanup_stale_state_backup, create_restricted_secret_file, decode_protected_state_with,
+    recover_protected_state_file, resolve_state_backup_path, restrict_state_file_permissions,
+    write_protected_state_file_with, AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse,
+    MembershipCertificate, MembershipClaims, MembershipRefreshRequest, MembershipRefreshResponse,
     NetworkAuthorizationManifest, NetworkId, NetworkKey, NetworkPolicyManifest, PlanetManifest,
-    PlanetRelay, PlanetRoot, PolicyRoute, StateFileLock, UpsertNetworkRequest, VirtualNetwork,
-    CONTROLLER_STATE_PROTECTION_PURPOSE,
+    PlanetRelay, PlanetRoot, PolicyRoute, StateFileLock, StateKeyProvider, StateProtection,
+    UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +39,9 @@ use url::Url;
 use uuid::Uuid;
 
 use state_backup_command::StateCommand as StateBackupCommand;
+
+#[cfg(test)]
+use meshlake_core::{decode_protected_state, write_protected_state_file};
 
 const CONTROLLER_STATE_SCHEMA_VERSION: u32 = 2;
 
@@ -75,6 +78,20 @@ struct Cli {
     /// Show the first administrator token only on the attached interactive terminal.
     #[arg(long, conflicts_with = "initial_admin_token_file")]
     claim_initial_admin_token: bool,
+    /// Linux: encrypt state using exactly 32 raw bytes from this restricted external file.
+    #[arg(
+        long,
+        value_name = "MASTER_KEY_FILE",
+        conflicts_with = "state_key_systemd_credential"
+    )]
+    state_key_file: Option<PathBuf>,
+    /// Linux: encrypt state using a named file from systemd's CREDENTIALS_DIRECTORY.
+    #[arg(
+        long,
+        value_name = "CREDENTIAL_NAME",
+        conflicts_with = "state_key_file"
+    )]
+    state_key_systemd_credential: Option<String>,
     /// Public controller URL published through the signed Planet manifest.
     #[arg(long)]
     planet_controller_url: Option<String>,
@@ -225,6 +242,7 @@ struct PlanetSettings {
 struct Controller {
     path: PathBuf,
     state: RwLock<ControllerState>,
+    state_protection: StateProtection,
     planet: Option<PlanetSettings>,
     refresh_nonces: Mutex<HashMap<[u8; 16], Instant>>,
     _state_lock: StateFileLock,
@@ -236,6 +254,7 @@ enum InitialAdminTokenOutput {
 }
 
 impl Controller {
+    #[cfg(test)]
     fn open(
         path: PathBuf,
         planet: Option<PlanetSettings>,
@@ -243,21 +262,59 @@ impl Controller {
         interactive_terminal: bool,
         output: &mut dyn Write,
     ) -> Result<Self> {
+        Self::open_with_protection(
+            path,
+            planet,
+            StateProtection::platform_default(),
+            initial_token_output,
+            interactive_terminal,
+            output,
+        )
+    }
+
+    fn open_with_protection(
+        path: PathBuf,
+        planet: Option<PlanetSettings>,
+        state_protection: StateProtection,
+        initial_token_output: Option<&InitialAdminTokenOutput>,
+        interactive_terminal: bool,
+        output: &mut dyn Write,
+    ) -> Result<Self> {
         let state_lock = StateFileLock::acquire(&path)?;
         recover_protected_state_file(&path)?;
         let (mut state, mut migrated) = if path.exists() {
+            if initial_token_output.is_some() {
+                anyhow::bail!(
+                    "initial administrator-token output options are valid only when creating a new controller state"
+                );
+            }
             restrict_state_file_permissions(&path)?;
             let bytes =
                 fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-            let decoded = decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE)
-                .with_context(|| {
-                    format!("invalid or unreadable controller state {}", path.display())
-                })?;
+            let decoded = decode_protected_state_with(
+                &bytes,
+                CONTROLLER_STATE_PROTECTION_PURPOSE,
+                &state_protection,
+            )
+            .with_context(|| {
+                format!("invalid or unreadable controller state {}", path.display())
+            })?;
             (decoded.value, decoded.needs_protection_upgrade)
         } else {
             let initial_token_output = initial_token_output.context(
                 "new controller initialization requires --claim-initial-admin-token or --initial-admin-token-file",
             )?;
+            let resolved_initial_token_file;
+            let initial_token_output = match initial_token_output {
+                InitialAdminTokenOutput::RestrictedFile(output_path) => {
+                    resolved_initial_token_file = resolve_state_backup_path(&path, output_path)
+                        .context(
+                            "initial administrator-token file conflicts with a reserved controller state path",
+                        )?;
+                    InitialAdminTokenOutput::RestrictedFile(resolved_initial_token_file)
+                }
+                InitialAdminTokenOutput::Interactive => InitialAdminTokenOutput::Interactive,
+            };
             let mut signing_key = [0_u8; 32];
             getrandom::fill(&mut signing_key).map_err(|error| {
                 anyhow::anyhow!("cannot generate controller signing key: {error:?}")
@@ -272,21 +329,22 @@ impl Controller {
             };
             deliver_initial_admin_token(
                 &admin_token,
-                initial_token_output,
+                &initial_token_output,
                 interactive_terminal,
                 output,
             )?;
-            write_state(&path, &state)?;
+            write_state_with_protection(&path, &state, &state_protection)?;
             (state, false)
         };
         migrated |= migrate_and_validate_controller_state(&mut state)?;
         if migrated {
-            write_state(&path, &state)?;
+            write_state_with_protection(&path, &state, &state_protection)?;
         }
         cleanup_stale_state_backup(&path)?;
         Ok(Self {
             path,
             state: RwLock::new(state),
+            state_protection,
             planet,
             refresh_nonces: Mutex::new(HashMap::new()),
             _state_lock: state_lock,
@@ -329,7 +387,8 @@ impl Controller {
                 policy: ManagedPolicy::default(),
             },
         );
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         Ok(network)
     }
 
@@ -355,7 +414,8 @@ impl Controller {
                 used_by: None,
             },
         );
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         let controller_public_key = signing_key(&state)
             .map_err(ApiError::internal)?
             .verifying_key()
@@ -445,7 +505,8 @@ impl Controller {
         managed.authorization_epoch = managed.authorization_epoch.saturating_add(1);
         let authorization =
             sign_authorization(managed, &signing_key).map_err(ApiError::internal)?;
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         Ok(EnrollmentResponse {
             network,
             certificate,
@@ -477,7 +538,8 @@ impl Controller {
         state
             .enrollment_tokens
             .retain(|_, token| token.network_id != network_id);
-        write_state(&self.path, &state).map_err(ApiError::internal)
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)
     }
 
     async fn members(
@@ -541,7 +603,8 @@ impl Controller {
         let updated = claims.clone();
         sign_policy(&candidate, &signing_key).map_err(ApiError::bad_request)?;
         *network = candidate;
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         Ok(updated)
     }
 
@@ -579,7 +642,8 @@ impl Controller {
             .to_vec();
         network.network_key_epoch = network.network_key_epoch.saturating_add(1).max(1);
         network.authorization_epoch = network.authorization_epoch.saturating_add(1).max(1);
-        write_state(&self.path, &state).map_err(ApiError::internal)
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)
     }
 
     async fn authorization(
@@ -633,7 +697,8 @@ impl Controller {
             .collect();
         candidate.policy.dns = manifest.dns.clone();
         *network = candidate;
-        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
         Ok(manifest)
     }
 
@@ -1032,8 +1097,18 @@ fn require_admin(state: &ControllerState, headers: &HeaderMap) -> Result<(), Api
     }
 }
 
+#[cfg(test)]
 fn write_state(path: &FsPath, state: &ControllerState) -> Result<()> {
     write_protected_state_file(path, state, CONTROLLER_STATE_PROTECTION_PURPOSE)
+        .with_context(|| format!("cannot securely write controller state {}", path.display()))
+}
+
+fn write_state_with_protection(
+    path: &FsPath,
+    state: &ControllerState,
+    protection: &StateProtection,
+) -> Result<()> {
+    write_protected_state_file_with(path, state, CONTROLLER_STATE_PROTECTION_PURPOSE, protection)
         .with_context(|| format!("cannot securely write controller state {}", path.display()))
 }
 
@@ -1239,8 +1314,22 @@ async fn refresh_membership(
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let path = cli.state_file.clone().unwrap_or_else(default_state_path);
+    let state_key_provider = cli
+        .state_key_file
+        .clone()
+        .map(StateKeyProvider::RestrictedFile)
+        .or_else(|| {
+            cli.state_key_systemd_credential
+                .clone()
+                .map(StateKeyProvider::SystemdCredential)
+        });
+    let state_protection = match state_key_provider {
+        Some(provider) => StateProtection::from_provider(&path, provider)?,
+        None => StateProtection::platform_default(),
+    };
+    eprintln!("State protection: {}", state_protection.level());
     if let Some(Command::State { command }) = cli.command.take() {
-        return state_backup_command::run(command, &path);
+        return state_backup_command::run(command, &path, &state_protection);
     }
     install_rustls_crypto_provider()?;
     let tls_files = controller_tls_configuration(&cli)?;
@@ -1304,9 +1393,10 @@ async fn main() -> Result<()> {
         });
     let mut stderr = io::stderr().lock();
     let interactive_terminal = stderr.is_terminal();
-    let controller = Controller::open(
+    let controller = Controller::open_with_protection(
         path.clone(),
         planet,
+        state_protection,
         initial_token_output.as_ref(),
         interactive_terminal,
         &mut stderr,
@@ -1561,6 +1651,8 @@ mod tests {
             state_file: None,
             initial_admin_token_file: None,
             claim_initial_admin_token: false,
+            state_key_file: None,
+            state_key_systemd_credential: None,
             planet_controller_url: None,
             planet_relay_endpoints: Vec::new(),
             planet_roots: Vec::new(),
@@ -1670,6 +1762,48 @@ mod tests {
             .contains("cannot create restricted initial administrator-token file"));
         assert!(!error.to_string().contains(token.trim_end()));
         assert!(!second_state.exists());
+    }
+
+    #[test]
+    fn initial_token_file_cannot_alias_controller_state_or_be_reused_on_existing_state() {
+        let directory = TestDirectory::new("initial-token-reserved-path");
+        let path = directory.file("controller.json");
+        let destination = InitialAdminTokenOutput::RestrictedFile(path.clone());
+        let error = match Controller::open(
+            path.clone(),
+            None,
+            Some(&destination),
+            false,
+            &mut io::sink(),
+        ) {
+            Ok(_) => panic!("initial token unexpectedly overwrote the controller state path"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("reserved controller state path"));
+        assert!(!path.exists());
+
+        let token_path = directory.file("administrator.token");
+        let destination = InitialAdminTokenOutput::RestrictedFile(token_path);
+        let controller = Controller::open(
+            path.clone(),
+            None,
+            Some(&destination),
+            false,
+            &mut io::sink(),
+        )
+        .unwrap();
+        drop(controller);
+        let error = match Controller::open(
+            path,
+            None,
+            Some(&InitialAdminTokenOutput::Interactive),
+            true,
+            &mut io::sink(),
+        ) {
+            Ok(_) => panic!("existing state unexpectedly accepted bootstrap output options"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("valid only when creating"));
     }
 
     async fn start_https_server(
@@ -2254,5 +2388,55 @@ mod tests {
             Controller::open(path.clone(), None, None, false, &mut io::sink()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         drop(controller);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_provider_migrates_controller_plaintext_without_rotating_credentials() {
+        use meshlake_core::{
+            create_restricted_secret_file, decode_protected_state_with, StateKeyProvider,
+        };
+
+        let directory = TestDirectory::new("linux-provider-migration");
+        let state_directory = directory.path.join("state");
+        let key_directory = directory.path.join("keys");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::create_dir_all(&key_directory).unwrap();
+        let path = state_directory.join("controller.json");
+        let key_path = key_directory.join("state.key");
+        let original = test_state(CONTROLLER_STATE_SCHEMA_VERSION);
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        create_restricted_secret_file(&key_path, &[11; 32]).unwrap();
+
+        let protection = StateProtection::from_provider(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        let controller = Controller::open_with_protection(
+            path.clone(),
+            None,
+            protection,
+            None,
+            false,
+            &mut io::sink(),
+        )
+        .unwrap();
+        drop(controller);
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&original.admin_token));
+        assert!(matches!(
+            decode_protected_state::<ControllerState>(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE),
+            Err(meshlake_core::StateProtectionError::MissingMasterKey)
+        ));
+        let protection =
+            StateProtection::from_provider(&path, StateKeyProvider::RestrictedFile(key_path))
+                .unwrap();
+        let decoded: meshlake_core::DecodedState<ControllerState> =
+            decode_protected_state_with(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE, &protection)
+                .unwrap();
+        assert_eq!(decoded.value.signing_key, original.signing_key);
+        assert_eq!(decoded.value.admin_token, original.admin_token);
     }
 }

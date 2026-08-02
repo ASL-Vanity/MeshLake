@@ -1,12 +1,14 @@
 //! Platform state-file protection shared by the agent and controller.
 //!
-//! Windows stores serialized state inside a machine-bound DPAPI envelope so
-//! autostarted SYSTEM services and an interactive administrator can use the
-//! same state file. Unix-like systems keep JSON for service portability and
-//! rely on the caller to enforce mode 0600.
+//! Windows stores serialized state inside a machine-bound DPAPI envelope.
+//! Linux can use a versioned XChaCha20-Poly1305 envelope whose master key is
+//! supplied explicitly by systemd credentials or an external restricted file.
 
-#[cfg(windows)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
+};
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -19,9 +21,130 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const ENVELOPE_VERSION: u8 = 1;
+#[cfg_attr(unix, allow(dead_code))]
 const WINDOWS_DPAPI_PROTECTION: &str = "windows-dpapi-local-machine";
+const LINUX_MASTER_KEY_PROTECTION: &str = "linux-xchacha20poly1305-master-key-v1";
+const LINUX_MASTER_KEY_LEN: usize = 32;
+const LINUX_NONCE_LEN: usize = 24;
+#[cfg(unix)]
+const MAX_PROVIDER_KEY_FILE_BYTES: u64 = 64 * 1024;
 pub const AGENT_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake agent state v1";
 pub const CONTROLLER_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake controller state v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateKeyProvider {
+    SystemdCredential(String),
+    RestrictedFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateProtectionLevel {
+    WindowsDpapiLocalMachine,
+    LinuxSystemdCredential,
+    LinuxRestrictedExternalKeyFile,
+    LinuxFilePermissionsOnly,
+}
+
+impl std::fmt::Display for StateProtectionLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::WindowsDpapiLocalMachine => "windows-dpapi-local-machine",
+            Self::LinuxSystemdCredential => "linux-systemd-credential-envelope",
+            Self::LinuxRestrictedExternalKeyFile => "linux-restricted-external-key-envelope",
+            Self::LinuxFilePermissionsOnly => "linux-0600-plaintext-compatibility",
+        })
+    }
+}
+
+pub struct StateProtection {
+    kind: StateProtectionKind,
+    level: StateProtectionLevel,
+}
+
+enum StateProtectionKind {
+    PlatformDefault,
+    #[cfg_attr(windows, allow(dead_code))]
+    LinuxMasterKey(Zeroizing<[u8; LINUX_MASTER_KEY_LEN]>),
+}
+
+impl std::fmt::Debug for StateProtection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StateProtection")
+            .field("level", &self.level)
+            .field("master_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl StateProtection {
+    pub fn platform_default() -> Self {
+        Self {
+            kind: StateProtectionKind::PlatformDefault,
+            level: if cfg!(windows) {
+                StateProtectionLevel::WindowsDpapiLocalMachine
+            } else {
+                StateProtectionLevel::LinuxFilePermissionsOnly
+            },
+        }
+    }
+
+    pub fn from_provider(
+        state_path: &Path,
+        provider: StateKeyProvider,
+    ) -> Result<Self, StateProtectionError> {
+        #[cfg(windows)]
+        {
+            let _ = state_path;
+            let _ = provider;
+            return Err(StateProtectionError::Provider(
+                "Linux state-key providers cannot be used on Windows".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            match provider {
+                StateKeyProvider::SystemdCredential(name) => {
+                    let key = load_systemd_credential(&name)?;
+                    Ok(Self::linux_master_key(
+                        key,
+                        StateProtectionLevel::LinuxSystemdCredential,
+                    ))
+                }
+                StateKeyProvider::RestrictedFile(path) => {
+                    reject_key_beside_state(state_path, &path)?;
+                    let bytes = crate::read_restricted_secret_file(&path).map_err(|error| {
+                        StateProtectionError::Provider(format!(
+                            "cannot read restricted state master-key file: {error}"
+                        ))
+                    })?;
+                    let key = exact_master_key(&bytes)?;
+                    Ok(Self::linux_master_key(
+                        key,
+                        StateProtectionLevel::LinuxRestrictedExternalKeyFile,
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn level(&self) -> StateProtectionLevel {
+        self.level
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    fn linux_master_key(key: [u8; LINUX_MASTER_KEY_LEN], level: StateProtectionLevel) -> Self {
+        Self {
+            kind: StateProtectionKind::LinuxMasterKey(Zeroizing::new(key)),
+            level,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_linux_master_key(key: [u8; LINUX_MASTER_KEY_LEN]) -> Self {
+        Self::linux_master_key(key, StateProtectionLevel::LinuxSystemdCredential)
+    }
+}
 
 /// Process-lifetime exclusive lock for one MeshLake state path.
 ///
@@ -73,6 +196,8 @@ pub struct DecodedState<T> {
 struct ProtectedStateEnvelope {
     format_version: u8,
     protection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce_base64: Option<String>,
     ciphertext_base64: String,
 }
 
@@ -90,6 +215,14 @@ pub enum StateProtectionError {
     SizeLimit,
     #[error("Windows DPAPI operation failed: {0}")]
     Platform(String),
+    #[error("state master-key provider configuration is invalid: {0}")]
+    Provider(String),
+    #[error("protected Linux state requires the configured master-key provider")]
+    MissingMasterKey,
+    #[error("protected state authentication failed")]
+    Authentication,
+    #[error("protected state nonce is missing or invalid")]
+    InvalidNonce,
 }
 
 #[derive(Debug, Error)]
@@ -115,26 +248,47 @@ pub fn encode_protected_state<T: Serialize>(
     value: &T,
     purpose: &[u8],
 ) -> Result<Vec<u8>, StateProtectionError> {
+    encode_protected_state_with(value, purpose, &StateProtection::platform_default())
+}
+
+pub fn encode_protected_state_with<T: Serialize>(
+    value: &T,
+    purpose: &[u8],
+    protection: &StateProtection,
+) -> Result<Vec<u8>, StateProtectionError> {
     let plaintext = Zeroizing::new(serde_json::to_vec_pretty(value)?);
-    encode_platform_state(&plaintext, purpose)
+    encode_platform_state(&plaintext, purpose, protection)
 }
 
 pub fn decode_protected_state<T: DeserializeOwned>(
     bytes: &[u8],
     purpose: &[u8],
 ) -> Result<DecodedState<T>, StateProtectionError> {
-    decode_platform_state(bytes, purpose)
+    decode_protected_state_with(bytes, purpose, &StateProtection::platform_default())
+}
+
+pub fn decode_protected_state_with<T: DeserializeOwned>(
+    bytes: &[u8],
+    purpose: &[u8],
+    protection: &StateProtection,
+) -> Result<DecodedState<T>, StateProtectionError> {
+    decode_platform_state(bytes, purpose, protection)
 }
 
 #[cfg(windows)]
 fn encode_platform_state(
     plaintext: &[u8],
     purpose: &[u8],
+    protection: &StateProtection,
 ) -> Result<Vec<u8>, StateProtectionError> {
+    if let StateProtectionKind::LinuxMasterKey(key) = &protection.kind {
+        return encode_linux_master_key_state(plaintext, purpose, key);
+    }
     let protected = dpapi_protect(plaintext, purpose)?;
     Ok(serde_json::to_vec_pretty(&ProtectedStateEnvelope {
         format_version: ENVELOPE_VERSION,
         protection: WINDOWS_DPAPI_PROTECTION.to_owned(),
+        nonce_base64: None,
         ciphertext_base64: STANDARD.encode(protected),
     })?)
 }
@@ -142,19 +296,34 @@ fn encode_platform_state(
 #[cfg(not(windows))]
 fn encode_platform_state(
     plaintext: &[u8],
-    _purpose: &[u8],
+    purpose: &[u8],
+    protection: &StateProtection,
 ) -> Result<Vec<u8>, StateProtectionError> {
-    Ok(plaintext.to_vec())
+    match &protection.kind {
+        StateProtectionKind::PlatformDefault => Ok(plaintext.to_vec()),
+        StateProtectionKind::LinuxMasterKey(key) => {
+            encode_linux_master_key_state(plaintext, purpose, key)
+        }
+    }
 }
 
 #[cfg(windows)]
 fn decode_platform_state<T: DeserializeOwned>(
     bytes: &[u8],
     purpose: &[u8],
+    protection: &StateProtection,
 ) -> Result<DecodedState<T>, StateProtectionError> {
     if let Ok(envelope) = serde_json::from_slice::<ProtectedStateEnvelope>(bytes) {
-        validate_envelope(&envelope)?;
-        let ciphertext = STANDARD.decode(envelope.ciphertext_base64)?;
+        validate_envelope_version(&envelope)?;
+        if envelope.protection == LINUX_MASTER_KEY_PROTECTION {
+            return decode_linux_master_key_state(envelope, purpose, protection);
+        }
+        if envelope.protection != WINDOWS_DPAPI_PROTECTION {
+            return Err(StateProtectionError::UnsupportedProtection(
+                envelope.protection,
+            ));
+        }
+        let ciphertext = STANDARD.decode(&envelope.ciphertext_base64)?;
         let plaintext = Zeroizing::new(dpapi_unprotect(&ciphertext, purpose)?);
         let value = serde_json::from_slice(&plaintext)?;
         return Ok(DecodedState {
@@ -221,6 +390,15 @@ pub fn write_protected_state_file<T: Serialize>(
     value: &T,
     purpose: &[u8],
 ) -> Result<(), StateFileError> {
+    write_protected_state_file_with(path, value, purpose, &StateProtection::platform_default())
+}
+
+pub fn write_protected_state_file_with<T: Serialize>(
+    path: &Path,
+    value: &T,
+    purpose: &[u8],
+    protection: &StateProtection,
+) -> Result<(), StateFileError> {
     let parent = state_parent(path);
     fs::create_dir_all(parent)
         .map_err(|source| state_io_error("create state directory", parent, source))?;
@@ -232,7 +410,7 @@ pub fn write_protected_state_file<T: Serialize>(
             .open(&temporary)
             .map_err(|source| state_io_error("create temporary state", &temporary, source))?;
         restrict_state_file_permissions(&temporary)?;
-        let encoded = Zeroizing::new(encode_protected_state(value, purpose)?);
+        let encoded = Zeroizing::new(encode_protected_state_with(value, purpose, protection)?);
         file.write_all(&encoded)
             .map_err(|source| state_io_error("write temporary state", &temporary, source))?;
         file.sync_all()
@@ -416,32 +594,218 @@ fn sync_state_parent(_: &Path) -> Result<(), StateFileError> {
 #[cfg(not(windows))]
 fn decode_platform_state<T: DeserializeOwned>(
     bytes: &[u8],
-    _purpose: &[u8],
+    purpose: &[u8],
+    protection: &StateProtection,
 ) -> Result<DecodedState<T>, StateProtectionError> {
     if let Ok(envelope) = serde_json::from_slice::<ProtectedStateEnvelope>(bytes) {
-        validate_envelope(&envelope)?;
+        validate_envelope_version(&envelope)?;
+        if envelope.protection == LINUX_MASTER_KEY_PROTECTION {
+            return decode_linux_master_key_state(envelope, purpose, protection);
+        }
         return Err(StateProtectionError::UnsupportedProtection(
             envelope.protection,
         ));
     }
     Ok(DecodedState {
         value: serde_json::from_slice(bytes)?,
-        needs_protection_upgrade: false,
+        needs_protection_upgrade: matches!(
+            &protection.kind,
+            StateProtectionKind::LinuxMasterKey(_)
+        ),
     })
 }
 
-fn validate_envelope(envelope: &ProtectedStateEnvelope) -> Result<(), StateProtectionError> {
+fn validate_envelope_version(
+    envelope: &ProtectedStateEnvelope,
+) -> Result<(), StateProtectionError> {
     if envelope.format_version != ENVELOPE_VERSION {
         return Err(StateProtectionError::UnsupportedVersion(
             envelope.format_version,
         ));
     }
-    if envelope.protection != WINDOWS_DPAPI_PROTECTION {
-        return Err(StateProtectionError::UnsupportedProtection(
-            envelope.protection.clone(),
+    Ok(())
+}
+
+fn encode_linux_master_key_state(
+    plaintext: &[u8],
+    purpose: &[u8],
+    key: &[u8; LINUX_MASTER_KEY_LEN],
+) -> Result<Vec<u8>, StateProtectionError> {
+    let mut nonce = [0_u8; LINUX_NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot generate state nonce: {error:?}"))
+    })?;
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let associated_data = state_associated_data(purpose);
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &associated_data,
+            },
+        )
+        .map_err(|_| StateProtectionError::Authentication)?;
+    Ok(serde_json::to_vec_pretty(&ProtectedStateEnvelope {
+        format_version: ENVELOPE_VERSION,
+        protection: LINUX_MASTER_KEY_PROTECTION.into(),
+        nonce_base64: Some(STANDARD.encode(nonce)),
+        ciphertext_base64: STANDARD.encode(ciphertext),
+    })?)
+}
+
+fn decode_linux_master_key_state<T: DeserializeOwned>(
+    envelope: ProtectedStateEnvelope,
+    purpose: &[u8],
+    protection: &StateProtection,
+) -> Result<DecodedState<T>, StateProtectionError> {
+    let StateProtectionKind::LinuxMasterKey(key) = &protection.kind else {
+        return Err(StateProtectionError::MissingMasterKey);
+    };
+    let nonce = envelope
+        .nonce_base64
+        .as_deref()
+        .ok_or(StateProtectionError::InvalidNonce)
+        .and_then(|value| STANDARD.decode(value).map_err(StateProtectionError::Base64))?;
+    let nonce: [u8; LINUX_NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| StateProtectionError::InvalidNonce)?;
+    let ciphertext = STANDARD.decode(envelope.ciphertext_base64)?;
+    let associated_data = state_associated_data(purpose);
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: &associated_data,
+                },
+            )
+            .map_err(|_| StateProtectionError::Authentication)?,
+    );
+    Ok(DecodedState {
+        value: serde_json::from_slice(&plaintext)?,
+        needs_protection_upgrade: false,
+    })
+}
+
+fn state_associated_data(purpose: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(64 + purpose.len());
+    data.extend_from_slice(b"MeshLake protected state envelope\0");
+    data.push(ENVELOPE_VERSION);
+    data.extend_from_slice(LINUX_MASTER_KEY_PROTECTION.as_bytes());
+    data.push(0);
+    data.extend_from_slice(&(purpose.len() as u64).to_le_bytes());
+    data.extend_from_slice(purpose);
+    data
+}
+
+#[cfg(unix)]
+fn load_systemd_credential(name: &str) -> Result<[u8; LINUX_MASTER_KEY_LEN], StateProtectionError> {
+    let directory = std::env::var_os("CREDENTIALS_DIRECTORY").ok_or_else(|| {
+        StateProtectionError::Provider(
+            "CREDENTIALS_DIRECTORY is not set for the requested systemd credential".into(),
+        )
+    })?;
+    let directory = PathBuf::from(directory);
+    if !directory.is_absolute() {
+        return Err(StateProtectionError::Provider(
+            "CREDENTIALS_DIRECTORY must be an absolute path".into(),
+        ));
+    }
+    load_systemd_credential_from_directory(name, &directory)
+}
+
+#[cfg(unix)]
+fn load_systemd_credential_from_directory(
+    name: &str,
+    directory: &Path,
+) -> Result<[u8; LINUX_MASTER_KEY_LEN], StateProtectionError> {
+    let component = Path::new(name);
+    if name.is_empty()
+        || component.components().count() != 1
+        || !matches!(
+            component.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(StateProtectionError::Provider(
+            "systemd credential name must be one plain file name".into(),
+        ));
+    }
+    let bytes = read_provider_key_file(&directory.join(name))?;
+    exact_master_key(&bytes)
+}
+
+#[cfg(unix)]
+fn read_provider_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, StateProtectionError> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot inspect state master-key source: {error}"))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(StateProtectionError::Provider(
+            "state master-key source is not a regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_PROVIDER_KEY_FILE_BYTES {
+        return Err(StateProtectionError::Provider(
+            "state master-key source exceeds 64 KiB".into(),
+        ));
+    }
+    let file = File::open(path).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot open state master-key source: {error}"))
+    })?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(MAX_PROVIDER_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            StateProtectionError::Provider(format!("cannot read state master-key source: {error}"))
+        })?;
+    if bytes.len() as u64 > MAX_PROVIDER_KEY_FILE_BYTES {
+        return Err(StateProtectionError::Provider(
+            "state master-key source exceeds 64 KiB".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn exact_master_key(bytes: &[u8]) -> Result<[u8; LINUX_MASTER_KEY_LEN], StateProtectionError> {
+    bytes.try_into().map_err(|_| {
+        StateProtectionError::Provider(
+            "state master-key source must contain exactly 32 raw bytes".into(),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn reject_key_beside_state(state_path: &Path, key_path: &Path) -> Result<(), StateProtectionError> {
+    let state_parent = absolute_parent(state_path)?;
+    let key_parent = key_path.parent().unwrap_or_else(|| Path::new("."));
+    let key_parent = fs::canonicalize(key_parent).map_err(|error| {
+        StateProtectionError::Provider(format!(
+            "cannot resolve state master-key parent directory: {error}"
+        ))
+    })?;
+    if state_parent == key_parent {
+        return Err(StateProtectionError::Provider(
+            "restricted state master-key file must not be stored beside the state file".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn absolute_parent(path: &Path) -> Result<PathBuf, StateProtectionError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot create state directory: {error}"))
+    })?;
+    fs::canonicalize(parent).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot resolve state directory: {error}"))
+    })
 }
 
 #[cfg(windows)]
@@ -579,6 +943,7 @@ mod tests {
         let wrong_version = serde_json::to_vec(&ProtectedStateEnvelope {
             format_version: ENVELOPE_VERSION + 1,
             protection: WINDOWS_DPAPI_PROTECTION.into(),
+            nonce_base64: None,
             ciphertext_base64: "AA==".into(),
         })
         .unwrap();
@@ -590,6 +955,7 @@ mod tests {
         let wrong_protection = serde_json::to_vec(&ProtectedStateEnvelope {
             format_version: ENVELOPE_VERSION,
             protection: "unknown-protection".into(),
+            nonce_base64: None,
             ciphertext_base64: "AA==".into(),
         })
         .unwrap();
@@ -597,6 +963,140 @@ mod tests {
             decode_protected_state::<ExampleState>(&wrong_protection, b"purpose"),
             Err(StateProtectionError::UnsupportedProtection(_))
         ));
+    }
+
+    #[test]
+    fn linux_master_key_envelope_migrates_plaintext_and_fails_closed() {
+        let state = ExampleState {
+            secret: "linux-provider-secret".into(),
+        };
+        let protection = StateProtection::test_linux_master_key([7; 32]);
+        let plaintext = serde_json::to_vec_pretty(&state).unwrap();
+        let legacy: DecodedState<ExampleState> =
+            decode_protected_state_with(&plaintext, b"purpose", &protection).unwrap();
+        assert_eq!(legacy.value, state);
+        assert!(legacy.needs_protection_upgrade);
+
+        let encoded = encode_protected_state_with(&state, b"purpose", &protection).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains(&state.secret));
+        let decoded: DecodedState<ExampleState> =
+            decode_protected_state_with(&encoded, b"purpose", &protection).unwrap();
+        assert_eq!(decoded.value, state);
+        assert!(!decoded.needs_protection_upgrade);
+
+        assert!(matches!(
+            decode_protected_state_with::<ExampleState>(
+                &encoded,
+                b"purpose",
+                &StateProtection::platform_default()
+            ),
+            Err(StateProtectionError::MissingMasterKey)
+        ));
+        let wrong_key = StateProtection::test_linux_master_key([8; 32]);
+        assert!(matches!(
+            decode_protected_state_with::<ExampleState>(&encoded, b"purpose", &wrong_key),
+            Err(StateProtectionError::Authentication)
+        ));
+        assert!(matches!(
+            decode_protected_state_with::<ExampleState>(&encoded, b"different", &protection),
+            Err(StateProtectionError::Authentication)
+        ));
+    }
+
+    #[test]
+    fn state_protection_debug_never_contains_the_master_key() {
+        let protection = StateProtection::test_linux_master_key([0x41; 32]);
+        let rendered = format!("{protection:?}");
+        assert!(!rendered.contains("AAAAAAAA"));
+        assert!(rendered.contains("REDACTED"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_linux_provider_configuration_without_fallback() {
+        let error = StateProtection::from_provider(
+            Path::new("controller.json"),
+            StateKeyProvider::RestrictedFile(PathBuf::from("state.key")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be used on Windows"));
+        assert_eq!(
+            StateProtection::platform_default().level(),
+            StateProtectionLevel::WindowsDpapiLocalMachine
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_restricted_file_provider_enforces_location_permissions_and_size() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-linux-state-provider-{}", Uuid::new_v4()));
+        let state_directory = directory.join("state");
+        let key_directory = directory.join("credentials");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::create_dir_all(&key_directory).unwrap();
+        let state_path = state_directory.join("agent.json");
+        let key_path = key_directory.join("state.key");
+        crate::create_restricted_secret_file(&key_path, &[7; 32]).unwrap();
+
+        let protection = StateProtection::from_provider(
+            &state_path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            protection.level(),
+            StateProtectionLevel::LinuxRestrictedExternalKeyFile
+        );
+
+        let beside = state_directory.join("state.key");
+        crate::create_restricted_secret_file(&beside, &[8; 32]).unwrap();
+        assert!(StateProtection::from_provider(
+            &state_path,
+            StateKeyProvider::RestrictedFile(beside)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must not be stored beside"));
+
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(StateProtection::from_provider(
+            &state_path,
+            StateKeyProvider::RestrictedFile(key_path.clone())
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("permissions are not restricted"));
+
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&key_path, [9; 31]).unwrap();
+        assert!(StateProtection::from_provider(
+            &state_path,
+            StateKeyProvider::RestrictedFile(key_path)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exactly 32 raw bytes"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_credential_provider_validates_name_and_reads_raw_key() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-systemd-credential-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("meshlake-state-key"), [5; 32]).unwrap();
+        assert_eq!(
+            load_systemd_credential_from_directory("meshlake-state-key", &directory).unwrap(),
+            [5; 32]
+        );
+        assert!(load_systemd_credential_from_directory("../state-key", &directory).is_err());
+        assert!(load_systemd_credential_from_directory("missing", &directory).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -693,6 +1193,7 @@ mod tests {
         let encoded = serde_json::to_vec(&ProtectedStateEnvelope {
             format_version: ENVELOPE_VERSION,
             protection: WINDOWS_DPAPI_PROTECTION.into(),
+            nonce_base64: None,
             ciphertext_base64: "AA==".into(),
         })
         .unwrap();

@@ -57,8 +57,10 @@ pub use state_backup::{
     StateBackupError, StateBackupKind,
 };
 pub use state_protection::{
-    cleanup_stale_state_backup, decode_protected_state, encode_protected_state,
-    recover_protected_state_file, restrict_state_file_permissions, write_protected_state_file,
-    DecodedState, StateFileError, StateFileLock, StateProtectionError,
-    AGENT_STATE_PROTECTION_PURPOSE, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    cleanup_stale_state_backup, decode_protected_state, decode_protected_state_with,
+    encode_protected_state, encode_protected_state_with, recover_protected_state_file,
+    restrict_state_file_permissions, write_protected_state_file, write_protected_state_file_with,
+    DecodedState, StateFileError, StateFileLock, StateKeyProvider, StateProtection,
+    StateProtectionError, StateProtectionLevel, AGENT_STATE_PROTECTION_PURPOSE,
+    CONTROLLER_STATE_PROTECTION_PURPOSE,
 };

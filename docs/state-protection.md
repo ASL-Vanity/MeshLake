@@ -17,9 +17,30 @@ Windows 上的 `meshlaked` 和 `meshlake-controller` 会先把完整状态序列
 
 ## Linux
 
-Linux 状态保持 JSON，以便 systemd 服务和管理员进行受控迁移。程序在读取任何既有状态前，以及每次创建临时文件和完成替换后，都会把权限收紧为 `0600`。这意味着只有文件所有者可以读写；从旧版本复制来的 `0644` 文件也会在启动时自动修正。
+Linux 支持版本化 XChaCha20-Poly1305 状态信封。主密钥必须是 32 字节原始随机数据，并通过以下一种显式 provider 提供：
 
-Linux 当前尚未接入 Secret Service、kernel keyring、TPM sealed storage 或管理员提供的主密钥，因此拥有 root 权限或能够读取状态文件的攻击者仍可取得其中的秘密。
+- `--state-key-systemd-credential <NAME>`：从 systemd 设置的 `$CREDENTIALS_DIRECTORY/<NAME>` 读取，适合 headless system service。
+- `--state-key-file <PATH>`：从权限不宽于 `0600` 的外部受限文件读取。该文件不得与状态文件位于同一目录，避免把明文 key 和密文作为同一份状态一起复制或泄露。
+
+systemd unit 可使用：
+
+```ini
+[Service]
+LoadCredential=meshlake-state-key:/etc/meshlake-secrets/state.key
+ExecStart=/usr/local/bin/meshlaked --state-file /var/lib/meshlake/agent.json --state-key-systemd-credential meshlake-state-key run
+```
+
+配置 provider 后，既有阶段 2 明文 JSON 会在完整解码和 schema 校验后原子迁移为加密信封。缺少 credential、文件权限过宽、key 长度错误、key 文件与状态同目录、错误 key、密文篡改或未知信封版本都会失败关闭；不会静默退回明文。
+
+未配置 provider 时保留 `0600` 明文兼容模式，以便现有部署显式迁移。程序启动会输出当前等级：
+
+- `linux-systemd-credential-envelope`
+- `linux-restricted-external-key-envelope`
+- `linux-0600-plaintext-compatibility`
+
+兼容模式只依赖文件权限，不等同于静态加密。程序在读取任何既有状态前，以及每次创建临时文件和完成替换后，都会把权限收紧为 `0600`；从旧版本复制来的 `0644` 状态文件也会被修正。
+
+当前 provider 边界不包含 TPM2 sealed key 或桌面 Secret Service。systemd credential 和外部受限 key file 都会在进程内存中短暂持有主密钥；拥有 root 权限或能够读取 provider 来源及进程内存的攻击者仍属于受信任边界之外的高权限威胁。
 
 ## 独占锁、原子写入与恢复
 

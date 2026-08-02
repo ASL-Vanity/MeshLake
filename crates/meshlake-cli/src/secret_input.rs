@@ -48,7 +48,7 @@ impl SecretInput {
         let mut value = match self {
             Self::DeprecatedArg(value) => {
                 eprintln!(
-                    "WARNING: passing {description} in argv is deprecated; use the corresponding --*-prompt, --*-stdin, or --*-file option"
+                    "WARNING: passing {description} in argv is deprecated and will be removed in MeshLake 0.2; use the corresponding --*-prompt, --*-stdin, or --*-file option"
                 );
                 value
             }
