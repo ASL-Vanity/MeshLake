@@ -17,7 +17,8 @@ contains:
 - `path`: `unknown`, `direct`, or `relay`
 - `age_ms`
 - bounded queue depth/capacity/drop counters
-- handshake, encrypted-send, authenticated-receive and rejected-receive counts
+- handshake, successful encrypted-send, authenticated-receive and
+  rejected-receive counts
 
 It never returns session keys, network PSKs, private identity material, raw
 handshake packets, endpoints, packet payloads, plaintext, or ciphertext.

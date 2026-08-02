@@ -56,6 +56,8 @@ pub struct SessionQueueCounters {
 pub struct SessionSecurityCounters {
     pub handshake_attempts: u64,
     pub handshake_retries: u64,
+    /// Pairwise-encrypted data packets accepted by the local UDP transport.
+    /// Sealed packets whose `send_to` fails are not counted.
     pub encrypted_packets_sent: u64,
     pub authenticated_packets_received: u64,
     pub rejected_packets_received: u64,

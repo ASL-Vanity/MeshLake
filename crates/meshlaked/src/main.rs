@@ -2442,6 +2442,7 @@ enum PeerSessionState {
         dropped_packets: u64,
         handshake_attempts: u64,
         handshake_retries: u64,
+        encrypted_packets_sent: u64,
         authenticated_packets_received: u64,
         rejected_packets_received: u64,
     },
@@ -2506,6 +2507,21 @@ impl PeerSessionState {
         }
     }
 
+    fn record_encrypted_send_results(&mut self, results: impl IntoIterator<Item = bool>) {
+        let Self::Established {
+            encrypted_packets_sent,
+            ..
+        } = self
+        else {
+            return;
+        };
+        for sent in results {
+            if sent {
+                *encrypted_packets_sent = encrypted_packets_sent.saturating_add(1);
+            }
+        }
+    }
+
     fn telemetry(&self) -> SessionTelemetry {
         match self {
             Self::Pending {
@@ -2534,12 +2550,12 @@ impl PeerSessionState {
                 },
             },
             Self::Established {
-                next_sequence,
                 established_at,
                 path,
                 dropped_packets,
                 handshake_attempts,
                 handshake_retries,
+                encrypted_packets_sent,
                 authenticated_packets_received,
                 rejected_packets_received,
                 ..
@@ -2555,7 +2571,7 @@ impl PeerSessionState {
                 security: SessionSecurityCounters {
                     handshake_attempts: *handshake_attempts,
                     handshake_retries: *handshake_retries,
-                    encrypted_packets_sent: *next_sequence,
+                    encrypted_packets_sent: *encrypted_packets_sent,
                     authenticated_packets_received: *authenticated_packets_received,
                     rejected_packets_received: *rejected_packets_received,
                 },
@@ -2578,6 +2594,28 @@ fn publish_session(
 enum PreparedPeerPacket {
     Handshake(Vec<u8>),
     Data(Vec<u8>),
+}
+
+fn seal_queued_packets(
+    keys: &PairwiseSessionKeys,
+    network_id: NetworkId,
+    local_device: DeviceId,
+    peer_device: DeviceId,
+    queued_packets: VecDeque<Vec<u8>>,
+) -> Result<(u64, Vec<Vec<u8>>)> {
+    let mut next_sequence = 0_u64;
+    let mut encrypted = Vec::with_capacity(queued_packets.len());
+    for queued in queued_packets {
+        encrypted.push(keys.seal(
+            network_id,
+            local_device,
+            peer_device,
+            next_sequence,
+            &queued,
+        )?);
+        next_sequence += 1;
+    }
+    Ok((next_sequence, encrypted))
 }
 
 fn prepare_outbound_peer_packet(
@@ -3229,6 +3267,7 @@ async fn run_relay_worker(
                         )? else {
                             continue;
                         };
+                        let is_encrypted_data = matches!(&prepared, PreparedPeerPacket::Data(_));
                         let (outbound, description) = match prepared {
                             PreparedPeerPacket::Handshake(packet) => (packet, "session handshake"),
                             PreparedPeerPacket::Data(packet) => (packet, "pairwise-encrypted packet"),
@@ -3249,6 +3288,9 @@ async fn run_relay_worker(
                             (selected_path, sessions.get_mut(&key))
                         {
                             session.set_path(path);
+                            if is_encrypted_data {
+                                session.record_encrypted_send_results([true]);
+                            }
                         }
                         if let Some(session) = sessions.get(&key) {
                             publish_session(&agent, configuration_revision, key, session);
@@ -3754,12 +3796,8 @@ async fn receive_session_init(
         ));
         return Ok(());
     }
-    let mut next_sequence = 0_u64;
-    let mut queued_encrypted = Vec::new();
-    for queued in queued_packets {
-        queued_encrypted.push(keys.seal(network_id, device_id, source, next_sequence, &queued)?);
-        next_sequence += 1;
-    }
+    let (next_sequence, queued_encrypted) =
+        seal_queued_packets(&keys, network_id, device_id, source, queued_packets)?;
     sessions.insert(
         peer_key,
         PeerSessionState::Established {
@@ -3777,16 +3815,19 @@ async fn receive_session_init(
             dropped_packets,
             handshake_attempts,
             handshake_retries,
+            encrypted_packets_sent: 0,
             authenticated_packets_received: 0,
             rejected_packets_received: rejected_packets,
         },
     );
-    if let Some(session) = sessions.get(&peer_key) {
-        publish_session(agent, configuration_revision, peer_key, session);
-    }
     sockets.send_to(&response, remote).await;
+    let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
     for encrypted in queued_encrypted {
-        sockets.send_to(&encrypted, remote).await;
+        queued_send_results.push(sockets.send_to(&encrypted, remote).await);
+    }
+    if let Some(session) = sessions.get_mut(&peer_key) {
+        session.record_encrypted_send_results(queued_send_results);
+        publish_session(agent, configuration_revision, peer_key, session);
     }
     trace_transport(format!(
         "accepted pairwise session {} from member {} via {}",
@@ -3881,12 +3922,8 @@ async fn receive_session_response(
         return Ok(());
     };
     let session_id = keys.session_id();
-    let mut next_sequence = 0_u64;
-    let mut queued_encrypted = Vec::new();
-    for queued in queued_packets {
-        queued_encrypted.push(keys.seal(network_id, device_id, source, next_sequence, &queued)?);
-        next_sequence += 1;
-    }
+    let (next_sequence, queued_encrypted) =
+        seal_queued_packets(&keys, network_id, device_id, source, queued_packets)?;
     sessions.insert(
         peer_key,
         PeerSessionState::Established {
@@ -3904,15 +3941,18 @@ async fn receive_session_response(
             dropped_packets,
             handshake_attempts,
             handshake_retries,
+            encrypted_packets_sent: 0,
             authenticated_packets_received: 0,
             rejected_packets_received: rejected_packets,
         },
     );
-    if let Some(session) = sessions.get(&peer_key) {
-        publish_session(agent, configuration_revision, peer_key, session);
-    }
+    let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
     for encrypted in queued_encrypted {
-        sockets.send_to(&encrypted, remote).await;
+        queued_send_results.push(sockets.send_to(&encrypted, remote).await);
+    }
+    if let Some(session) = sessions.get_mut(&peer_key) {
+        session.record_encrypted_send_results(queued_send_results);
+        publish_session(agent, configuration_revision, peer_key, session);
     }
     trace_transport(format!(
         "completed pairwise session {} with member {}",
@@ -4610,6 +4650,57 @@ mod tests {
         }
     }
 
+    fn test_established_session(
+        network: &JoinedNetwork,
+        local_device: DeviceId,
+        peer_device: DeviceId,
+        local_identity: &SigningKey,
+        peer_identity: &SigningKey,
+    ) -> PeerSessionState {
+        let network_key = NetworkKey::from_slice(&network.network_key).unwrap();
+        let (handshake, init_packet) = InitiatorHandshake::start(
+            network.network.id,
+            local_device,
+            peer_device,
+            local_identity,
+            now(),
+        )
+        .unwrap();
+        let (_, response) = accept_pairwise_handshake(
+            &init_packet,
+            &local_identity.verifying_key().to_bytes(),
+            peer_identity,
+            &network_key,
+            now(),
+            HANDSHAKE_CLOCK_SKEW_SECONDS,
+        )
+        .unwrap();
+        let keys = handshake
+            .complete(
+                &response,
+                &peer_identity.verifying_key().to_bytes(),
+                &network_key,
+                now(),
+                HANDSHAKE_CLOCK_SKEW_SECONDS,
+            )
+            .unwrap();
+        PeerSessionState::Established {
+            keys,
+            peer_public_key: peer_identity.verifying_key().to_bytes().to_vec(),
+            next_sequence: 0,
+            replay_window: ReplayWindow::default(),
+            established_at: Instant::now(),
+            cached_response: None,
+            path: SessionPath::Unknown,
+            dropped_packets: 0,
+            handshake_attempts: 1,
+            handshake_retries: 0,
+            encrypted_packets_sent: 0,
+            authenticated_packets_received: 0,
+            rejected_packets_received: 0,
+        }
+    }
+
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
         let mut packet = vec![0_u8; 20];
         packet[0] = 0x45;
@@ -5029,6 +5120,104 @@ mod tests {
         };
         assert_eq!(queued_packets.len(), 8);
         assert_eq!(queued_packets.front(), Some(&first_packet));
+    }
+
+    #[test]
+    fn established_send_counter_requires_a_successful_transport_send() {
+        let network = test_joined_network();
+        let local_device = DeviceId(Uuid::from_u128(231));
+        let peer_device = DeviceId(Uuid::from_u128(232));
+        let local_identity = SigningKey::from_bytes(&[31_u8; 32]);
+        let peer_identity = SigningKey::from_bytes(&[32_u8; 32]);
+        let mut sessions = HashMap::from([(
+            (network.network.id, peer_device),
+            test_established_session(
+                &network,
+                local_device,
+                peer_device,
+                &local_identity,
+                &peer_identity,
+            ),
+        )]);
+
+        assert!(matches!(
+            prepare_outbound_peer_packet(
+                &mut sessions,
+                &network,
+                local_device,
+                peer_device,
+                &peer_identity.verifying_key().to_bytes(),
+                &local_identity,
+                &ipv4_packet([100, 64, 90, 1], [100, 64, 90, 2]),
+            )
+            .unwrap(),
+            Some(PreparedPeerPacket::Data(_))
+        ));
+        let session = sessions
+            .get_mut(&(network.network.id, peer_device))
+            .unwrap();
+        let PeerSessionState::Established { next_sequence, .. } = session else {
+            panic!("expected an established session");
+        };
+        assert_eq!(*next_sequence, 1, "sealing must consume the nonce");
+        session.record_encrypted_send_results([false]);
+        assert_eq!(session.telemetry().security.encrypted_packets_sent, 0);
+        session.record_encrypted_send_results([true]);
+        assert_eq!(session.telemetry().security.encrypted_packets_sent, 1);
+        let PeerSessionState::Established { next_sequence, .. } = session else {
+            unreachable!();
+        };
+        assert_eq!(*next_sequence, 1, "send results must not reuse a nonce");
+    }
+
+    #[test]
+    fn handshake_queue_counts_only_successfully_sent_encrypted_packets() {
+        let network = test_joined_network();
+        let local_device = DeviceId(Uuid::from_u128(241));
+        let peer_device = DeviceId(Uuid::from_u128(242));
+        let local_identity = SigningKey::from_bytes(&[41_u8; 32]);
+        let peer_identity = SigningKey::from_bytes(&[42_u8; 32]);
+        let mut session = test_established_session(
+            &network,
+            local_device,
+            peer_device,
+            &local_identity,
+            &peer_identity,
+        );
+        let PeerSessionState::Established {
+            keys,
+            next_sequence,
+            ..
+        } = &mut session
+        else {
+            panic!("expected an established session");
+        };
+        let queued_packets = VecDeque::from([
+            ipv4_packet([100, 64, 90, 1], [100, 64, 90, 2]),
+            ipv4_packet([100, 64, 90, 1], [100, 64, 90, 3]),
+            ipv4_packet([100, 64, 90, 1], [100, 64, 90, 4]),
+        ]);
+        let (consumed_sequences, encrypted) = seal_queued_packets(
+            keys,
+            network.network.id,
+            local_device,
+            peer_device,
+            queued_packets,
+        )
+        .unwrap();
+        *next_sequence = consumed_sequences;
+
+        assert_eq!(encrypted.len(), 3);
+        assert_eq!(*next_sequence, 3, "all sealed packets consume nonces");
+        session.record_encrypted_send_results([true, false, true]);
+        assert_eq!(session.telemetry().security.encrypted_packets_sent, 2);
+        let PeerSessionState::Established { next_sequence, .. } = session else {
+            unreachable!();
+        };
+        assert_eq!(
+            next_sequence, 3,
+            "failed sends must not roll nonce state back"
+        );
     }
 
     #[test]
