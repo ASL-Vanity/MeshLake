@@ -1,6 +1,7 @@
 mod adapter;
 mod data_plane;
 mod port_mapping;
+mod transport_health;
 mod upnp;
 
 use anyhow::{Context, Result};
@@ -47,6 +48,7 @@ use tokio::{
     net::UdpSocket,
     sync::{Notify, RwLock},
 };
+use transport_health::{select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
 
 const LOCAL_API: &str = "127.0.0.1:51821";
@@ -267,8 +269,7 @@ impl TransportConfiguration {
 
 #[derive(Default)]
 struct TransportHealth {
-    relay_acknowledgements: HashMap<SocketAddr, Instant>,
-    root_responses: HashMap<SocketAddr, Instant>,
+    endpoints: EndpointHealthTable,
     peer_paths: Vec<PeerPathStatus>,
 }
 
@@ -363,22 +364,13 @@ impl Agent {
         drop(state);
         let health = self.transport_health.read().await;
         let peer_paths = health.peer_paths.clone();
-        let mut responsive_roots = health
-            .root_responses
-            .iter()
-            .filter_map(|(endpoint, seen)| {
-                (seen.elapsed() < Duration::from_secs(90)).then_some(*endpoint)
-            })
-            .collect::<Vec<_>>();
+        let health_time = Instant::now();
+        let mut responsive_roots = health.endpoints.responsive_root_endpoints(health_time);
         responsive_roots.sort_unstable();
-        let mut healthy_relays = health
-            .relay_acknowledgements
-            .iter()
-            .filter_map(|(endpoint, seen)| {
-                (seen.elapsed() < Duration::from_secs(45)).then_some(*endpoint)
-            })
-            .collect::<Vec<_>>();
+        responsive_roots.dedup();
+        let mut healthy_relays = health.endpoints.healthy_relay_endpoints(health_time);
         healthy_relays.sort_unstable();
+        healthy_relays.dedup();
         AgentStatus {
             device_id,
             identity_public_key,
@@ -395,20 +387,20 @@ impl Agent {
         }
     }
 
-    async fn mark_relay_acknowledged(&self, endpoint: SocketAddr) {
+    async fn mark_relay_acknowledged(&self, network_id: NetworkId, endpoint: SocketAddr) {
         self.transport_health
             .write()
             .await
-            .relay_acknowledgements
-            .insert(endpoint, Instant::now());
+            .endpoints
+            .mark_relay_acknowledged(network_id, endpoint, Instant::now());
     }
 
-    async fn mark_root_responsive(&self, endpoint: SocketAddr) {
+    async fn mark_root_responsive(&self, network_id: NetworkId, endpoint: SocketAddr) {
         self.transport_health
             .write()
             .await
-            .root_responses
-            .insert(endpoint, Instant::now());
+            .endpoints
+            .mark_root_responsive(network_id, endpoint, Instant::now());
     }
 
     async fn update_peer_paths(&self, peers: &HashMap<PeerKey, PeerRoute>, now: Instant) {
@@ -2227,7 +2219,7 @@ fn prepare_outbound_peer_packet(
 async fn send_peer_routed_packet(
     sockets: &TransportSockets,
     relay_endpoints: &[SocketAddr],
-    relay_health: &HashMap<SocketAddr, RelayHealth>,
+    endpoint_health: &EndpointHealthTable,
     network: &JoinedNetwork,
     route: &PeerRoute,
     target_device: DeviceId,
@@ -2248,7 +2240,12 @@ async fn send_peer_routed_packet(
     if matches!(network.network.relay_policy, RelayPolicy::Disabled) {
         return false;
     }
-    let Some(relay_endpoint) = select_relay_endpoint(relay_endpoints, relay_health) else {
+    let Some(relay_endpoint) = select_relay_endpoint(
+        network.network.id,
+        relay_endpoints,
+        endpoint_health,
+        Instant::now(),
+    ) else {
         return false;
     };
     if sockets.send_to(packet, relay_endpoint).await {
@@ -2268,14 +2265,10 @@ struct StunTransaction {
 }
 
 struct RootTransaction {
+    network_id: NetworkId,
     endpoint: SocketAddr,
     public_key: Vec<u8>,
     issued_at: Instant,
-}
-
-#[derive(Default)]
-struct RelayHealth {
-    last_acknowledged: Option<Instant>,
 }
 
 struct TransportSockets {
@@ -2415,11 +2408,7 @@ async fn run_relay_worker(
     let mut seen_handshakes = HashMap::<(PeerKey, [u8; 16]), Instant>::new();
     let mut stun_transactions = HashMap::<[u8; 12], StunTransaction>::new();
     let mut root_transactions = HashMap::<[u8; 16], RootTransaction>::new();
-    let mut relay_health = relay_endpoints
-        .iter()
-        .copied()
-        .map(|endpoint| (endpoint, RelayHealth::default()))
-        .collect::<HashMap<_, _>>();
+    let mut endpoint_health = EndpointHealthTable::default();
     let mut incoming_ipv4 = vec![0_u8; u16::MAX as usize];
     let mut incoming_ipv6 = vec![0_u8; u16::MAX as usize];
     let mut tick = tokio::time::interval(Duration::from_millis(5));
@@ -2447,7 +2436,7 @@ async fn run_relay_worker(
                     &mut stun_transactions,
                     &mut root_transactions,
                     &mut advertised_candidates,
-                    &mut relay_health,
+                    &mut endpoint_health,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -2465,7 +2454,7 @@ async fn run_relay_worker(
                     &mut stun_transactions,
                     &mut root_transactions,
                     &mut advertised_candidates,
-                    &mut relay_health,
+                    &mut endpoint_health,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -2549,7 +2538,7 @@ async fn run_relay_worker(
                         send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network_id),
-                            &relay_health,
+                            &endpoint_health,
                             network,
                             route,
                             target_device,
@@ -2636,6 +2625,7 @@ async fn run_relay_worker(
                                     root_transactions.insert(
                                         nonce,
                                         RootTransaction {
+                                            network_id: certificate.claims.network_id,
                                             endpoint: root_endpoint,
                                             public_key: root.public_key.clone(),
                                             issued_at: Instant::now(),
@@ -2703,7 +2693,7 @@ async fn run_relay_worker(
                         send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network.network.id),
-                            &relay_health,
+                            &endpoint_health,
                             network,
                             &route,
                             target_device,
@@ -2732,7 +2722,7 @@ async fn receive_udp_packet(
     stun_transactions: &mut HashMap<[u8; 12], StunTransaction>,
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
-    relay_health: &mut HashMap<SocketAddr, RelayHealth>,
+    endpoint_health: &mut EndpointHealthTable,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     let root_servers = configuration.root_servers.as_slice();
@@ -2784,15 +2774,20 @@ async fn receive_udp_packet(
             let Some((network, device)) = parse_registration_ack(packet) else {
                 return Ok(());
             };
+            if !configuration.relay_endpoints_for(network).contains(&remote) {
+                return Ok(());
+            }
             let (self_id, networks) = agent.relay_snapshot().await;
             if device != self_id || !networks.iter().any(|entry| entry.network.id == network) {
                 return Ok(());
             }
-            if let Some(health) = relay_health.get_mut(&remote) {
-                health.last_acknowledged = Some(Instant::now());
-                agent.mark_relay_acknowledged(remote).await;
-                trace_transport(format!("relay {remote} registration acknowledged"));
-            }
+            let acknowledged = Instant::now();
+            endpoint_health.mark_relay_acknowledged(network, remote, acknowledged);
+            agent.mark_relay_acknowledged(network, remote).await;
+            trace_transport(format!(
+                "relay {remote} registration acknowledged for network {}",
+                network.0
+            ));
         }
         RELAY_PEER_IDENTITY if relay_endpoints.contains(&remote) => {
             let Some(certificate) = parse_peer_identity(packet) else {
@@ -2957,7 +2952,9 @@ async fn handle_root_response(
             peers: discovered,
             ..
         } => {
-            agent.mark_root_responsive(remote).await;
+            agent
+                .mark_root_responsive(transaction.network_id, remote)
+                .await;
             trace_transport(format!(
                 "authenticated root {remote} observed this node at {observed_endpoint}"
             ));
@@ -3496,22 +3493,6 @@ fn parse_registration_ack(packet: &[u8]) -> Option<(NetworkId, DeviceId)> {
         NetworkId(Uuid::from_slice(&packet[5..21]).ok()?),
         DeviceId(Uuid::from_slice(&packet[21..37]).ok()?),
     ))
-}
-
-fn select_relay_endpoint(
-    configured: &[SocketAddr],
-    health: &HashMap<SocketAddr, RelayHealth>,
-) -> Option<SocketAddr> {
-    configured
-        .iter()
-        .copied()
-        .find(|endpoint| {
-            health
-                .get(endpoint)
-                .and_then(|entry| entry.last_acknowledged)
-                .is_some_and(|acknowledged| acknowledged.elapsed() < Duration::from_secs(45))
-        })
-        .or_else(|| configured.first().copied())
 }
 
 fn parse_peer_announcement(packet: &[u8]) -> Option<(NetworkId, DeviceId, SocketAddr)> {
@@ -4140,22 +4121,6 @@ mod tests {
             session_id,
             started + HANDSHAKE_REPLAY_TTL + Duration::from_secs(1)
         ));
-    }
-
-    #[test]
-    fn relay_selection_uses_priority_then_healthy_failover() {
-        let primary: SocketAddr = "203.0.113.10:51820".parse().unwrap();
-        let secondary: SocketAddr = "203.0.113.11:51820".parse().unwrap();
-        let configured = [primary, secondary];
-        let mut health = HashMap::from([
-            (primary, RelayHealth::default()),
-            (secondary, RelayHealth::default()),
-        ]);
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(primary));
-        health.get_mut(&secondary).unwrap().last_acknowledged = Some(Instant::now());
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(secondary));
-        health.get_mut(&primary).unwrap().last_acknowledged = Some(Instant::now());
-        assert_eq!(select_relay_endpoint(&configured, &health), Some(primary));
     }
 
     #[test]
