@@ -1,6 +1,7 @@
 mod adapter;
 mod data_plane;
 mod port_mapping;
+mod state_backup_command;
 mod transport_health;
 mod upnp;
 
@@ -84,6 +85,11 @@ struct Cli {
 enum Command {
     Run,
     PrintStatePath,
+    /// Export or restore password-protected agent state.
+    State {
+        #[command(subcommand)]
+        command: state_backup_command::StateCommand,
+    },
     Autostart {
         #[command(subcommand)]
         command: AutostartCommand,
@@ -296,38 +302,7 @@ impl Agent {
             write_state(&path, &state)?;
             (state, false)
         };
-        if state.schema_version > AGENT_STATE_SCHEMA_VERSION {
-            anyhow::bail!(
-                "agent state schema {} is newer than supported schema {}",
-                state.schema_version,
-                AGENT_STATE_SCHEMA_VERSION
-            );
-        }
-        if state.identity_secret_key.len() != 32 {
-            if state.schema_version >= AGENT_STATE_SCHEMA_VERSION {
-                anyhow::bail!(
-                    "agent state contains an invalid node identity key; refusing automatic identity rotation"
-                );
-            }
-            let mut identity_secret_key = [0_u8; 32];
-            getrandom::fill(&mut identity_secret_key)
-                .map_err(|error| anyhow::anyhow!("cannot generate node identity: {error:?}"))?;
-            state.identity_secret_key = identity_secret_key.to_vec();
-            state_changed = true;
-        }
-        if state.relay_endpoints.is_empty() {
-            if let Some(endpoint) = state.relay_endpoint {
-                state.relay_endpoints.push(endpoint);
-                state_changed = true;
-            }
-        }
-        if migrate_legacy_network_control_planes(&mut state) {
-            state_changed = true;
-        }
-        if state.schema_version < AGENT_STATE_SCHEMA_VERSION {
-            state.schema_version = AGENT_STATE_SCHEMA_VERSION;
-            state_changed = true;
-        }
+        state_changed |= migrate_and_validate_agent_state(&mut state)?;
         if state_changed {
             write_state(&path, &state)?;
         }
@@ -1572,6 +1547,51 @@ fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
     write_protected_state_file(path, state, AGENT_STATE_PROTECTION_PURPOSE).map_err(Into::into)
 }
 
+fn migrate_and_validate_agent_state(state: &mut PersistedState) -> Result<bool> {
+    if state.schema_version > AGENT_STATE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "agent state schema {} is newer than supported schema {}",
+            state.schema_version,
+            AGENT_STATE_SCHEMA_VERSION
+        );
+    }
+    let mut changed = false;
+    if state.identity_secret_key.len() != 32 {
+        if state.schema_version >= AGENT_STATE_SCHEMA_VERSION {
+            anyhow::bail!(
+                "agent state contains an invalid node identity key; refusing automatic identity rotation"
+            );
+        }
+        let mut identity_secret_key = [0_u8; 32];
+        getrandom::fill(&mut identity_secret_key)
+            .map_err(|error| anyhow::anyhow!("cannot generate node identity: {error:?}"))?;
+        state.identity_secret_key = identity_secret_key.to_vec();
+        changed = true;
+    }
+    for network in &state.networks {
+        if network.network_key.len() != 32 {
+            anyhow::bail!(
+                "agent network {} contains an invalid network key",
+                network.network.id.0
+            );
+        }
+    }
+    if state.relay_endpoints.is_empty() {
+        if let Some(endpoint) = state.relay_endpoint {
+            state.relay_endpoints.push(endpoint);
+            changed = true;
+        }
+    }
+    if migrate_legacy_network_control_planes(state) {
+        changed = true;
+    }
+    if state.schema_version < AGENT_STATE_SCHEMA_VERSION {
+        state.schema_version = AGENT_STATE_SCHEMA_VERSION;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl ApiError {
@@ -1663,6 +1683,7 @@ async fn main() -> Result<()> {
         Some(Command::Autostart { command }) => {
             return manage_autostart(command, &path, &wintun_dll)
         }
+        Some(Command::State { command }) => return state_backup_command::run(command, &path),
         Some(Command::Run) | None => {}
     }
     let agent = Arc::new(Agent::open(path.clone(), wintun_dll.clone())?);

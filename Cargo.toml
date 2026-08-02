@@ -18,6 +18,7 @@ authors = ["MeshLake Contributors"]
 
 [workspace.dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
 axum = "0.8"
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
@@ -33,6 +34,7 @@ igd-next = "0.17"
 libloading = "0.8"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }

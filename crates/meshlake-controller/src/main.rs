@@ -1,6 +1,8 @@
 //! Self-hostable MeshLake membership controller.
 //! It signs authorization documents but never handles virtual-network packets.
 
+mod state_backup_command;
+
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
@@ -9,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
@@ -34,6 +36,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
+
+use state_backup_command::StateCommand as StateBackupCommand;
+
+const CONTROLLER_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +76,17 @@ struct Cli {
     /// Optional STUN server (`host:port`). Repeat for multiple servers.
     #[arg(long = "planet-stun")]
     planet_stun_servers: Vec<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Export or restore password-protected controller state.
+    State {
+        #[command(subcommand)]
+        command: StateBackupCommand,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,7 +194,7 @@ impl Controller {
             })?;
             let admin_token = Uuid::new_v4().to_string();
             let state = ControllerState {
-                schema_version: 2,
+                schema_version: CONTROLLER_STATE_SCHEMA_VERSION,
                 signing_key: signing_key.to_vec(),
                 admin_token: admin_token.clone(),
                 networks: HashMap::new(),
@@ -186,33 +203,7 @@ impl Controller {
             write_state(&path, &state)?;
             (state, Some(admin_token), false)
         };
-        for managed in state.networks.values_mut() {
-            if managed.network_key.len() != 32 {
-                managed.network_key = NetworkKey::generate()?.to_bytes().to_vec();
-                migrated = true;
-            }
-            if managed.network_key_epoch == 0 {
-                managed.network_key_epoch = 1;
-                migrated = true;
-            }
-            if managed.authorization_epoch == 0 {
-                managed.authorization_epoch = 1;
-                migrated = true;
-            }
-            for device_id in managed.members.keys().copied().collect::<Vec<_>>() {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    managed.member_certificate_ids.entry(device_id)
-                {
-                    entry.insert(Uuid::new_v4());
-                    migrated = true;
-                }
-            }
-        }
-        if state.schema_version < 2 {
-            state.schema_version = 2;
-            migrated = true;
-        }
-        validate_controller_state(&state)?;
+        migrated |= migrate_and_validate_controller_state(&mut state)?;
         if migrated {
             write_state(&path, &state)?;
         }
@@ -580,6 +571,51 @@ fn validate_controller_state(state: &ControllerState) -> Result<()> {
     Ok(())
 }
 
+fn migrate_and_validate_controller_state(state: &mut ControllerState) -> Result<bool> {
+    if state.schema_version > CONTROLLER_STATE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "controller state schema {} is newer than supported schema {}",
+            state.schema_version,
+            CONTROLLER_STATE_SCHEMA_VERSION
+        );
+    }
+    let mut migrated = false;
+    for managed in state.networks.values_mut() {
+        if managed.network_key.len() != 32 {
+            if state.schema_version >= CONTROLLER_STATE_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "controller network {} contains an invalid network key",
+                    managed.network.id.0
+                );
+            }
+            managed.network_key = NetworkKey::generate()?.to_bytes().to_vec();
+            migrated = true;
+        }
+        if managed.network_key_epoch == 0 {
+            managed.network_key_epoch = 1;
+            migrated = true;
+        }
+        if managed.authorization_epoch == 0 {
+            managed.authorization_epoch = 1;
+            migrated = true;
+        }
+        for device_id in managed.members.keys().copied().collect::<Vec<_>>() {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                managed.member_certificate_ids.entry(device_id)
+            {
+                entry.insert(Uuid::new_v4());
+                migrated = true;
+            }
+        }
+    }
+    if state.schema_version < CONTROLLER_STATE_SCHEMA_VERSION {
+        state.schema_version = CONTROLLER_STATE_SCHEMA_VERSION;
+        migrated = true;
+    }
+    validate_controller_state(state)?;
+    Ok(migrated)
+}
+
 fn sign_authorization(
     network: &ManagedNetwork,
     signing_key: &SigningKey,
@@ -879,8 +915,12 @@ async fn refresh_membership(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut cli = Cli::parse();
+    let path = cli.state_file.clone().unwrap_or_else(default_state_path);
+    if let Some(Command::State { command }) = cli.command.take() {
+        return state_backup_command::run(command, &path);
+    }
     install_rustls_crypto_provider()?;
-    let cli = Cli::parse();
     let tls_files = controller_tls_configuration(&cli)?;
     // Load and validate the complete chain/key pair before opening the state.
     // A broken TLS deployment must never create a fresh controller identity
@@ -892,7 +932,6 @@ async fn main() -> Result<()> {
             "--tls-client-ca-certificate requires --planet-controller-url so the CA can be embedded in invitations"
         );
     }
-    let path = cli.state_file.unwrap_or_else(default_state_path);
     let planet = match (
         cli.planet_controller_url,
         cli.planet_relay_endpoints.is_empty(),
@@ -1182,6 +1221,7 @@ mod tests {
             planet_relay_endpoints: Vec::new(),
             planet_roots: Vec::new(),
             planet_stun_servers: Vec::new(),
+            command: None,
         }
     }
 

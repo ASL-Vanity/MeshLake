@@ -7,6 +7,7 @@ mod overlay;
 mod relay;
 mod root;
 mod session;
+mod state_backup;
 mod state_protection;
 
 pub use authorization::{
@@ -36,6 +37,10 @@ pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,
     InitiatorHandshake, PairwiseSessionKeys, ReplayWindow, SessionPacket, SESSION_DATA_HEADER_LEN,
     SESSION_PROTOCOL_VERSION,
+};
+pub use state_backup::{
+    decode_state_backup, encode_state_backup, write_state_backup_file, StateBackupError,
+    StateBackupKind,
 };
 pub use state_protection::{
     cleanup_stale_state_backup, decode_protected_state, encode_protected_state,
