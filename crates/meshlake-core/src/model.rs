@@ -75,6 +75,9 @@ pub struct NetworkControlPlane {
     /// Latest controller-signed authorization state for this network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_manifest: Option<crate::authorization::NetworkAuthorizationManifest>,
+    /// Latest verified controller-signed custom route and DNS policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_manifest: Option<crate::policy::NetworkPolicyManifest>,
 }
 
 impl NetworkControlPlane {
@@ -88,6 +91,7 @@ impl NetworkControlPlane {
             && self.verified_relays.is_empty()
             && self.verified_stun_servers.is_empty()
             && self.authorization_manifest.is_none()
+            && self.policy_manifest.is_none()
     }
 }
 
@@ -332,6 +336,7 @@ mod tests {
                     controller_public_key: vec![7; 32],
                     signature: vec![6; 64],
                 }),
+                policy_manifest: None,
             },
         };
 

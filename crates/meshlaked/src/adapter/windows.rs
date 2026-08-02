@@ -3,6 +3,7 @@
 //! The driver is intentionally not linked at build time. A release package places the signed
 //! `wintun.dll` next to `meshlaked.exe`; development can pass `--wintun-dll <path>`.
 
+use super::policy::PolicyPlan;
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use meshlake_core::JoinedNetwork;
@@ -162,6 +163,7 @@ impl AdapterSession {
 pub struct AdapterController {
     dll_path: PathBuf,
     session: Mutex<Option<AdapterSession>>,
+    applied_policy: Mutex<PolicyPlan>,
 }
 
 impl AdapterController {
@@ -169,6 +171,7 @@ impl AdapterController {
         Self {
             dll_path,
             session: Mutex::new(None),
+            applied_policy: Mutex::new(PolicyPlan::default()),
         }
     }
     pub fn status(&self) -> String {
@@ -204,6 +207,11 @@ impl AdapterController {
         Ok(())
     }
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_policy() {
+            eprintln!(
+                "MeshLake could not completely roll back Windows route/DNS policy: {error:#}"
+            );
+        }
         self.session.lock().expect("adapter lock poisoned").take();
     }
 
@@ -278,6 +286,7 @@ impl AdapterController {
         // it has been authenticated and injected by the agent. This rule is
         // restricted to the MeshLake virtual adapter, never a physical NIC.
         ensure_virtual_lan_firewall_rule()?;
+        self.configure_policy(networks)?;
         Ok(())
     }
 
@@ -307,6 +316,152 @@ impl AdapterController {
         }
         Ok(())
     }
+
+    pub fn configure_policy(&self, networks: &[JoinedNetwork]) -> Result<()> {
+        let plan = PolicyPlan::from_networks(networks, now())?;
+        if !self.is_active() {
+            return Ok(());
+        }
+        self.reconcile_policy(plan)
+    }
+
+    fn reconcile_policy(&self, desired: PolicyPlan) -> Result<()> {
+        if desired.search_domains.len() > 1 {
+            bail!(
+                "Windows supports one connection-specific search domain on the MeshLake adapter; policy requested {}",
+                desired.search_domains.len()
+            );
+        }
+        let mut current = self
+            .applied_policy
+            .lock()
+            .expect("applied policy lock poisoned");
+        if *current == desired {
+            return Ok(());
+        }
+        let previous = current.clone();
+        run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Remove))?;
+        if let Err(error) =
+            run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Apply))
+        {
+            let _ = run_policy_scripts(&windows_policy_scripts(&desired, PolicyOperation::Remove));
+            let _ = run_policy_scripts(&windows_policy_scripts(&previous, PolicyOperation::Apply));
+            return Err(error.context("Windows policy transaction was rolled back"));
+        }
+        *current = desired;
+        Ok(())
+    }
+
+    fn rollback_policy(&self) -> Result<()> {
+        let mut current = self
+            .applied_policy
+            .lock()
+            .expect("applied policy lock poisoned");
+        let result = run_policy_scripts(&windows_policy_scripts(&current, PolicyOperation::Remove));
+        if result.is_ok() {
+            *current = PolicyPlan::default();
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyOperation {
+    Apply,
+    Remove,
+}
+
+fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<String> {
+    let mut scripts = Vec::new();
+    for route in &plan.routes {
+        scripts.push(match operation {
+            PolicyOperation::Apply => format!(
+                "New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '{}' -RouteMetric 5 -ErrorAction Stop | Out-Null",
+                route.prefix,
+                ADAPTER_NAME,
+                if route.prefix.contains(':') { "::" } else { "0.0.0.0" }
+            ),
+            PolicyOperation::Remove => format!(
+                "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{}' -InterfaceAlias '{}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction Stop",
+                route.prefix, ADAPTER_NAME
+            ),
+        });
+    }
+    match operation {
+        PolicyOperation::Apply => {
+            if !plan.dns_servers.is_empty() {
+                let servers = plan
+                    .dns_servers
+                    .iter()
+                    .map(|server| format!("'{server}'"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                scripts.push(format!(
+                    "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses @({servers}) -ErrorAction Stop",
+                    ADAPTER_NAME
+                ));
+            }
+            if let Some(domain) = plan.search_domains.first() {
+                scripts.push(format!(
+                    "Set-DnsClient -InterfaceAlias '{}' -ConnectionSpecificSuffix '{}' -RegisterThisConnectionsAddress:$false -ErrorAction Stop",
+                    ADAPTER_NAME, domain
+                ));
+            }
+        }
+        PolicyOperation::Remove => {
+            if !plan.dns_servers.is_empty() {
+                scripts.push(format!(
+                    "Set-DnsClientServerAddress -InterfaceAlias '{}' -ResetServerAddresses -ErrorAction Stop",
+                    ADAPTER_NAME
+                ));
+            }
+            if !plan.search_domains.is_empty() {
+                scripts.push(format!(
+                    "Set-DnsClient -InterfaceAlias '{}' -ConnectionSpecificSuffix '' -ErrorAction Stop",
+                    ADAPTER_NAME
+                ));
+            }
+        }
+    }
+    scripts
+}
+
+fn run_policy_scripts(scripts: &[String]) -> Result<()> {
+    let mut failures = Vec::new();
+    for script in scripts {
+        let output = match Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                failures.push(format!(
+                    "cannot start PowerShell to configure MeshLake policy: {error}"
+                ));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            failures.push(format!(
+                "PowerShell policy command failed ({}): {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(failures.join("\n"))
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates Unix epoch")
+        .as_secs()
 }
 
 fn ipv4_prefix_len(prefix: &str) -> Result<u8> {
@@ -418,5 +573,25 @@ mod tests {
         assert!(ipv4_prefix_len("not-a-prefix").is_err());
         assert_eq!(ipv6_prefix_len("fd42:4d4c::/64").unwrap(), 64);
         assert!(ipv6_prefix_len("fd42:4d4c::/129").is_err());
+    }
+
+    #[test]
+    fn builds_pure_windows_route_and_dns_transactions() {
+        let plan = PolicyPlan {
+            routes: vec![super::super::policy::PlannedRoute {
+                prefix: "10.20.0.0/16".into(),
+                network_id: meshlake_core::NetworkId(uuid::Uuid::from_u128(1)),
+                gateway_device_id: meshlake_core::DeviceId(uuid::Uuid::from_u128(2)),
+            }],
+            dns_servers: vec!["10.20.0.53".parse().unwrap()],
+            search_domains: vec!["corp.example".into()],
+        };
+        let apply = windows_policy_scripts(&plan, PolicyOperation::Apply).join("\n");
+        assert!(apply.contains("New-NetRoute"));
+        assert!(apply.contains("Set-DnsClientServerAddress"));
+        assert!(apply.contains("ConnectionSpecificSuffix 'corp.example'"));
+        let remove = windows_policy_scripts(&plan, PolicyOperation::Remove).join("\n");
+        assert!(remove.contains("Remove-NetRoute"));
+        assert!(remove.contains("ResetServerAddresses"));
     }
 }

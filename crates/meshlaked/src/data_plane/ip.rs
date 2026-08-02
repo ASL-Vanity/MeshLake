@@ -1,7 +1,13 @@
 //! Pure IP packet classification shared by the platform adapters and transport loop.
 
 use ipnet::{Ipv4Net, Ipv6Net};
-use meshlake_core::JoinedNetwork;
+use meshlake_core::{DeviceId, JoinedNetwork};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutboundNetworkRoute<'a> {
+    pub network: &'a JoinedNetwork,
+    pub gateway: Option<DeviceId>,
+}
 
 /// Selects exactly one virtual network for an outbound IP packet.
 ///
@@ -9,6 +15,7 @@ use meshlake_core::JoinedNetwork;
 /// the selected network. This prevents overlapping virtual prefixes from
 /// selecting whichever network happens to appear first in persisted state.
 /// Ambiguous assignments fail closed.
+#[cfg(test)]
 pub(crate) fn network_for_ip_packet<'a>(
     networks: &'a [JoinedNetwork],
     packet: &[u8],
@@ -22,6 +29,137 @@ pub(crate) fn network_for_ip_packet<'a>(
     });
     let selected = matches.next()?;
     matches.next().is_none().then_some(selected)
+}
+
+/// Selects normal overlay delivery, a controller-authorized custom gateway, or
+/// the return path from a local gateway. Longest-prefix ties fail closed.
+pub(crate) fn outbound_route_for_ip_packet<'a>(
+    networks: &'a [JoinedNetwork],
+    local_device: DeviceId,
+    packet: &[u8],
+) -> Option<OutboundNetworkRoute<'a>> {
+    let (source, destination) = packet_addresses(packet)?;
+    let mut source_networks = networks.iter().filter(|network| {
+        network.network_key.len() == 32 && network.assigned_addresses.contains(&source)
+    });
+    if let Some(network) = source_networks.next() {
+        if source_networks.next().is_some() {
+            return None;
+        }
+        if is_group_destination(network, destination) {
+            return Some(OutboundNetworkRoute {
+                network,
+                gateway: None,
+            });
+        }
+        let direct_prefix = destination_prefix_len(network, destination);
+        let policy_route = policy_gateway(network, destination);
+        return match (direct_prefix, policy_route) {
+            (Some(_), None) => Some(OutboundNetworkRoute {
+                network,
+                gateway: None,
+            }),
+            (None, Some((_, gateway))) => Some(OutboundNetworkRoute {
+                network,
+                gateway: Some(gateway),
+            }),
+            (Some(direct), Some((custom, gateway))) if custom > direct => {
+                Some(OutboundNetworkRoute {
+                    network,
+                    gateway: Some(gateway),
+                })
+            }
+            (Some(direct), Some((custom, _))) if direct > custom => Some(OutboundNetworkRoute {
+                network,
+                gateway: None,
+            }),
+            _ => None,
+        };
+    }
+
+    let mut gateway_returns = networks.iter().filter_map(|network| {
+        if network.network_key.len() != 32 || !address_belongs_to_network(network, destination) {
+            return None;
+        }
+        let (prefix_len, gateway) = policy_gateway(network, source)?;
+        (gateway == local_device).then_some((prefix_len, network))
+    });
+    let selected = gateway_returns.next()?;
+    let mut best = selected;
+    let mut ambiguous = false;
+    for candidate in gateway_returns {
+        match candidate.0.cmp(&best.0) {
+            std::cmp::Ordering::Greater => {
+                best = candidate;
+                ambiguous = false;
+            }
+            std::cmp::Ordering::Equal => ambiguous = true,
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    (!ambiguous).then_some(OutboundNetworkRoute {
+        network: best.1,
+        gateway: None,
+    })
+}
+
+pub(crate) fn local_device_is_gateway_for(
+    network: &JoinedNetwork,
+    local_device: DeviceId,
+    destination: std::net::IpAddr,
+) -> bool {
+    policy_gateway(network, destination).is_some_and(|(_, gateway)| gateway == local_device)
+}
+
+fn policy_gateway(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<(u8, DeviceId)> {
+    let policy = network.control_plane.policy_manifest.as_ref()?;
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if current_time > policy.expires_at_unix_seconds {
+        return None;
+    }
+    let mut matches = policy.routes.iter().filter_map(|route| {
+        let prefix = route.prefix.parse::<ipnet::IpNet>().ok()?;
+        prefix.contains(&address).then_some((
+            prefix.prefix_len(),
+            route.gateway_certificate.claims.device_id,
+        ))
+    });
+    let mut best = matches.next()?;
+    let mut ambiguous = false;
+    for candidate in matches {
+        match candidate.0.cmp(&best.0) {
+            std::cmp::Ordering::Greater => {
+                best = candidate;
+                ambiguous = false;
+            }
+            std::cmp::Ordering::Equal if candidate.1 != best.1 => ambiguous = true,
+            _ => {}
+        }
+    }
+    (!ambiguous).then_some(best)
+}
+
+fn destination_prefix_len(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<u8> {
+    match address {
+        std::net::IpAddr::V4(address) => network
+            .network
+            .ipv4_prefix
+            .parse::<Ipv4Net>()
+            .ok()
+            .filter(|prefix| prefix.contains(&address))
+            .map(|prefix| prefix.prefix_len()),
+        std::net::IpAddr::V6(address) => network
+            .network
+            .ipv6_prefix
+            .as_deref()?
+            .parse::<Ipv6Net>()
+            .ok()
+            .filter(|prefix| prefix.contains(&address))
+            .map(|prefix| prefix.prefix_len()),
+    }
 }
 
 pub(crate) fn packet_addresses(packet: &[u8]) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
@@ -83,7 +221,11 @@ pub(crate) fn is_group_destination(network: &JoinedNetwork, destination: std::ne
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meshlake_core::{NetworkControlPlane, NetworkId, RelayPolicy, VirtualNetwork};
+    use ed25519_dalek::SigningKey;
+    use meshlake_core::{
+        DnsPolicy, MembershipCertificate, MembershipClaims, NetworkControlPlane, NetworkId,
+        NetworkPolicyManifest, PolicyRoute, RelayPolicy, VirtualNetwork,
+    };
     use uuid::Uuid;
 
     fn network(id: u128, assigned: &[&str]) -> JoinedNetwork {
@@ -120,6 +262,44 @@ mod tests {
         packet[24..40]
             .copy_from_slice(&destination.parse::<std::net::Ipv6Addr>().unwrap().octets());
         packet
+    }
+
+    fn with_policy(mut network: JoinedNetwork, routes: &[(&str, u128)]) -> JoinedNetwork {
+        let signing = SigningKey::from_bytes(&[44; 32]);
+        let routes = routes
+            .iter()
+            .map(|(prefix, gateway)| PolicyRoute {
+                prefix: (*prefix).into(),
+                gateway_certificate: MembershipCertificate::sign_authorized(
+                    MembershipClaims {
+                        network_id: network.network.id,
+                        device_id: DeviceId(Uuid::from_u128(*gateway)),
+                        device_public_key: vec![*gateway as u8; 32],
+                        assigned_addresses: vec!["100.64.0.254".parse().unwrap()],
+                        allowed_routes: vec![(*prefix).into()],
+                        issued_at_unix_seconds: 1,
+                        expires_at_unix_seconds: Some(u64::MAX),
+                    },
+                    Uuid::from_u128(*gateway + 100),
+                    1,
+                    &signing,
+                )
+                .unwrap(),
+            })
+            .collect();
+        network.control_plane.policy_manifest = Some(
+            NetworkPolicyManifest::sign(
+                network.network.id,
+                1,
+                routes,
+                DnsPolicy::default(),
+                1,
+                u64::MAX,
+                &signing,
+            )
+            .unwrap(),
+        );
+        network
     }
 
     #[test]
@@ -164,5 +344,42 @@ mod tests {
             network_for_ip_packet(&networks, &packet).map(|network| network.network.id),
             Some(NetworkId(Uuid::from_u128(2)))
         );
+    }
+
+    #[test]
+    fn custom_routes_use_longest_prefix_gateway() {
+        let network = with_policy(
+            network(4, &["100.64.0.4"]),
+            &[("10.0.0.0/8", 40), ("10.20.0.0/16", 41)],
+        );
+        let packet = ipv4_packet([100, 64, 0, 4], [10, 20, 1, 9]);
+        let selected = outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(4)),
+            &packet,
+        )
+        .unwrap();
+        assert_eq!(selected.network.network.id, network.network.id);
+        assert_eq!(selected.gateway, Some(DeviceId(Uuid::from_u128(41))));
+    }
+
+    #[test]
+    fn local_gateway_return_traffic_uses_the_authorized_network() {
+        let network = with_policy(network(5, &["100.64.0.5"]), &[("10.30.0.0/16", 50)]);
+        let packet = ipv4_packet([10, 30, 1, 9], [100, 64, 0, 5]);
+        let selected = outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(50)),
+            &packet,
+        )
+        .unwrap();
+        assert_eq!(selected.network.network.id, network.network.id);
+        assert_eq!(selected.gateway, None);
+        assert!(outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(51)),
+            &packet,
+        )
+        .is_none());
     }
 }

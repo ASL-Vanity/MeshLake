@@ -17,10 +17,10 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
     cleanup_stale_state_backup, decode_protected_state, recover_protected_state_file,
     restrict_state_file_permissions, write_protected_state_file, AuthorizedMembership, DeviceId,
-    EnrollmentResponse, MembershipCertificate, MembershipClaims, MembershipRefreshRequest,
-    MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId, NetworkKey, PlanetManifest,
-    PlanetRelay, PlanetRoot, StateFileLock, UpsertNetworkRequest, VirtualNetwork,
-    CONTROLLER_STATE_PROTECTION_PURPOSE,
+    DnsPolicy, EnrollmentResponse, MembershipCertificate, MembershipClaims,
+    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId,
+    NetworkKey, NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PolicyRoute,
+    StateFileLock, UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -112,6 +112,32 @@ struct ManagedNetwork {
     member_certificate_ids: HashMap<DeviceId, Uuid>,
     #[serde(default)]
     revoked_certificate_ids: HashMap<Uuid, u64>,
+    #[serde(default)]
+    policy_epoch: u64,
+    #[serde(default)]
+    policy: ManagedPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ManagedPolicy {
+    #[serde(default)]
+    routes: Vec<ManagedPolicyRoute>,
+    #[serde(default)]
+    dns: DnsPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedPolicyRoute {
+    prefix: String,
+    gateway_device_id: DeviceId,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyUpdateRequest {
+    #[serde(default)]
+    routes: Vec<ManagedPolicyRoute>,
+    #[serde(default)]
+    dns: DnsPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +278,8 @@ impl Controller {
                 authorization_epoch: 1,
                 member_certificate_ids: HashMap::new(),
                 revoked_certificate_ids: HashMap::new(),
+                policy_epoch: 1,
+                policy: ManagedPolicy::default(),
             },
         );
         write_state(&self.path, &state).map_err(ApiError::internal)?;
@@ -439,6 +467,14 @@ impl Controller {
                 .revoked_certificate_ids
                 .insert(certificate_id, now());
         }
+        let previous_route_count = network.policy.routes.len();
+        network
+            .policy
+            .routes
+            .retain(|route| route.gateway_device_id != device_id);
+        if network.policy.routes.len() != previous_route_count {
+            network.policy_epoch = network.policy_epoch.saturating_add(1).max(1);
+        }
         network.network_key = NetworkKey::generate()
             .map_err(ApiError::internal)?
             .to_bytes()
@@ -459,6 +495,48 @@ impl Controller {
             .get(&network_id)
             .ok_or_else(|| ApiError::not_found("network does not exist"))?;
         sign_authorization(network, &signing_key).map_err(ApiError::internal)
+    }
+
+    async fn policy(&self, network_id: NetworkId) -> Result<NetworkPolicyManifest, ApiError> {
+        let state = self.state.read().await;
+        let signing_key = signing_key(&state).map_err(ApiError::internal)?;
+        let network = state
+            .networks
+            .get(&network_id)
+            .ok_or_else(|| ApiError::not_found("network does not exist"))?;
+        sign_policy(network, &signing_key).map_err(ApiError::internal)
+    }
+
+    async fn update_policy(
+        &self,
+        headers: &HeaderMap,
+        network_id: NetworkId,
+        request: PolicyUpdateRequest,
+    ) -> Result<NetworkPolicyManifest, ApiError> {
+        let mut state = self.state.write().await;
+        require_admin(&state, headers)?;
+        let signing_key = signing_key(&state).map_err(ApiError::internal)?;
+        let network = state
+            .networks
+            .get_mut(&network_id)
+            .ok_or_else(|| ApiError::not_found("network does not exist"))?;
+        let mut candidate = network.clone();
+        candidate.policy.routes = request.routes;
+        candidate.policy.dns = request.dns;
+        candidate.policy_epoch = candidate.policy_epoch.saturating_add(1).max(1);
+        let manifest = sign_policy(&candidate, &signing_key).map_err(ApiError::bad_request)?;
+        candidate.policy.routes = manifest
+            .routes
+            .iter()
+            .map(|route| ManagedPolicyRoute {
+                prefix: route.prefix.clone(),
+                gateway_device_id: route.gateway_certificate.claims.device_id,
+            })
+            .collect();
+        candidate.policy.dns = manifest.dns.clone();
+        *network = candidate;
+        write_state(&self.path, &state).map_err(ApiError::internal)?;
+        Ok(manifest)
     }
 
     async fn refresh_membership(
@@ -556,7 +634,7 @@ fn signing_key(state: &ControllerState) -> Result<SigningKey> {
 }
 
 fn validate_controller_state(state: &ControllerState) -> Result<()> {
-    signing_key(state)?;
+    let signing_key = signing_key(state)?;
     if state.admin_token.trim().is_empty() {
         anyhow::bail!("controller administrator token is empty");
     }
@@ -564,6 +642,12 @@ fn validate_controller_state(state: &ControllerState) -> Result<()> {
         NetworkKey::from_slice(&managed.network_key).with_context(|| {
             format!(
                 "controller network {} contains an invalid network key",
+                network_id.0
+            )
+        })?;
+        sign_policy(managed, &signing_key).with_context(|| {
+            format!(
+                "controller network {} contains an invalid policy",
                 network_id.0
             )
         })?;
@@ -597,6 +681,10 @@ fn migrate_and_validate_controller_state(state: &mut ControllerState) -> Result<
         }
         if managed.authorization_epoch == 0 {
             managed.authorization_epoch = 1;
+            migrated = true;
+        }
+        if managed.policy_epoch == 0 {
+            managed.policy_epoch = 1;
             migrated = true;
         }
         for device_id in managed.members.keys().copied().collect::<Vec<_>>() {
@@ -642,6 +730,55 @@ fn sign_authorization(
         network.network_key_epoch,
         active_members,
         network.revoked_certificate_ids.keys().copied().collect(),
+        now(),
+        now() + 90,
+        signing_key,
+    )
+    .map_err(Into::into)
+}
+
+fn sign_policy(
+    network: &ManagedNetwork,
+    signing_key: &SigningKey,
+) -> Result<NetworkPolicyManifest> {
+    let mut routes = Vec::with_capacity(network.policy.routes.len());
+    for route in &network.policy.routes {
+        let claims = network
+            .members
+            .get(&route.gateway_device_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "policy gateway {} is not an active member",
+                    route.gateway_device_id.0
+                )
+            })?;
+        let certificate_id = network
+            .member_certificate_ids
+            .get(&route.gateway_device_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("policy gateway certificate is missing"))?;
+        let mut policy_claims = claims.clone();
+        policy_claims.allowed_routes.push(route.prefix.clone());
+        policy_claims.allowed_routes.sort();
+        policy_claims.allowed_routes.dedup();
+        policy_claims.issued_at_unix_seconds = now();
+        policy_claims.expires_at_unix_seconds = Some(now() + 86_400);
+        let certificate = MembershipCertificate::sign_authorized(
+            policy_claims,
+            certificate_id,
+            network.network_key_epoch,
+            signing_key,
+        )?;
+        routes.push(PolicyRoute {
+            prefix: route.prefix.clone(),
+            gateway_certificate: certificate,
+        });
+    }
+    NetworkPolicyManifest::sign(
+        network.network.id,
+        network.policy_epoch,
+        routes,
+        network.policy.dns.clone(),
         now(),
         now() + 90,
         signing_key,
@@ -906,6 +1043,26 @@ async fn network_authorization(
     Ok(Json(controller.authorization(NetworkId(network_id)).await?))
 }
 
+async fn network_policy(
+    State(controller): State<Arc<Controller>>,
+    Path(network_id): Path<Uuid>,
+) -> Result<Json<NetworkPolicyManifest>, ApiError> {
+    Ok(Json(controller.policy(NetworkId(network_id)).await?))
+}
+
+async fn update_network_policy(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    Path(network_id): Path<Uuid>,
+    Json(request): Json<PolicyUpdateRequest>,
+) -> Result<Json<NetworkPolicyManifest>, ApiError> {
+    Ok(Json(
+        controller
+            .update_policy(&headers, NetworkId(network_id), request)
+            .await?,
+    ))
+}
+
 async fn refresh_membership(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<MembershipRefreshRequest>,
@@ -990,6 +1147,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/networks/{id}/authorization",
             get(network_authorization),
+        )
+        .route(
+            "/v1/networks/{id}/policy",
+            get(network_policy).post(update_network_policy),
         )
         .route("/v1/networks/{id}/enrollment-tokens", post(create_token))
         .route("/v1/networks/{id}/members", get(list_members))
@@ -1702,6 +1863,68 @@ mod tests {
             decode_protected_state(&bytes, CONTROLLER_STATE_PROTECTION_PURPOSE).unwrap();
         assert_eq!(decoded.value.admin_token, original.admin_token);
         drop(controller);
+    }
+
+    #[test]
+    fn signed_policy_embeds_gateway_route_authorization() {
+        let signing_key = SigningKey::from_bytes(&[61; 32]);
+        let network_id = NetworkId(Uuid::from_u128(61));
+        let gateway = DeviceId(Uuid::from_u128(62));
+        let certificate_id = Uuid::from_u128(63);
+        let managed = ManagedNetwork {
+            network: VirtualNetwork {
+                id: network_id,
+                name: "policy-test".into(),
+                ipv4_prefix: "100.64.61.0/24".into(),
+                ipv6_prefix: Some("fd42:4d4c:61::/64".into()),
+                relay_policy: RelayPolicy::Preferred,
+            },
+            members: HashMap::from([(
+                gateway,
+                MembershipClaims {
+                    network_id,
+                    device_id: gateway,
+                    device_public_key: vec![6; 32],
+                    assigned_addresses: vec!["100.64.61.2".parse().unwrap()],
+                    allowed_routes: vec!["100.64.61.0/24".into()],
+                    issued_at_unix_seconds: now(),
+                    expires_at_unix_seconds: Some(now() + 86_400),
+                },
+            )]),
+            network_key: vec![7; 32],
+            network_key_epoch: 1,
+            authorization_epoch: 1,
+            member_certificate_ids: HashMap::from([(gateway, certificate_id)]),
+            revoked_certificate_ids: HashMap::new(),
+            policy_epoch: 2,
+            policy: ManagedPolicy {
+                routes: vec![ManagedPolicyRoute {
+                    prefix: "10.61.0.0/16".into(),
+                    gateway_device_id: gateway,
+                }],
+                dns: DnsPolicy {
+                    servers: vec!["10.61.0.53".parse().unwrap()],
+                    search_domains: vec!["corp.example".into()],
+                },
+            },
+        };
+        let policy = sign_policy(&managed, &signing_key).unwrap();
+        let authorization = sign_authorization(&managed, &signing_key).unwrap();
+        assert_eq!(
+            policy.verify_for_network(
+                network_id,
+                &signing_key.verifying_key().to_bytes(),
+                &authorization,
+                now(),
+                Some(1),
+            ),
+            Ok(())
+        );
+        assert!(policy.routes[0]
+            .gateway_certificate
+            .claims
+            .allowed_routes
+            .contains(&"10.61.0.0/16".into()));
     }
 
     #[cfg(unix)]

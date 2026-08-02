@@ -14,8 +14,11 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use data_plane::ip::network_for_ip_packet;
 use data_plane::ip::{
-    address_belongs_to_network, is_group_destination, network_for_ip_packet, packet_addresses,
+    address_belongs_to_network, is_group_destination, local_device_is_gateway_for,
+    outbound_route_for_ip_packet, packet_addresses,
 };
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
@@ -24,13 +27,13 @@ use meshlake_core::{
     restrict_state_file_permissions, session_handshake_id, write_protected_state_file, AgentStatus,
     DeviceId, EnrollmentResponse, InitiatorHandshake, JoinedNetwork, MembershipCertificate,
     MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
-    NetworkControlPlane, NetworkId, NetworkKey, PairwiseSessionKeys, PeerPathStatus,
-    PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration,
-    RootResponse, SignedRootResponse, StateFileLock, TransportStatus, UpsertNetworkRequest,
-    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
-    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
-    RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
-    RELAY_SESSION_RESPONSE,
+    NetworkControlPlane, NetworkId, NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys,
+    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
+    RootRegistration, RootResponse, SignedRootResponse, StateFileLock, TransportStatus,
+    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
+    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
+    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
+    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -635,6 +638,31 @@ impl Agent {
                 reload_transport = true;
             }
         }
+        if removed_network.is_none() {
+            if let (Some(policy), Some(authorization)) = (
+                state.networks[index].control_plane.policy_manifest.as_ref(),
+                state.networks[index]
+                    .control_plane
+                    .authorization_manifest
+                    .as_ref(),
+            ) {
+                let controller_key = &state.networks[index]
+                    .control_plane
+                    .pinned_controller_public_key;
+                if policy
+                    .verify_for_network(
+                        state.networks[index].network.id,
+                        controller_key,
+                        authorization,
+                        now(),
+                        None,
+                    )
+                    .is_err()
+                {
+                    state.networks[index].control_plane.policy_manifest = None;
+                }
+            }
+        }
         write_state(&self.path, &state)?;
         drop(state);
 
@@ -645,6 +673,8 @@ impl Agent {
         }
         if let Some(removed_network) = removed_network {
             self.adapter.remove_network(&removed_network)?;
+            let networks = self.state.read().await.networks.clone();
+            self.adapter.configure_policy(&networks)?;
             eprintln!(
                 "MeshLake network {} was revoked by its controller and has been disabled",
                 removed_network.network.id.0
@@ -657,6 +687,7 @@ impl Agent {
     }
 
     async fn refresh_authorizations_once(&self, client: &reqwest::Client) -> Result<()> {
+        self.expire_stale_policies().await?;
         let (device_id, identity, targets) = self.authorization_refresh_material().await?;
         for target in targets {
             let pinned_client = match target.controller_tls_ca_pem.as_deref() {
@@ -682,6 +713,13 @@ impl Agent {
                             "MeshLake could not apply authorization update for network {}: {error:#}",
                             target.network_id.0
                         );
+                        continue;
+                    }
+                    if let Err(error) = self.refresh_policy(client, &target).await {
+                        eprintln!(
+                            "MeshLake could not refresh signed policy for network {}: {error:#}",
+                            target.network_id.0
+                        );
                     }
                 }
                 Err(error) => eprintln!(
@@ -690,6 +728,131 @@ impl Agent {
                 ),
             }
         }
+        Ok(())
+    }
+
+    async fn refresh_policy(
+        &self,
+        default_client: &reqwest::Client,
+        target: &AuthorizationRefreshTarget,
+    ) -> Result<()> {
+        let pinned_client = target
+            .controller_tls_ca_pem
+            .as_deref()
+            .map(|pem| controller_http_client(Some(pem), Duration::from_secs(8)))
+            .transpose()?;
+        let client = pinned_client.as_ref().unwrap_or(default_client);
+        let url = format!(
+            "{}/v1/networks/{}/policy",
+            target.controller_url.trim_end_matches('/'),
+            target.network_id.0
+        );
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .context("cannot fetch network policy")?
+            .error_for_status()
+            .context("controller rejected network policy request")?;
+        let policy = response
+            .json::<NetworkPolicyManifest>()
+            .await
+            .context("controller returned an invalid network policy")?;
+        self.apply_policy_manifest(target.network_id, policy).await
+    }
+
+    async fn apply_policy_manifest(
+        &self,
+        network_id: NetworkId,
+        policy: NetworkPolicyManifest,
+    ) -> Result<()> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        let mut state = self.state.write().await;
+        let index = state
+            .networks
+            .iter()
+            .position(|joined| joined.network.id == network_id)
+            .context("network was removed while policy was being fetched")?;
+        let joined = &state.networks[index];
+        let authorization = joined
+            .control_plane
+            .authorization_manifest
+            .as_ref()
+            .context("network has no current authorization manifest")?;
+        authorization
+            .verify_from_controller(&joined.control_plane.pinned_controller_public_key, now())?;
+        let previous = joined.control_plane.policy_manifest.clone();
+        if let Some(previous) = &previous {
+            if policy.policy_epoch < previous.policy_epoch
+                || (policy.policy_epoch == previous.policy_epoch
+                    && (!same_policy_semantics(&policy, previous)
+                        || policy.issued_at_unix_seconds < previous.issued_at_unix_seconds))
+            {
+                anyhow::bail!("controller attempted a policy rollback or same-epoch mutation");
+            }
+        }
+        policy.verify_for_network(
+            network_id,
+            &joined.control_plane.pinned_controller_public_key,
+            authorization,
+            now(),
+            previous
+                .as_ref()
+                .filter(|previous| previous.policy_epoch != policy.policy_epoch)
+                .map(|previous| previous.policy_epoch),
+        )?;
+        if previous.as_ref() == Some(&policy) {
+            return Ok(());
+        }
+        state.networks[index].control_plane.policy_manifest = Some(policy);
+        write_state(&self.path, &state)?;
+        let networks = state.networks.clone();
+        drop(state);
+        if let Err(error) = self.adapter.configure_policy(&networks) {
+            let mut state = self.state.write().await;
+            if let Some(joined) = state
+                .networks
+                .iter_mut()
+                .find(|joined| joined.network.id == network_id)
+            {
+                joined.control_plane.policy_manifest = previous;
+            }
+            write_state(&self.path, &state)?;
+            let rollback_networks = state.networks.clone();
+            drop(state);
+            let _ = self.adapter.configure_policy(&rollback_networks);
+            return Err(
+                error.context("policy application failed and persisted state was rolled back")
+            );
+        }
+        self.request_transport_reload();
+        Ok(())
+    }
+
+    async fn expire_stale_policies(&self) -> Result<()> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        let mut state = self.state.write().await;
+        let current_time = now();
+        let mut changed = false;
+        for joined in &mut state.networks {
+            if joined
+                .control_plane
+                .policy_manifest
+                .as_ref()
+                .is_some_and(|policy| current_time > policy.expires_at_unix_seconds)
+            {
+                joined.control_plane.policy_manifest = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        write_state(&self.path, &state)?;
+        let networks = state.networks.clone();
+        drop(state);
+        self.adapter.configure_policy(&networks)?;
+        self.request_transport_reload();
         Ok(())
     }
 
@@ -816,7 +979,11 @@ impl Agent {
         state.networks.retain(|entry| entry.network.id != id);
         state.authorizations.remove(&id);
         write_state(&self.path, &state).map_err(ApiError::internal)?;
+        let networks = state.networks.clone();
         drop(state);
+        self.adapter
+            .configure_policy(&networks)
+            .map_err(ApiError::internal)?;
         self.request_transport_reload();
         Ok(())
     }
@@ -949,6 +1116,18 @@ impl Agent {
         let _lifecycle = self.adapter_lifecycle.lock().await;
         self.adapter.deactivate();
     }
+}
+
+fn same_policy_semantics(left: &NetworkPolicyManifest, right: &NetworkPolicyManifest) -> bool {
+    left.network_id == right.network_id
+        && left.policy_epoch == right.policy_epoch
+        && left.dns == right.dns
+        && left.routes.len() == right.routes.len()
+        && left.routes.iter().zip(&right.routes).all(|(left, right)| {
+            left.prefix == right.prefix
+                && left.gateway_certificate.claims.device_id
+                    == right.gateway_certificate.claims.device_id
+        })
 }
 
 fn activate_adapter_transaction<E>(
@@ -1466,6 +1645,41 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
     changed
 }
 
+fn discard_invalid_persisted_policies(state: &mut PersistedState, current_time: u64) -> bool {
+    let mut changed = false;
+    for joined in &mut state.networks {
+        let Some(policy) = joined.control_plane.policy_manifest.as_ref() else {
+            continue;
+        };
+        let valid = joined
+            .control_plane
+            .authorization_manifest
+            .as_ref()
+            .is_some_and(|authorization| {
+                authorization
+                    .verify_from_controller(
+                        &joined.control_plane.pinned_controller_public_key,
+                        current_time,
+                    )
+                    .is_ok()
+                    && policy
+                        .verify_for_network(
+                            joined.network.id,
+                            &joined.control_plane.pinned_controller_public_key,
+                            authorization,
+                            current_time,
+                            None,
+                        )
+                        .is_ok()
+            });
+        if !valid {
+            joined.control_plane.policy_manifest = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn transport_configuration_from_state(state: &PersistedState) -> TransportConfiguration {
     let mut legacy_relays = state.relay_endpoints.clone();
     if legacy_relays.is_empty() {
@@ -1583,6 +1797,9 @@ fn migrate_and_validate_agent_state(state: &mut PersistedState) -> Result<bool> 
         }
     }
     if migrate_legacy_network_control_planes(state) {
+        changed = true;
+    }
+    if discard_invalid_persisted_policies(state, now()) {
         changed = true;
     }
     if state.schema_version < AGENT_STATE_SCHEMA_VERSION {
@@ -2778,10 +2995,11 @@ async fn run_relay_worker(
                 }
                 for _ in 0..32 {
                     let Some(packet) = agent.adapter.try_read_packet()? else { break; };
-                    let Some(network) = network_for_ip_packet(&networks, &packet)
-                        .filter(|network| local_network_is_authorized(network, now()))
+                    let Some(outbound_route) = outbound_route_for_ip_packet(&networks, device_id, &packet)
+                        .filter(|route| local_network_is_authorized(route.network, now()))
                     else { continue; };
-                    let targets = peer_targets_for_packet(&peers, network, &packet);
+                    let network = outbound_route.network;
+                    let targets = peer_targets_for_packet(&peers, network, outbound_route.gateway, &packet);
                     if targets.is_empty() {
                         trace_transport(format!(
                             "dropped packet for network {} because no authorized peer owns the destination",
@@ -3701,6 +3919,7 @@ fn parse_punch(packet: &[u8], kind: u8) -> Option<(NetworkId, DeviceId)> {
 fn peer_targets_for_packet(
     peers: &HashMap<PeerKey, PeerRoute>,
     network: &JoinedNetwork,
+    gateway: Option<DeviceId>,
     packet: &[u8],
 ) -> Vec<(DeviceId, PeerRoute)> {
     let Some((_, destination)) = packet_addresses(packet) else {
@@ -3712,8 +3931,10 @@ fn peer_targets_for_packet(
             if *network_id != network.network.id || route.assigned_addresses.is_empty() {
                 return None;
             }
-            (is_group_destination(network, destination)
-                || route.assigned_addresses.contains(&destination))
+            (gateway == Some(*device_id)
+                || (gateway.is_none()
+                    && (is_group_destination(network, destination)
+                        || route.assigned_addresses.contains(&destination))))
             .then_some((*device_id, route.clone()))
         })
         .collect::<Vec<_>>();
@@ -3741,7 +3962,9 @@ fn packet_is_authorized_for_delivery(
     if outer_destination.0.is_nil() {
         return group_destination;
     }
-    group_destination || network.assigned_addresses.contains(&destination_address)
+    group_destination
+        || network.assigned_addresses.contains(&destination_address)
+        || local_device_is_gateway_for(network, local_device, destination_address)
 }
 
 fn now() -> u64 {
@@ -3755,7 +3978,8 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use meshlake_core::{
-        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy, RootPeer,
+        AuthorizedMembership, DnsPolicy, MembershipClaims, NetworkAuthorizationManifest,
+        NetworkPolicyManifest, PolicyRoute, RelayPolicy, RootPeer,
     };
     use std::cell::Cell;
 
@@ -4167,7 +4391,7 @@ mod tests {
 
         let unicast = ipv4_packet([100, 64, 90, 1], [100, 64, 90, 2]);
         assert_eq!(
-            peer_targets_for_packet(&peers, &network, &unicast)
+            peer_targets_for_packet(&peers, &network, None, &unicast)
                 .into_iter()
                 .map(|(device, _)| device)
                 .collect::<Vec<_>>(),
@@ -4176,7 +4400,7 @@ mod tests {
 
         let broadcast = ipv4_packet([100, 64, 90, 1], [100, 64, 90, 255]);
         assert_eq!(
-            peer_targets_for_packet(&peers, &network, &broadcast).len(),
+            peer_targets_for_packet(&peers, &network, None, &broadcast).len(),
             2
         );
         let multicast = ipv6_packet("fd42:4d4c:90::1", "ff02::1");
@@ -4185,7 +4409,7 @@ mod tests {
             Some(&network)
         );
         assert_eq!(
-            peer_targets_for_packet(&peers, &network, &multicast).len(),
+            peer_targets_for_packet(&peers, &network, None, &multicast).len(),
             2
         );
     }
@@ -4235,6 +4459,61 @@ mod tests {
             DeviceId(Uuid::nil()),
             local_device,
             &valid,
+        ));
+    }
+
+    #[test]
+    fn inbound_custom_route_is_delivered_only_to_the_signed_gateway() {
+        let mut network = test_joined_network();
+        let signing = SigningKey::from_bytes(&[62; 32]);
+        let gateway = DeviceId(Uuid::from_u128(620));
+        let gateway_certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: network.network.id,
+                device_id: gateway,
+                device_public_key: vec![8; 32],
+                assigned_addresses: vec!["100.64.90.254".parse().unwrap()],
+                allowed_routes: vec!["10.62.0.0/16".into()],
+                issued_at_unix_seconds: now(),
+                expires_at_unix_seconds: Some(now() + 300),
+            },
+            Uuid::from_u128(621),
+            1,
+            &signing,
+        )
+        .unwrap();
+        network.control_plane.policy_manifest = Some(
+            NetworkPolicyManifest::sign(
+                network.network.id,
+                1,
+                vec![PolicyRoute {
+                    prefix: "10.62.0.0/16".into(),
+                    gateway_certificate,
+                }],
+                DnsPolicy::default(),
+                now(),
+                now() + 300,
+                &signing,
+            )
+            .unwrap(),
+        );
+        let mut source_route = PeerRoute::empty();
+        source_route.set_assigned_addresses(vec!["100.64.90.2".parse().unwrap()]);
+        let packet = ipv4_packet([100, 64, 90, 2], [10, 62, 1, 9]);
+        assert!(packet_is_authorized_for_delivery(
+            &network,
+            &source_route,
+            gateway,
+            gateway,
+            &packet,
+        ));
+        let other = DeviceId(Uuid::from_u128(622));
+        assert!(!packet_is_authorized_for_delivery(
+            &network,
+            &source_route,
+            other,
+            other,
+            &packet,
         ));
     }
 

@@ -1,5 +1,6 @@
 //! Linux TUN adapter implementation used by the headless MeshLake agent.
 
+use super::policy::PolicyPlan;
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::JoinedNetwork;
@@ -49,12 +50,14 @@ impl AddressOperation {
 
 pub struct AdapterController {
     session: Mutex<Option<File>>,
+    applied_policy: Mutex<PolicyPlan>,
 }
 
 impl AdapterController {
     pub fn new(_: PathBuf) -> Self {
         Self {
             session: Mutex::new(None),
+            applied_policy: Mutex::new(PolicyPlan::default()),
         }
     }
 
@@ -103,6 +106,9 @@ impl AdapterController {
     }
 
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_policy() {
+            eprintln!("MeshLake could not completely roll back Linux route/DNS policy: {error:#}");
+        }
         self.session.lock().expect("adapter lock poisoned").take();
     }
 
@@ -149,6 +155,7 @@ impl AdapterController {
         for command in address_commands(networks, AddressOperation::Replace)? {
             run_ip(&command)?;
         }
+        self.configure_policy(networks)?;
         Ok(())
     }
 
@@ -161,6 +168,157 @@ impl AdapterController {
         }
         Ok(())
     }
+
+    pub fn configure_policy(&self, networks: &[JoinedNetwork]) -> Result<()> {
+        let plan = PolicyPlan::from_networks(networks, now())?;
+        if !self.is_active() {
+            return Ok(());
+        }
+        self.reconcile_policy(plan)
+    }
+
+    fn reconcile_policy(&self, desired: PolicyPlan) -> Result<()> {
+        let mut current = self
+            .applied_policy
+            .lock()
+            .expect("applied policy lock poisoned");
+        if *current == desired {
+            return Ok(());
+        }
+        let previous = current.clone();
+        run_linux_policy_commands(&linux_policy_commands(&previous, PolicyOperation::Remove))?;
+        if let Err(error) =
+            run_linux_policy_commands(&linux_policy_commands(&desired, PolicyOperation::Apply))
+        {
+            let _ = run_linux_policy_commands(&linux_policy_commands(
+                &desired,
+                PolicyOperation::Remove,
+            ));
+            let _ = run_linux_policy_commands(&linux_policy_commands(
+                &previous,
+                PolicyOperation::Apply,
+            ));
+            return Err(error.context("Linux policy transaction was rolled back"));
+        }
+        *current = desired;
+        Ok(())
+    }
+
+    fn rollback_policy(&self) -> Result<()> {
+        let mut current = self
+            .applied_policy
+            .lock()
+            .expect("applied policy lock poisoned");
+        let result =
+            run_linux_policy_commands(&linux_policy_commands(&current, PolicyOperation::Remove));
+        if result.is_ok() {
+            *current = PolicyPlan::default();
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyOperation {
+    Apply,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxPolicyCommand {
+    program: &'static str,
+    arguments: Vec<String>,
+}
+
+fn linux_policy_commands(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<LinuxPolicyCommand> {
+    let mut commands = plan
+        .routes
+        .iter()
+        .map(|route| LinuxPolicyCommand {
+            program: "ip",
+            arguments: vec![
+                "route".into(),
+                match operation {
+                    PolicyOperation::Apply => "replace",
+                    PolicyOperation::Remove => "del",
+                }
+                .into(),
+                route.prefix.clone(),
+                "dev".into(),
+                INTERFACE_NAME.into(),
+            ],
+        })
+        .collect::<Vec<_>>();
+    match operation {
+        PolicyOperation::Apply if !plan.dns_servers.is_empty() => {
+            commands.push(LinuxPolicyCommand {
+                program: "resolvectl",
+                arguments: std::iter::once("dns".into())
+                    .chain(std::iter::once(INTERFACE_NAME.into()))
+                    .chain(plan.dns_servers.iter().map(ToString::to_string))
+                    .collect(),
+            });
+            if !plan.search_domains.is_empty() {
+                commands.push(LinuxPolicyCommand {
+                    program: "resolvectl",
+                    arguments: std::iter::once("domain".into())
+                        .chain(std::iter::once(INTERFACE_NAME.into()))
+                        .chain(plan.search_domains.iter().cloned())
+                        .collect(),
+                });
+            }
+            commands.push(LinuxPolicyCommand {
+                program: "resolvectl",
+                arguments: vec!["default-route".into(), INTERFACE_NAME.into(), "no".into()],
+            });
+        }
+        PolicyOperation::Remove if !plan.dns_servers.is_empty() => {
+            commands.push(LinuxPolicyCommand {
+                program: "resolvectl",
+                arguments: vec!["revert".into(), INTERFACE_NAME.into()],
+            });
+        }
+        _ => {}
+    }
+    commands
+}
+
+fn run_linux_policy_commands(commands: &[LinuxPolicyCommand]) -> Result<()> {
+    let mut failures = Vec::new();
+    for command in commands {
+        let output = match Command::new(command.program)
+            .args(&command.arguments)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                failures.push(format!("cannot start {}: {error}", command.program));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            failures.push(format!(
+                "{} {} failed ({}): {}{}",
+                command.program,
+                command.arguments.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(failures.join("\n"))
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates Unix epoch")
+        .as_secs()
 }
 
 fn publish_session_after_interface_up<T>(
@@ -446,5 +604,35 @@ mod tests {
         let first = joined_network(12, "100.64.12.0/24", None, &["100.64.12.1"]);
         let second = joined_network(13, "100.64.12.0/24", None, &["100.64.12.1"]);
         assert!(planned_addresses(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn builds_linux_route_and_resolved_commands_without_touching_resolv_conf() {
+        let plan = PolicyPlan {
+            routes: vec![super::super::policy::PlannedRoute {
+                prefix: "2001:db8:10::/64".into(),
+                network_id: NetworkId(Uuid::from_u128(1)),
+                gateway_device_id: meshlake_core::DeviceId(Uuid::from_u128(2)),
+            }],
+            dns_servers: vec!["2001:db8:10::53".parse().unwrap()],
+            search_domains: vec!["corp.example".into()],
+        };
+        let commands = linux_policy_commands(&plan, PolicyOperation::Apply);
+        assert_eq!(commands[0].program, "ip");
+        assert_eq!(
+            commands[0].arguments,
+            vec!["route", "replace", "2001:db8:10::/64", "dev", "meshlake0"]
+        );
+        assert!(commands
+            .iter()
+            .any(|command| command.program == "resolvectl"
+                && command
+                    .arguments
+                    .first()
+                    .is_some_and(|argument| argument == "dns")));
+        assert!(commands.iter().all(|command| !command
+            .arguments
+            .iter()
+            .any(|argument| argument == "/etc/resolv.conf")));
     }
 }
