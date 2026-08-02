@@ -1,3 +1,5 @@
+mod secret_input;
+
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -9,6 +11,8 @@ use reqwest::{Certificate, Client, StatusCode};
 use std::{fs, path::PathBuf};
 use url::Url;
 use uuid::Uuid;
+
+use secret_input::{AdminTokenInputArgs, EnrollmentTokenInputArgs, JoinLinkInputArgs, SecretInput};
 
 const LOCAL_API: &str = "http://127.0.0.1:51821/v1";
 
@@ -115,8 +119,8 @@ enum ControllerCommand {
         controller: String,
         #[arg(long)]
         network: Uuid,
-        #[arg(long)]
-        admin_token: String,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
         /// Invitation lifetime in seconds (60 through 86400).
         #[arg(long, default_value_t = 900)]
         expires_in_seconds: u64,
@@ -128,8 +132,8 @@ enum ControllerNetworkCommand {
     Create {
         #[arg(long)]
         controller: String,
-        #[arg(long)]
-        admin_token: String,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -146,8 +150,8 @@ enum ControllerNetworkCommand {
     Delete {
         #[arg(long)]
         controller: String,
-        #[arg(long)]
-        admin_token: String,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
         #[arg(long)]
         network: Uuid,
     },
@@ -176,8 +180,8 @@ enum NetworkCommand {
     /// Join from one invitation URL instead of manually entering controller,
     /// network ID, token and public key.
     JoinLink {
-        #[arg(long)]
-        link: String,
+        #[command(flatten)]
+        link: JoinLinkInputArgs,
     },
     Join {
         /// Controller URL, for example https://controller.example.com.
@@ -185,8 +189,8 @@ enum NetworkCommand {
         controller: String,
         #[arg(long)]
         network: Uuid,
-        #[arg(long)]
-        token: String,
+        #[command(flatten)]
+        token: EnrollmentTokenInputArgs,
         /// Base64 controller Ed25519 public key obtained from a trusted administrator.
         #[arg(long)]
         controller_public_key_base64: String,
@@ -284,6 +288,7 @@ async fn main() -> Result<()> {
                         },
                 },
         } => {
+            let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
             let request = UpsertNetworkRequest {
                 id: None,
@@ -295,7 +300,7 @@ async fn main() -> Result<()> {
             let network: VirtualNetwork = ensure_success(
                 client
                     .post(format!("{controller_url}/v1/networks"))
-                    .header("x-meshlake-admin-token", admin_token)
+                    .header("x-meshlake-admin-token", admin_token.as_str())
                     .json(&request)
                     .send()
                     .await?,
@@ -340,11 +345,12 @@ async fn main() -> Result<()> {
                         },
                 },
         } => {
+            let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
             ensure_success(
                 client
                     .delete(format!("{controller_url}/v1/networks/{network}"))
-                    .header("x-meshlake-admin-token", admin_token)
+                    .header("x-meshlake-admin-token", admin_token.as_str())
                     .send()
                     .await?,
             )
@@ -379,13 +385,14 @@ async fn main() -> Result<()> {
                     expires_in_seconds,
                 },
         } => {
+            let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
             let response: serde_json::Value = ensure_success(
                 client
                     .post(format!(
                         "{controller_url}/v1/networks/{network}/enrollment-tokens"
                     ))
-                    .header("x-meshlake-admin-token", admin_token)
+                    .header("x-meshlake-admin-token", admin_token.as_str())
                     .json(&serde_json::json!({
                         "expires_in_seconds": expires_in_seconds,
                     }))
@@ -416,6 +423,7 @@ async fn main() -> Result<()> {
         Command::Network {
             command: NetworkCommand::JoinLink { link },
         } => {
+            let link = SecretInput::from(link).resolve("join link")?;
             let invitation = InviteLink::parse(&link)?;
             let effective_tls_ca =
                 select_effective_tls_ca(invitation.tls_ca.as_ref(), tls_ca.as_ref())?;
@@ -446,6 +454,7 @@ async fn main() -> Result<()> {
                     controller_public_key_base64,
                 },
         } => {
+            let token = SecretInput::from(token).resolve("enrollment token")?;
             let controller = controller_base_url(&controller, tls_ca.is_some())?;
             let control_plane = EnrollmentControlPlane {
                 controller_url: controller.clone(),
@@ -477,7 +486,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct InviteLink {
     controller: String,
     network: Uuid,
@@ -485,6 +494,23 @@ struct InviteLink {
     controller_public_key_base64: String,
     planet_manifest_url: Option<String>,
     tls_ca: Option<NormalizedTlsCa>,
+}
+
+impl std::fmt::Debug for InviteLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InviteLink")
+            .field("controller", &self.controller)
+            .field("network", &self.network)
+            .field("token", &"[REDACTED]")
+            .field(
+                "controller_public_key_base64",
+                &self.controller_public_key_base64,
+            )
+            .field("planet_manifest_url", &self.planet_manifest_url)
+            .field("tls_ca", &self.tls_ca)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1241,6 +1267,46 @@ mod tests {
         };
         assert_eq!(ipv4_prefix, "100.64.50.0/24");
         assert_eq!(ipv6_prefix.as_deref(), Some("fd42:4d4c:50::/64"));
+    }
+
+    #[test]
+    fn secret_sources_are_required_and_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["meshlake", "network", "join-link", "--link-stdin",]).is_ok());
+        assert!(Cli::try_parse_from([
+            "meshlake",
+            "network",
+            "join-link",
+            "--link",
+            "meshlake://join?token=deprecated",
+            "--link-file",
+            "join.secret",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["meshlake", "network", "join-link"]).is_err());
+
+        assert!(Cli::try_parse_from([
+            "meshlake",
+            "controller",
+            "network",
+            "delete",
+            "--controller",
+            "http://127.0.0.1:51822",
+            "--network",
+            "2a2d7ed1-5a22-4f60-b6c5-573ac589c514",
+            "--admin-token-file",
+            "admin.secret",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn invite_debug_redacts_the_enrollment_token() {
+        let secret = "enrollment-token-that-must-not-be-logged";
+        let invite = InviteLink::parse(&format!(
+            "meshlake://join?controller=https%3A%2F%2Fcontroller.example&network_id=2a2d7ed1-5a22-4f60-b6c5-573ac589c514&token={secret}&public_key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D"
+        ))
+        .unwrap();
+        assert!(!format!("{invite:?}").contains(secret));
     }
 
     #[test]

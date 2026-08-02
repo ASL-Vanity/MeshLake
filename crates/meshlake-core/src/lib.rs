@@ -7,6 +7,7 @@ mod overlay;
 mod policy;
 mod relay;
 mod root;
+mod secret_file;
 mod session;
 mod session_observation;
 mod state_backup;
@@ -37,6 +38,10 @@ pub use relay::{
 pub use root::{
     RootPeer, RootProtocolError, RootRegistration, RootRegistrationPayload, RootResponse,
     SignedRootResponse,
+};
+pub use secret_file::{
+    create_restricted_secret_file, read_restricted_secret_file, verify_restricted_secret_file,
+    SecretFileError,
 };
 pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,

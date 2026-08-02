@@ -2825,10 +2825,12 @@ dependencies = [
  "meshlake-core",
  "rcgen",
  "reqwest",
+ "rpassword",
  "serde_json",
  "tokio",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
