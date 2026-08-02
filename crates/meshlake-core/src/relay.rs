@@ -18,7 +18,11 @@ pub const RELAY_PUNCH: u8 = 4;
 /// included in this control frame.
 pub const RELAY_CANDIDATE: u8 = 5;
 /// Registration acknowledgement emitted only after the relay has verified a
-/// controller-signed membership certificate.
+/// controller-signed membership certificate. The 53-byte frame carries the
+/// network ID, device ID, and the 16-byte nonce from the signed registration so
+/// clients can bind relay health to one fresh registration transaction.
+/// This is a transaction-bound liveness response, not a relay-signed identity
+/// assertion.
 pub const RELAY_REGISTER_ACK: u8 = 6;
 /// Direct response to a punch request. Unlike [`RELAY_PUNCH`], acknowledgements
 /// are never answered again, preventing an infinite UDP echo loop.

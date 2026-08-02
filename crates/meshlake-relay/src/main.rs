@@ -146,7 +146,9 @@ async fn handle_packet(
                         last_seen: Instant::now(),
                     },
                 );
-                socket.send_to(&registration_ack(key), remote).await?;
+                socket
+                    .send_to(&registration_ack(key, nonce), remote)
+                    .await?;
                 trace_transport(format!(
                     "registered member {} for network {} from {remote}",
                     key.1 .0, key.0 .0
@@ -189,12 +191,13 @@ async fn handle_packet(
     Ok(())
 }
 
-fn registration_ack(peer: PeerKey) -> [u8; 37] {
-    let mut packet = [0_u8; 37];
+fn registration_ack(peer: PeerKey, nonce: [u8; 16]) -> [u8; 53] {
+    let mut packet = [0_u8; 53];
     packet[..4].copy_from_slice(&RELAY_MAGIC);
     packet[4] = RELAY_REGISTER_ACK;
     packet[5..21].copy_from_slice((peer.0).0.as_bytes());
     packet[21..37].copy_from_slice((peer.1).0.as_bytes());
+    packet[37..53].copy_from_slice(&nonce);
     packet
 }
 
@@ -636,15 +639,17 @@ mod tests {
     }
 
     #[test]
-    fn registration_ack_contains_authenticated_peer_identity() {
+    fn registration_ack_echoes_verified_peer_identity_and_signed_nonce() {
         let peer = (
             NetworkId(Uuid::from_u128(41)),
             DeviceId(Uuid::from_u128(42)),
         );
-        let packet = registration_ack(peer);
+        let nonce = [43_u8; 16];
+        let packet = registration_ack(peer, nonce);
         assert_eq!(&packet[..5], b"MLR1\x06");
         assert_eq!(Uuid::from_slice(&packet[5..21]).unwrap(), peer.0 .0);
         assert_eq!(Uuid::from_slice(&packet[21..37]).unwrap(), peer.1 .0);
+        assert_eq!(packet[37..53], nonce);
     }
 
     #[test]
@@ -930,6 +935,10 @@ mod tests {
         let mut seen_nonces = HashMap::new();
         let registration_one =
             signed_registration_packet(&controller, &node_one, certificate_one.clone());
+        let registration_nonce = serde_json::from_slice::<RootRegistration>(&registration_one[5..])
+            .unwrap()
+            .payload
+            .nonce;
 
         handle_packet(
             &relay_socket,
@@ -941,7 +950,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(receive_datagram(&client_one).await[4], RELAY_REGISTER_ACK);
+        let acknowledgement = receive_datagram(&client_one).await;
+        assert_eq!(acknowledgement[4], RELAY_REGISTER_ACK);
+        assert_eq!(acknowledgement[37..53], registration_nonce);
 
         handle_packet(
             &relay_socket,

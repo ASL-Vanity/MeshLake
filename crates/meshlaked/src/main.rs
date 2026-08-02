@@ -60,6 +60,7 @@ const HANDSHAKE_RETRY: Duration = Duration::from_secs(1);
 const HANDSHAKE_CLOCK_SKEW_SECONDS: u64 = 120;
 const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(300);
 const MAX_HANDSHAKE_REPLAY_ENTRIES: usize = 16_384;
+const TRANSPORT_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const AUTHORIZATION_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const CERTIFICATE_REFRESH_MARGIN_SECONDS: u64 = 300;
 
@@ -2296,6 +2297,14 @@ struct RootTransaction {
     issued_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct RelayRegistrationTransaction {
+    network_id: NetworkId,
+    device_id: DeviceId,
+    endpoint: SocketAddr,
+    issued_at: Instant,
+}
+
 struct TransportSockets {
     ipv4: UdpSocket,
     ipv6: Option<UdpSocket>,
@@ -2433,6 +2442,8 @@ async fn run_relay_worker(
     let mut seen_handshakes = HashMap::<(PeerKey, [u8; 16]), Instant>::new();
     let mut stun_transactions = HashMap::<[u8; 12], StunTransaction>::new();
     let mut root_transactions = HashMap::<[u8; 16], RootTransaction>::new();
+    let mut relay_registration_transactions =
+        HashMap::<[u8; 16], RelayRegistrationTransaction>::new();
     let mut endpoint_health = EndpointHealthTable::default();
     let mut incoming_ipv4 = vec![0_u8; u16::MAX as usize];
     let mut incoming_ipv6 = vec![0_u8; u16::MAX as usize];
@@ -2460,6 +2471,7 @@ async fn run_relay_worker(
                     &identity,
                     &mut stun_transactions,
                     &mut root_transactions,
+                    &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
                 ).await?;
@@ -2478,6 +2490,7 @@ async fn run_relay_worker(
                     &identity,
                     &mut stun_transactions,
                     &mut root_transactions,
+                    &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
                 ).await?;
@@ -2608,22 +2621,33 @@ async fn run_relay_worker(
                         agent.root_registration_material().await?;
                     for membership in &memberships {
                         let certificate = &membership.certificate;
-                        let signed = RootRegistration::sign_authorized(
-                            root_device,
-                            vec![certificate.clone()],
-                            vec![membership.authorization.clone()],
-                            advertised_candidates.clone(),
-                            now(),
-                            new_root_nonce(),
-                            &identity,
-                        )?;
-                        let mut registration = Vec::from(RELAY_MAGIC);
-                        registration.push(RELAY_REGISTER_SIGNED);
-                        registration.extend_from_slice(&serde_json::to_vec(&signed)?);
                         for relay_endpoint in configuration
                             .relay_endpoints_for(certificate.claims.network_id)
                         {
-                            sockets.send_to(&registration, *relay_endpoint).await;
+                            let nonce = new_root_nonce();
+                            let signed = RootRegistration::sign_authorized(
+                                root_device,
+                                vec![certificate.clone()],
+                                vec![membership.authorization.clone()],
+                                advertised_candidates.clone(),
+                                now(),
+                                nonce,
+                                &identity,
+                            )?;
+                            let mut registration = Vec::from(RELAY_MAGIC);
+                            registration.push(RELAY_REGISTER_SIGNED);
+                            registration.extend_from_slice(&serde_json::to_vec(&signed)?);
+                            if sockets.send_to(&registration, *relay_endpoint).await {
+                                relay_registration_transactions.insert(
+                                    nonce,
+                                    RelayRegistrationTransaction {
+                                        network_id: certificate.claims.network_id,
+                                        device_id: root_device,
+                                        endpoint: *relay_endpoint,
+                                        issued_at: Instant::now(),
+                                    },
+                                );
+                            }
                         }
                         trace_transport(format!(
                             "sent signed relay registration for network {}",
@@ -2679,7 +2703,10 @@ async fn run_relay_worker(
                         transaction.issued_at.elapsed() < Duration::from_secs(30)
                     });
                     root_transactions.retain(|_, transaction| {
-                        transaction.issued_at.elapsed() < Duration::from_secs(30)
+                        transaction.issued_at.elapsed() < TRANSPORT_TRANSACTION_TTL
+                    });
+                    relay_registration_transactions.retain(|_, transaction| {
+                        transaction.issued_at.elapsed() < TRANSPORT_TRANSACTION_TTL
                     });
                     next_registration = tokio::time::Instant::now() + Duration::from_secs(20);
                 }
@@ -2746,6 +2773,7 @@ async fn receive_udp_packet(
     identity: &SigningKey,
     stun_transactions: &mut HashMap<[u8; 12], StunTransaction>,
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
+    relay_registration_transactions: &mut HashMap<[u8; 16], RelayRegistrationTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
     endpoint_health: &mut EndpointHealthTable,
 ) -> Result<()> {
@@ -2796,7 +2824,7 @@ async fn receive_udp_packet(
     }
     match packet[4] {
         RELAY_REGISTER_ACK if relay_endpoints.contains(&remote) => {
-            let Some((network, device)) = parse_registration_ack(packet) else {
+            let Some((network, device, nonce)) = parse_registration_ack(packet) else {
                 return Ok(());
             };
             if !configuration.relay_endpoints_for(network).contains(&remote) {
@@ -2807,7 +2835,17 @@ async fn receive_udp_packet(
                 return Ok(());
             }
             let acknowledged = Instant::now();
-            endpoint_health.mark_relay_acknowledged(network, remote, acknowledged);
+            if !acknowledge_relay_registration(
+                relay_registration_transactions,
+                endpoint_health,
+                network,
+                device,
+                nonce,
+                remote,
+                acknowledged,
+            ) {
+                return Ok(());
+            }
             agent.mark_relay_acknowledged(network, remote).await;
             trace_transport(format!(
                 "relay {remote} registration acknowledged for network {}",
@@ -3511,14 +3549,39 @@ fn candidate_announcement(network: NetworkId, device: DeviceId, endpoint: Socket
     packet
 }
 
-fn parse_registration_ack(packet: &[u8]) -> Option<(NetworkId, DeviceId)> {
-    if packet.len() != 37 || packet[..4] != RELAY_MAGIC || packet[4] != RELAY_REGISTER_ACK {
+fn parse_registration_ack(packet: &[u8]) -> Option<(NetworkId, DeviceId, [u8; 16])> {
+    if packet.len() != 53 || packet[..4] != RELAY_MAGIC || packet[4] != RELAY_REGISTER_ACK {
         return None;
     }
     Some((
         NetworkId(Uuid::from_slice(&packet[5..21]).ok()?),
         DeviceId(Uuid::from_slice(&packet[21..37]).ok()?),
+        packet[37..53].try_into().ok()?,
     ))
+}
+
+fn acknowledge_relay_registration(
+    transactions: &mut HashMap<[u8; 16], RelayRegistrationTransaction>,
+    endpoint_health: &mut EndpointHealthTable,
+    network_id: NetworkId,
+    device_id: DeviceId,
+    nonce: [u8; 16],
+    endpoint: SocketAddr,
+    now: Instant,
+) -> bool {
+    let Some(transaction) = transactions.get(&nonce) else {
+        return false;
+    };
+    if transaction.network_id != network_id
+        || transaction.device_id != device_id
+        || transaction.endpoint != endpoint
+        || now.saturating_duration_since(transaction.issued_at) >= TRANSPORT_TRANSACTION_TTL
+    {
+        return false;
+    }
+    transactions.remove(&nonce);
+    endpoint_health.mark_relay_acknowledged(network_id, endpoint, now);
+    true
 }
 
 fn parse_peer_announcement(packet: &[u8]) -> Option<(NetworkId, DeviceId, SocketAddr)> {
@@ -4150,14 +4213,126 @@ mod tests {
     }
 
     #[test]
-    fn parses_authenticated_relay_acknowledgement() {
+    fn parses_transaction_bound_relay_acknowledgement() {
         let network = NetworkId(Uuid::from_u128(51));
         let device = DeviceId(Uuid::from_u128(52));
+        let nonce = [53_u8; 16];
         let mut packet = Vec::from(RELAY_MAGIC);
         packet.push(RELAY_REGISTER_ACK);
         packet.extend_from_slice(network.0.as_bytes());
         packet.extend_from_slice(device.0.as_bytes());
-        assert_eq!(parse_registration_ack(&packet), Some((network, device)));
+        let legacy = packet.clone();
+        packet.extend_from_slice(&nonce);
+        assert_eq!(
+            parse_registration_ack(&packet),
+            Some((network, device, nonce))
+        );
+        assert_eq!(legacy.len(), 37);
+        assert_eq!(parse_registration_ack(&legacy), None);
+    }
+
+    #[test]
+    fn relay_acknowledgement_requires_the_matching_pending_transaction() {
+        let network = NetworkId(Uuid::from_u128(61));
+        let other_network = NetworkId(Uuid::from_u128(62));
+        let device = DeviceId(Uuid::from_u128(63));
+        let relay: SocketAddr = "203.0.113.61:51820".parse().unwrap();
+        let other_relay: SocketAddr = "203.0.113.62:51820".parse().unwrap();
+        let nonce = [64_u8; 16];
+        let issued_at = Instant::now();
+        let transaction = RelayRegistrationTransaction {
+            network_id: network,
+            device_id: device,
+            endpoint: relay,
+            issued_at,
+        };
+
+        let mut transactions = HashMap::from([(nonce, transaction)]);
+        let mut health = EndpointHealthTable::default();
+
+        assert!(!acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            network,
+            device,
+            [65_u8; 16],
+            relay,
+            issued_at,
+        ));
+        assert!(!acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            other_network,
+            device,
+            nonce,
+            relay,
+            issued_at,
+        ));
+        assert!(!acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            network,
+            device,
+            nonce,
+            other_relay,
+            issued_at,
+        ));
+        assert!(!health.relay_is_healthy(network, relay, issued_at));
+        assert_eq!(transactions.len(), 1);
+
+        assert!(acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            network,
+            device,
+            nonce,
+            relay,
+            issued_at,
+        ));
+        assert!(transactions.is_empty());
+        assert!(health.relay_is_healthy(network, relay, issued_at));
+
+        assert!(!acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            network,
+            device,
+            nonce,
+            relay,
+            issued_at,
+        ));
+    }
+
+    #[test]
+    fn expired_relay_acknowledgement_does_not_consume_or_mark_health() {
+        let network = NetworkId(Uuid::from_u128(71));
+        let device = DeviceId(Uuid::from_u128(72));
+        let relay: SocketAddr = "203.0.113.71:51820".parse().unwrap();
+        let nonce = [73_u8; 16];
+        let issued_at = Instant::now();
+        let mut transactions = HashMap::from([(
+            nonce,
+            RelayRegistrationTransaction {
+                network_id: network,
+                device_id: device,
+                endpoint: relay,
+                issued_at,
+            },
+        )]);
+        let now = issued_at + TRANSPORT_TRANSACTION_TTL;
+        let mut health = EndpointHealthTable::default();
+
+        assert!(!acknowledge_relay_registration(
+            &mut transactions,
+            &mut health,
+            network,
+            device,
+            nonce,
+            relay,
+            now,
+        ));
+        assert_eq!(transactions.len(), 1);
+        assert!(!health.relay_is_healthy(network, relay, now));
     }
 
     #[tokio::test]
