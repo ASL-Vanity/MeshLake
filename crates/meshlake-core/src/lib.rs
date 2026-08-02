@@ -39,8 +39,8 @@ pub use session::{
     SESSION_PROTOCOL_VERSION,
 };
 pub use state_backup::{
-    decode_state_backup, encode_state_backup, write_state_backup_file, StateBackupError,
-    StateBackupKind,
+    decode_state_backup, encode_state_backup, resolve_state_backup_path, write_state_backup_file,
+    StateBackupError, StateBackupKind,
 };
 pub use state_protection::{
     cleanup_stale_state_backup, decode_protected_state, encode_protected_state,

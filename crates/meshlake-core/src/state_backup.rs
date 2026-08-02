@@ -10,7 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -111,6 +111,8 @@ pub enum StateBackupError {
     Randomness,
     #[error("state backup destination already exists: {0}")]
     DestinationExists(PathBuf),
+    #[error("backup path conflicts with a reserved state path")]
+    ReservedStatePath,
     #[error(transparent)]
     StateFile(#[from] StateFileError),
     #[error("cannot {action} {path}: {source}")]
@@ -199,6 +201,28 @@ pub fn decode_state_backup<T: DeserializeOwned>(
             .map_err(|_| StateBackupError::AuthenticationFailed)?,
     );
     serde_json::from_slice(&plaintext).map_err(|_| StateBackupError::InvalidState)
+}
+
+/// Rejects backup paths that resolve to the state file or its lock/recovery
+/// sidecars. Resolution processes `.` and `..` even below nonexistent
+/// directories and canonicalizes every existing component so directory
+/// symlinks cannot hide an alias.
+pub fn resolve_state_backup_path(
+    state_path: &Path,
+    backup_path: &Path,
+) -> Result<PathBuf, StateBackupError> {
+    let backup = resolve_path_with_missing_components(backup_path)?;
+    for reserved in [
+        state_path.to_path_buf(),
+        suffixed_path(state_path, ".lock"),
+        suffixed_path(state_path, ".bak"),
+    ] {
+        let reserved = resolve_path_with_missing_components(&reserved)?;
+        if paths_equal(&backup, &reserved) {
+            return Err(StateBackupError::ReservedStatePath);
+        }
+    }
+    Ok(backup)
 }
 
 /// Atomically writes a fully constructed encrypted backup. Existing files are
@@ -324,6 +348,61 @@ fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+fn resolve_path_with_missing_components(path: &Path) -> Result<PathBuf, StateBackupError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| backup_io("resolve current directory for", path, source))?
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => {
+                        resolved = fs::canonicalize(&candidate).map_err(|source| {
+                            backup_io("resolve existing path component", &candidate, source)
+                        })?;
+                    }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.push(name);
+                    }
+                    Err(source) => {
+                        return Err(backup_io(
+                            "inspect path component while resolving",
+                            &candidate,
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn paths_equal(first: &Path, second: &Path) -> bool {
+    first
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&second.as_os_str().to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn paths_equal(first: &Path, second: &Path) -> bool {
+    first == second
 }
 
 fn backup_io(action: &'static str, path: &Path, source: std::io::Error) -> StateBackupError {
@@ -471,5 +550,57 @@ mod tests {
             decode_state_backup::<SecretState>(&unknown, b"password", StateBackupKind::Agent),
             Err(StateBackupError::UnsupportedVersion(_))
         ));
+    }
+
+    #[test]
+    fn nonexistent_parent_traversal_cannot_alias_any_reserved_state_path() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-backup-path-traversal-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("state.json");
+        fs::write(&state, b"original-state").unwrap();
+        fs::write(suffixed_path(&state, ".lock"), b"lock").unwrap();
+        fs::write(suffixed_path(&state, ".bak"), b"recovery").unwrap();
+
+        for name in ["state.json", "state.json.lock", "state.json.bak"] {
+            let alias = directory.join("missing").join("..").join(name);
+            assert!(matches!(
+                resolve_state_backup_path(&state, &alias),
+                Err(StateBackupError::ReservedStatePath)
+            ));
+        }
+        assert_eq!(fs::read(&state).unwrap(), b"original-state");
+        let safe = resolve_state_backup_path(&state, &directory.join("portable.mlb")).unwrap();
+        assert!(safe.is_absolute());
+        assert_eq!(safe.file_name().unwrap(), "portable.mlb");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlink_then_parent_traversal_cannot_alias_reserved_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-backup-path-symlink-{}", Uuid::new_v4()));
+        let real = directory.join("real");
+        let nested = real.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let state = real.join("state.json");
+        fs::write(&state, b"original-state").unwrap();
+        fs::write(suffixed_path(&state, ".lock"), b"lock").unwrap();
+        fs::write(suffixed_path(&state, ".bak"), b"recovery").unwrap();
+        let alias_root = directory.join("alias");
+        symlink(&nested, &alias_root).unwrap();
+
+        for name in ["state.json", "state.json.lock", "state.json.bak"] {
+            let alias = alias_root.join("..").join(name);
+            assert!(matches!(
+                resolve_state_backup_path(&state, &alias),
+                Err(StateBackupError::ReservedStatePath)
+            ));
+        }
+        assert_eq!(fs::read(&state).unwrap(), b"original-state");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use meshlake_core::{
     cleanup_stale_state_backup, decode_protected_state, decode_state_backup, encode_state_backup,
-    recover_protected_state_file, restrict_state_file_permissions, write_state_backup_file,
-    StateBackupKind, StateFileLock, AGENT_STATE_PROTECTION_PURPOSE,
+    recover_protected_state_file, resolve_state_backup_path, restrict_state_file_permissions,
+    write_state_backup_file, StateBackupKind, StateFileLock, AGENT_STATE_PROTECTION_PURPOSE,
 };
 use std::{
     fs,
@@ -71,7 +71,7 @@ pub(crate) fn backup_with_password(
     force: bool,
 ) -> Result<()> {
     let _state_lock = StateFileLock::acquire(state_path)?;
-    ensure_safe_backup_path(state_path, output)?;
+    let output = resolve_state_backup_path(state_path, output)?;
     recover_protected_state_file(state_path)?;
     if !state_path.exists() {
         anyhow::bail!("agent state file does not exist: {}", state_path.display());
@@ -89,7 +89,7 @@ pub(crate) fn backup_with_password(
         password,
         StateBackupKind::Agent,
     )?);
-    write_state_backup_file(output, &encrypted, force)?;
+    write_state_backup_file(&output, &encrypted, force)?;
     Ok(())
 }
 
@@ -100,9 +100,9 @@ pub(crate) fn restore_with_password(
     force: bool,
 ) -> Result<()> {
     let _state_lock = StateFileLock::acquire(state_path)?;
-    ensure_safe_backup_path(state_path, input)?;
+    let input = resolve_state_backup_path(state_path, input)?;
     recover_protected_state_file(state_path)?;
-    let bytes = fs::read(input)
+    let bytes = fs::read(&input)
         .with_context(|| format!("cannot read agent state backup {}", input.display()))?;
     let mut state: PersistedState = decode_state_backup(&bytes, password, StateBackupKind::Agent)?;
     migrate_and_validate_agent_state(&mut state)?;
@@ -146,50 +146,6 @@ fn read_password(from_stdin: bool, confirm: bool) -> Result<Zeroizing<String>> {
         }
     }
     Ok(password)
-}
-
-fn ensure_safe_backup_path(state_path: &Path, backup_path: &Path) -> Result<()> {
-    let backup = resolved_path(backup_path)?;
-    for reserved in [
-        state_path.to_path_buf(),
-        suffixed_path(state_path, ".lock"),
-        suffixed_path(state_path, ".bak"),
-    ] {
-        if backup == resolved_path(&reserved)? {
-            anyhow::bail!("backup path conflicts with a reserved state path");
-        }
-    }
-    Ok(())
-}
-
-fn resolved_path(path: &Path) -> Result<PathBuf> {
-    if path.exists() {
-        return fs::canonicalize(path)
-            .with_context(|| format!("cannot resolve path {}", path.display()));
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
-    let parent = if parent.exists() {
-        fs::canonicalize(parent)
-            .with_context(|| format!("cannot resolve directory {}", parent.display()))?
-    } else {
-        parent.to_path_buf()
-    };
-    Ok(parent.join(
-        absolute
-            .file_name()
-            .context("state or backup path has no file name")?,
-    ))
-}
-
-fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    value.into()
 }
 
 #[cfg(test)]
@@ -279,5 +235,22 @@ mod tests {
         fs::write(&backup, invalid).unwrap();
         assert!(restore_with_password(&restored, &backup, b"right", true).is_err());
         assert_eq!(fs::read(&restored).unwrap(), before);
+    }
+
+    #[test]
+    fn traversal_alias_cannot_replace_agent_state_even_with_force() {
+        let directory = TestDirectory::new("traversal-alias");
+        let source = directory.file("agent.json");
+        let alias = directory.file("missing").join("..").join("agent.json");
+        write_state(&source, &PersistedState::new()).unwrap();
+        let before = fs::read(&source).unwrap();
+
+        let error = backup_with_password(&source, &alias, b"portable password", true)
+            .expect_err("reserved traversal alias must fail before writing");
+        assert!(error
+            .to_string()
+            .contains("backup path conflicts with a reserved state path"));
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert!(!directory.file("missing").exists());
     }
 }
