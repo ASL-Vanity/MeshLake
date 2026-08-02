@@ -2960,7 +2960,8 @@ async fn handle_root_response(
             ));
             let (self_id, networks) = agent.relay_snapshot().await;
             for peer in discovered {
-                if peer.device_id == self_id
+                if peer.network_id != transaction.network_id
+                    || peer.device_id == self_id
                     || !networks
                         .iter()
                         .any(|network| network.network.id == peer.network_id)
@@ -3603,7 +3604,7 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use meshlake_core::{
-        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy,
+        AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy, RootPeer,
     };
 
     fn suffixed_state_path(path: &FsPath, suffix: &str) -> PathBuf {
@@ -4132,6 +4133,154 @@ mod tests {
         packet.extend_from_slice(network.0.as_bytes());
         packet.extend_from_slice(device.0.as_bytes());
         assert_eq!(parse_registration_ack(&packet), Some((network, device)));
+    }
+
+    #[tokio::test]
+    async fn root_response_cannot_inject_a_peer_from_another_network() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-root-scope-test-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let state = agent.state.read().await;
+        let local_device = state.device_id;
+        let local_identity = identity_signing_key(&state).unwrap();
+        drop(state);
+
+        let controller = SigningKey::from_bytes(&[51_u8; 32]);
+        let root_identity = SigningKey::from_bytes(&[52_u8; 32]);
+        let peer_identity = SigningKey::from_bytes(&[53_u8; 32]);
+        let requested_network = NetworkId(Uuid::from_u128(510));
+        let foreign_network = NetworkId(Uuid::from_u128(520));
+        let peer_device = DeviceId(Uuid::from_u128(521));
+        let requested = joined_network_with_authorization(
+            &controller,
+            &local_identity,
+            local_device,
+            requested_network,
+            Uuid::from_u128(511),
+            1,
+            1,
+            String::new(),
+        );
+        let mut foreign = joined_network_with_authorization(
+            &controller,
+            &local_identity,
+            local_device,
+            foreign_network,
+            Uuid::from_u128(522),
+            1,
+            1,
+            String::new(),
+        );
+        let timestamp = now();
+        let peer_certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: foreign_network,
+                device_id: peer_device,
+                device_public_key: peer_identity.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.90.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.90.0/24".into()],
+                issued_at_unix_seconds: timestamp,
+                expires_at_unix_seconds: Some(timestamp + 86_400),
+            },
+            Uuid::from_u128(523),
+            1,
+            &controller,
+        )
+        .unwrap();
+        let local_foreign_certificate = foreign.certificate.as_ref().unwrap();
+        foreign.control_plane.authorization_manifest = Some(
+            NetworkAuthorizationManifest::sign(
+                foreign_network,
+                2,
+                1,
+                vec![
+                    AuthorizedMembership {
+                        device_id: local_foreign_certificate.claims.device_id,
+                        certificate_id: local_foreign_certificate.certificate_id,
+                        device_public_key: local_foreign_certificate
+                            .claims
+                            .device_public_key
+                            .clone(),
+                        network_key_epoch: local_foreign_certificate.network_key_epoch,
+                    },
+                    AuthorizedMembership {
+                        device_id: peer_device,
+                        certificate_id: peer_certificate.certificate_id,
+                        device_public_key: peer_certificate.claims.device_public_key.clone(),
+                        network_key_epoch: peer_certificate.network_key_epoch,
+                    },
+                ],
+                vec![],
+                timestamp,
+                timestamp + 90,
+                &controller,
+            )
+            .unwrap(),
+        );
+        agent.state.write().await.networks = vec![requested, foreign];
+
+        let root_endpoint: SocketAddr = "127.0.0.1:51819".parse().unwrap();
+        let nonce = [54_u8; 16];
+        let response = SignedRootResponse::sign(
+            nonce,
+            RootResponse::Registered {
+                observed_endpoint: "198.51.100.54:40000".parse().unwrap(),
+                peers: vec![RootPeer {
+                    network_id: foreign_network,
+                    device_id: peer_device,
+                    candidates: vec!["127.0.0.1:52000".parse().unwrap()],
+                    assigned_addresses: peer_certificate.claims.assigned_addresses.clone(),
+                    certificate: Some(peer_certificate),
+                }],
+                refresh_after_seconds: 20,
+            },
+            &root_identity,
+        )
+        .unwrap();
+        let mut root_transactions = HashMap::from([(
+            nonce,
+            RootTransaction {
+                network_id: requested_network,
+                endpoint: root_endpoint,
+                public_key: root_identity.verifying_key().to_bytes().to_vec(),
+                issued_at: Instant::now(),
+            },
+        )]);
+        let roots = vec![PlanetRoot {
+            public_key: root_identity.verifying_key().to_bytes().to_vec(),
+            endpoints: vec![root_endpoint],
+            priority: 0,
+        }];
+        let sockets = TransportSockets::bind().await.unwrap();
+        let mut peers = HashMap::<PeerKey, PeerRoute>::new();
+        let mut sessions = HashMap::<PeerKey, PeerSessionState>::new();
+
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &serde_json::to_vec(&response).unwrap(),
+            &mut peers,
+            &mut sessions,
+            &roots,
+            &mut root_transactions,
+        )
+        .await
+        .unwrap());
+        assert!(!peers.contains_key(&(foreign_network, peer_device)));
+        let health = agent.transport_health.read().await;
+        let health_time = Instant::now();
+        assert!(health
+            .endpoints
+            .root_is_responsive(requested_network, root_endpoint, health_time));
+        assert!(!health
+            .endpoints
+            .root_is_responsive(foreign_network, root_endpoint, health_time));
+        drop(health);
+        drop(sockets);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[test]
