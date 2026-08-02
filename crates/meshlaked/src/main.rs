@@ -46,7 +46,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::{Notify, RwLock},
+    sync::{Mutex, Notify, RwLock},
 };
 use transport_health::{select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
@@ -196,6 +196,10 @@ struct Agent {
     _state_lock: StateFileLock,
     state: RwLock<PersistedState>,
     adapter: adapter::AdapterController,
+    /// Serializes adapter activation, shutdown, address changes, and state
+    /// updates that drive them. When both locks are needed, acquire this before
+    /// `state` to avoid lifecycle/state lock inversion.
+    adapter_lifecycle: Mutex<()>,
     relay_running: AtomicBool,
     transport_supervisor_running: AtomicBool,
     authorization_supervisor_running: AtomicBool,
@@ -333,6 +337,7 @@ impl Agent {
             _state_lock: state_lock,
             state: RwLock::new(state),
             adapter: adapter::AdapterController::new(wintun_dll),
+            adapter_lifecycle: Mutex::new(()),
             relay_running: AtomicBool::new(false),
             transport_supervisor_running: AtomicBool::new(false),
             authorization_supervisor_running: AtomicBool::new(false),
@@ -607,6 +612,7 @@ impl Agent {
         target: &AuthorizationRefreshTarget,
         action: AuthorizationRefreshAction,
     ) -> Result<()> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
         let Some(index) = state
             .networks
@@ -821,6 +827,7 @@ impl Agent {
     }
 
     async fn remove_network(&self, id: NetworkId) -> Result<(), ApiError> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
         let joined = state
             .networks
@@ -873,6 +880,7 @@ impl Agent {
             enrollment.authorization.clone(),
         )
         .await?;
+        let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
         if enrollment.certificate.claims.device_id != state.device_id {
             return Err(ApiError::bad_request(
@@ -949,12 +957,46 @@ impl Agent {
     }
 
     async fn activate_adapter(&self) -> Result<(), ApiError> {
-        self.adapter.activate().map_err(ApiError::internal)?;
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        ensure_adapter_activation_allowed(self.shutting_down.load(Ordering::Acquire))?;
         let networks = self.state.read().await.networks.clone();
-        self.adapter
-            .configure_networks(&networks)
-            .map_err(ApiError::internal)
+        let was_active = self.adapter.is_active();
+        activate_adapter_transaction(
+            was_active,
+            || self.adapter.activate(),
+            || self.adapter.configure_networks(&networks),
+            || self.adapter.deactivate(),
+        )
+        .map_err(ApiError::internal)
     }
+
+    async fn deactivate_adapter(&self) {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        self.adapter.deactivate();
+    }
+}
+
+fn activate_adapter_transaction<E>(
+    was_active: bool,
+    activate: impl FnOnce() -> std::result::Result<(), E>,
+    configure: impl FnOnce() -> std::result::Result<(), E>,
+    rollback: impl FnOnce(),
+) -> std::result::Result<(), E> {
+    activate()?;
+    if let Err(error) = configure() {
+        if !was_active {
+            rollback();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn ensure_adapter_activation_allowed(shutting_down: bool) -> Result<(), ApiError> {
+    if shutting_down {
+        return Err(ApiError::conflict("MeshLake agent is shutting down"));
+    }
+    Ok(())
 }
 
 fn identity_signing_key(state: &PersistedState) -> Result<SigningKey> {
@@ -1598,12 +1640,12 @@ async fn activate_adapter(State(agent): State<Arc<Agent>>) -> Result<StatusCode,
     Ok(StatusCode::NO_CONTENT)
 }
 async fn deactivate_adapter(State(agent): State<Arc<Agent>>) -> StatusCode {
-    agent.adapter.deactivate();
+    agent.deactivate_adapter().await;
     StatusCode::NO_CONTENT
 }
 async fn shutdown_agent(State(agent): State<Arc<Agent>>) -> StatusCode {
     agent.shutting_down.store(true, Ordering::Release);
-    agent.adapter.deactivate();
+    agent.deactivate_adapter().await;
     agent.shutdown.notify_waiters();
     StatusCode::NO_CONTENT
 }
@@ -1670,7 +1712,7 @@ async fn main() -> Result<()> {
                         eprintln!("MeshLake could not install the Ctrl+C handler: {error}");
                     }
                     shutdown_agent.shutting_down.store(true, Ordering::Release);
-                    shutdown_agent.adapter.deactivate();
+                    shutdown_agent.deactivate_adapter().await;
                     shutdown_agent.shutdown.notify_waiters();
                 }
             }
@@ -3694,6 +3736,91 @@ mod tests {
     use meshlake_core::{
         AuthorizedMembership, MembershipClaims, NetworkAuthorizationManifest, RelayPolicy, RootPeer,
     };
+    use std::cell::Cell;
+
+    #[test]
+    fn adapter_activation_failure_skips_configuration_and_rollback() {
+        let configured = Cell::new(false);
+        let rolled_back = Cell::new(false);
+        let result = activate_adapter_transaction(
+            false,
+            || Err("activation failed"),
+            || {
+                configured.set(true);
+                Ok(())
+            },
+            || rolled_back.set(true),
+        );
+
+        assert_eq!(result, Err("activation failed"));
+        assert!(!configured.get());
+        assert!(!rolled_back.get());
+    }
+
+    #[test]
+    fn new_adapter_session_rolls_back_when_configuration_fails() {
+        let activated = Cell::new(false);
+        let rolled_back = Cell::new(false);
+        let result = activate_adapter_transaction(
+            false,
+            || {
+                activated.set(true);
+                Ok(())
+            },
+            || Err("configuration failed"),
+            || rolled_back.set(true),
+        );
+
+        assert_eq!(result, Err("configuration failed"));
+        assert!(activated.get());
+        assert!(rolled_back.get());
+    }
+
+    #[test]
+    fn existing_adapter_session_is_not_closed_by_reconfiguration_failure() {
+        let rolled_back = Cell::new(false);
+        let result = activate_adapter_transaction(
+            true,
+            || Ok(()),
+            || Err("configuration failed"),
+            || rolled_back.set(true),
+        );
+
+        assert_eq!(result, Err("configuration failed"));
+        assert!(!rolled_back.get());
+    }
+
+    #[test]
+    fn successful_adapter_activation_keeps_the_new_session() {
+        let activated = Cell::new(false);
+        let configured = Cell::new(false);
+        let rolled_back = Cell::new(false);
+        let result: std::result::Result<(), &str> = activate_adapter_transaction(
+            false,
+            || {
+                activated.set(true);
+                Ok(())
+            },
+            || {
+                configured.set(true);
+                Ok(())
+            },
+            || rolled_back.set(true),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(activated.get());
+        assert!(configured.get());
+        assert!(!rolled_back.get());
+    }
+
+    #[test]
+    fn adapter_activation_is_refused_after_shutdown_begins() {
+        assert!(ensure_adapter_activation_allowed(false).is_ok());
+        let error = ensure_adapter_activation_allowed(true).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "MeshLake agent is shutting down");
+    }
 
     fn suffixed_state_path(path: &FsPath, suffix: &str) -> PathBuf {
         let mut value = path.as_os_str().to_os_string();
