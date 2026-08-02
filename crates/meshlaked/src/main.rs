@@ -1,4 +1,5 @@
 mod adapter;
+mod data_plane;
 mod port_mapping;
 mod upnp;
 
@@ -11,8 +12,10 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+use data_plane::ip::{
+    address_belongs_to_network, is_group_destination, network_for_ip_packet, packet_addresses,
+};
 use ed25519_dalek::SigningKey;
-use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::{
     accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
@@ -2082,22 +2085,6 @@ fn record_session_handshake(
     true
 }
 
-fn address_belongs_to_network(network: &JoinedNetwork, address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(address) => network
-            .network
-            .ipv4_prefix
-            .parse::<Ipv4Net>()
-            .is_ok_and(|prefix| prefix.contains(&address)),
-        std::net::IpAddr::V6(address) => network
-            .network
-            .ipv6_prefix
-            .as_deref()
-            .and_then(|prefix| prefix.parse::<Ipv6Net>().ok())
-            .is_some_and(|prefix| prefix.contains(&address)),
-    }
-}
-
 type PeerKey = (NetworkId, DeviceId);
 
 enum PeerSessionState {
@@ -3576,56 +3563,6 @@ fn parse_punch(packet: &[u8], kind: u8) -> Option<(NetworkId, DeviceId)> {
         NetworkId(Uuid::from_slice(&packet[5..21]).ok()?),
         DeviceId(Uuid::from_slice(&packet[21..37]).ok()?),
     ))
-}
-
-fn network_for_ip_packet<'a>(
-    networks: &'a [JoinedNetwork],
-    packet: &[u8],
-) -> Option<&'a JoinedNetwork> {
-    let (source, destination) = packet_addresses(packet)?;
-    networks.iter().find(|network| {
-        network.network_key.len() == 32
-            && (address_belongs_to_network(network, destination)
-                || (is_group_destination(network, destination)
-                    && address_belongs_to_network(network, source)))
-    })
-}
-
-fn packet_addresses(packet: &[u8]) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
-    match packet.first().map(|byte| byte >> 4) {
-        Some(4) if packet.len() >= 20 => Some((
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                packet[12], packet[13], packet[14], packet[15],
-            )),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                packet[16], packet[17], packet[18], packet[19],
-            )),
-        )),
-        Some(6) if packet.len() >= 40 => Some((
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                <[u8; 16]>::try_from(&packet[8..24]).ok()?,
-            )),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                <[u8; 16]>::try_from(&packet[24..40]).ok()?,
-            )),
-        )),
-        _ => None,
-    }
-}
-
-fn is_group_destination(network: &JoinedNetwork, destination: std::net::IpAddr) -> bool {
-    match destination {
-        std::net::IpAddr::V4(destination) => {
-            destination == std::net::Ipv4Addr::BROADCAST
-                || destination.is_multicast()
-                || network
-                    .network
-                    .ipv4_prefix
-                    .parse::<Ipv4Net>()
-                    .is_ok_and(|prefix| destination == prefix.broadcast())
-        }
-        std::net::IpAddr::V6(destination) => destination.is_multicast(),
-    }
 }
 
 fn peer_targets_for_packet(
