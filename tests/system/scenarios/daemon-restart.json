@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "id": "daemon-restart",
+  "description": "Restart meshlaked and prove process-local sessions are cleared before a fresh authenticated session is established.",
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "root_primary", "platforms": ["linux", "windows"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "baseline",
+      "actions": [
+        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "before_restart" }
+      ],
+      "assertions": [
+        { "type": "session", "snapshot": "before_restart", "state": "established" },
+        { "type": "transport_revision_present", "snapshot": "before_restart" }
+      ]
+    },
+    {
+      "name": "restart",
+      "actions": [
+        { "type": "restart_daemon", "role": "node_a" },
+        { "type": "wait_local_api", "role": "node_a", "path": "/v1/status" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "after_restart" }
+      ],
+      "assertions": [
+        { "type": "session_list_empty", "snapshot": "after_restart" },
+        { "type": "old_security_context_absent", "snapshot": "after_restart" },
+        { "type": "no_secret_fields", "api": "/v1/sessions" }
+      ]
+    },
+    {
+      "name": "reestablish",
+      "actions": [
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "fresh_session" }
+      ],
+      "assertions": [
+        { "type": "session", "snapshot": "fresh_session", "state": "established" },
+        { "type": "fresh_session_age", "snapshot": "fresh_session", "maximum_ms": 60000 }
+      ]
+    }
+  ]
+}

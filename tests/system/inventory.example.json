@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "role": "node_a",
+      "name": "replace-node-a",
+      "platform": "windows",
+      "address": "replace-before-use"
+    },
+    {
+      "role": "node_b",
+      "name": "replace-node-b",
+      "platform": "linux",
+      "address": "replace-before-use"
+    },
+    {
+      "role": "root_primary",
+      "name": "replace-with-root-host",
+      "platform": "linux",
+      "address": "replace-before-use"
+    },
+    {
+      "role": "root_secondary",
+      "name": "replace-with-second-root-host",
+      "platform": "linux",
+      "address": "replace-before-use"
+    },
+    {
+      "role": "relay_primary",
+      "name": "replace-with-relay-host",
+      "platform": "linux",
+      "address": "replace-before-use"
+    },
+    {
+      "role": "relay_secondary",
+      "name": "replace-with-second-relay-host",
+      "platform": "linux",
+      "address": "replace-before-use"
+    }
+  ]
+}

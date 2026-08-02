@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand, ValueEnum};
 use meshlake_core::{
-    AgentStatus, EnrollmentResponse, JoinedNetwork, RelayPolicy, UpsertNetworkRequest,
-    VirtualNetwork,
+    AgentStatus, EnrollmentResponse, JoinedNetwork, RelayPolicy, SessionList, SessionObservation,
+    SessionPath, SessionState, UpsertNetworkRequest, VirtualNetwork,
 };
 use reqwest::{Certificate, Client, StatusCode};
 use std::{fs, path::PathBuf};
@@ -25,6 +25,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Status,
+    /// List sanitized pairwise-session state from the local daemon.
+    Sessions {
+        /// Print the versioned /v1/sessions response without lossy reformatting.
+        #[arg(long)]
+        json: bool,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -199,6 +205,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Status => {
             print_status(client.get(format!("{LOCAL_API}/status")).send().await?).await?
+        }
+        Command::Sessions { json } => {
+            print_sessions(
+                client.get(format!("{LOCAL_API}/sessions")).send().await?,
+                json,
+            )
+            .await?
         }
         Command::Agent {
             command: AgentCommand::Stop,
@@ -931,6 +944,72 @@ async fn print_status(response: reqwest::Response) -> Result<()> {
     }
     Ok(())
 }
+
+async fn print_sessions(response: reqwest::Response, json: bool) -> Result<()> {
+    let sessions: SessionList = ensure_success(response)
+        .await?
+        .json()
+        .await
+        .context("invalid session response")?;
+    if json {
+        println!("{}", render_sessions_json(&sessions)?);
+        return Ok(());
+    }
+    print!("{}", render_sessions(&sessions));
+    Ok(())
+}
+
+fn render_sessions_json(response: &SessionList) -> Result<String> {
+    serde_json::to_string_pretty(response).context("could not serialize session response")
+}
+
+fn render_sessions(response: &SessionList) -> String {
+    if response.sessions.is_empty() {
+        return format!(
+            "No pairwise sessions. Transport revision {}.\n",
+            response.transport_revision
+        );
+    }
+    let mut output = format!(
+        "Pairwise sessions: {} (transport revision {})\n",
+        response.sessions.len(),
+        response.transport_revision
+    );
+    for session in &response.sessions {
+        output.push_str(&render_session(session));
+    }
+    output
+}
+
+fn render_session(session: &SessionObservation) -> String {
+    let state = match session.state {
+        SessionState::Pending => "pending",
+        SessionState::Established => "established",
+        SessionState::Expired => "expired",
+    };
+    let path = match session.path {
+        SessionPath::Unknown => "unknown",
+        SessionPath::Direct => "direct",
+        SessionPath::Relay => "relay",
+    };
+    format!(
+        "  network {}  peer {}  {} via {}  age={}ms  queue={}/{} dropped={}  security={{attempts:{}, retries:{}, tx:{}, rx_auth:{}, rx_rejected:{}}}\n",
+        session.network_id.0,
+        session.peer_device_id.0,
+        state,
+        path,
+        session.age_ms,
+        session.queue.queued_packets,
+        session.queue.queue_capacity,
+        session.queue.dropped_packets,
+        session.security.handshake_attempts,
+        session.security.handshake_retries,
+        session.security.encrypted_packets_sent,
+        session.security.authenticated_packets_received,
+        session.security.rejected_packets_received,
+    )
+}
+
 async fn print_networks(response: reqwest::Response) -> Result<()> {
     for network in ensure_success(response)
         .await?
@@ -1162,6 +1241,70 @@ mod tests {
         };
         assert_eq!(ipv4_prefix, "100.64.50.0/24");
         assert_eq!(ipv6_prefix.as_deref(), Some("fd42:4d4c:50::/64"));
+    }
+
+    #[test]
+    fn parses_sessions_json_command() {
+        let cli = Cli::try_parse_from(["meshlake", "sessions", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Sessions { json: true }));
+    }
+
+    #[test]
+    fn session_json_output_is_versioned_and_stable() {
+        let response = SessionList {
+            schema_version: 1,
+            generated_at_unix_ms: 123,
+            transport_revision: 7,
+            sessions: vec![SessionObservation {
+                network_id: meshlake_core::NetworkId(Uuid::from_u128(1)),
+                peer_device_id: meshlake_core::DeviceId(Uuid::from_u128(2)),
+                state: SessionState::Established,
+                path: SessionPath::Relay,
+                age_ms: 45,
+                queue: meshlake_core::SessionQueueCounters {
+                    queued_packets: 0,
+                    queue_capacity: 8,
+                    dropped_packets: 1,
+                },
+                security: meshlake_core::SessionSecurityCounters {
+                    handshake_attempts: 2,
+                    handshake_retries: 1,
+                    encrypted_packets_sent: 3,
+                    authenticated_packets_received: 4,
+                    rejected_packets_received: 5,
+                },
+            }],
+        };
+
+        assert_eq!(
+            render_sessions_json(&response).unwrap(),
+            r#"{
+  "schema_version": 1,
+  "generated_at_unix_ms": 123,
+  "transport_revision": 7,
+  "sessions": [
+    {
+      "network_id": "00000000-0000-0000-0000-000000000001",
+      "peer_device_id": "00000000-0000-0000-0000-000000000002",
+      "state": "established",
+      "path": "relay",
+      "age_ms": 45,
+      "queue": {
+        "queued_packets": 0,
+        "queue_capacity": 8,
+        "dropped_packets": 1
+      },
+      "security": {
+        "handshake_attempts": 2,
+        "handshake_retries": 1,
+        "encrypted_packets_sent": 3,
+        "authenticated_packets_received": 4,
+        "rejected_packets_received": 5
+      }
+    }
+  ]
+}"#
+        );
     }
 }
 async fn print_network(response: reqwest::Response) -> Result<()> {

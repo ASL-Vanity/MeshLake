@@ -8,6 +8,7 @@ mod policy;
 mod relay;
 mod root;
 mod session;
+mod session_observation;
 mod state_backup;
 mod state_protection;
 
@@ -41,6 +42,10 @@ pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,
     InitiatorHandshake, PairwiseSessionKeys, ReplayWindow, SessionPacket, SESSION_DATA_HEADER_LEN,
     SESSION_PROTOCOL_VERSION,
+};
+pub use session_observation::{
+    SessionList, SessionObservation, SessionPath, SessionQueueCounters, SessionSecurityCounters,
+    SessionState, SESSION_API_SCHEMA_VERSION,
 };
 pub use state_backup::{
     decode_state_backup, encode_state_backup, resolve_state_backup_path, write_state_backup_file,

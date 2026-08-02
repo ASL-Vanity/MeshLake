@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "dual-stack-direct",
+  "description": "Establish one isolated pairwise session and verify direct IPv4 and IPv6 overlay traffic.",
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "root_primary", "platforms": ["linux", "windows"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "enroll",
+      "actions": [
+        { "type": "create_network", "network": "test_network", "ipv4": true, "ipv6": true },
+        { "type": "enroll_nodes", "network": "test_network", "roles": ["node_a", "node_b"] },
+        { "type": "wait_transport_ready", "roles": ["node_a", "node_b"] }
+      ],
+      "assertions": [
+        { "type": "network_isolation_key", "fields": ["network_id", "peer_device_id"] },
+        { "type": "no_secret_fields", "api": "/v1/sessions" }
+      ]
+    },
+    {
+      "name": "direct_dual_stack",
+      "actions": [
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv6" }
+      ],
+      "assertions": [
+        { "type": "overlay_probe_succeeds", "families": ["ipv4", "ipv6"] },
+        { "type": "session", "role": "node_a", "state": "established", "path": "direct" },
+        { "type": "security_counters_monotonic", "role": "node_a" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "direct-relay-fallback",
+  "description": "Verify a live peer can move from a direct path to the configured relay without crossing network boundaries.",
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "root_primary", "platforms": ["linux", "windows"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "direct_baseline",
+      "actions": [
+        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "direct" }
+      ],
+      "assertions": [
+        { "type": "session", "snapshot": "direct", "state": "established", "path": "direct" },
+        { "type": "queue_bounded", "snapshot": "direct", "maximum": 8 }
+      ]
+    },
+    {
+      "name": "force_relay",
+      "actions": [
+        { "type": "block_direct_path", "roles": ["node_a", "node_b"], "scope": "disposable_hosts_only" },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "relay" }
+      ],
+      "assertions": [
+        { "type": "overlay_probe_succeeds", "families": ["ipv4"] },
+        { "type": "session", "snapshot": "relay", "state": "established", "path": "relay" },
+        { "type": "same_network_and_peer", "snapshots": ["direct", "relay"] }
+      ]
+    },
+    {
+      "name": "cleanup",
+      "actions": [
+        { "type": "restore_direct_path", "roles": ["node_a", "node_b"] }
+      ],
+      "assertions": [
+        { "type": "fault_injection_removed", "roles": ["node_a", "node_b"] }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "root-relay-failover",
+  "description": "Validate primary Root and Relay failure handling with explicitly configured secondary endpoints.",
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "root_primary", "platforms": ["linux", "windows"] },
+    { "role": "root_secondary", "platforms": ["linux", "windows"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] },
+    { "role": "relay_secondary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "healthy_baseline",
+      "actions": [
+        { "type": "configure_ordered_roots", "roles": ["root_primary", "root_secondary"] },
+        { "type": "configure_ordered_relays", "roles": ["relay_primary", "relay_secondary"] },
+        { "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b" }
+      ],
+      "assertions": [
+        { "type": "root_responsive", "role": "root_primary" },
+        { "type": "relay_healthy", "role": "relay_primary" },
+        { "type": "session", "role": "node_a", "state": "established" }
+      ]
+    },
+    {
+      "name": "primary_failure",
+      "actions": [
+        { "type": "stop_service", "role": "root_primary", "service": "meshlake-root" },
+        { "type": "stop_service", "role": "relay_primary", "service": "meshlake-relay" },
+        { "type": "wait_health_convergence" },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" }
+      ],
+      "assertions": [
+        { "type": "root_responsive", "role": "root_secondary" },
+        { "type": "relay_healthy", "role": "relay_secondary" },
+        { "type": "overlay_probe_succeeds", "families": ["ipv4"] },
+        { "type": "no_cross_network_session_reuse" }
+      ]
+    },
+    {
+      "name": "cleanup",
+      "actions": [
+        { "type": "start_service", "role": "root_primary", "service": "meshlake-root" },
+        { "type": "start_service", "role": "relay_primary", "service": "meshlake-relay" }
+      ],
+      "assertions": [
+        { "type": "service_running", "role": "root_primary", "service": "meshlake-root" },
+        { "type": "service_running", "role": "relay_primary", "service": "meshlake-relay" }
+      ]
+    }
+  ]
+}

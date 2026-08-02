@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "authorization-revocation",
+  "description": "Revoke one member and verify old sessions and authorization state are removed without affecting another network.",
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "root_primary", "platforms": ["linux", "windows"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "two_network_baseline",
+      "actions": [
+        { "type": "enroll_nodes", "network": "revoked_network", "roles": ["node_a", "node_b"] },
+        { "type": "enroll_nodes", "network": "control_network", "roles": ["node_a", "node_b"] },
+        { "type": "establish_sessions", "networks": ["revoked_network", "control_network"] }
+      ],
+      "assertions": [
+        { "type": "session_count_by_network", "network": "revoked_network", "minimum": 1 },
+        { "type": "session_count_by_network", "network": "control_network", "minimum": 1 }
+      ]
+    },
+    {
+      "name": "revoke",
+      "actions": [
+        { "type": "revoke_member", "network": "revoked_network", "role": "node_b" },
+        { "type": "wait_authorization_refresh", "role": "node_b" }
+      ],
+      "assertions": [
+        { "type": "network_absent", "network": "revoked_network", "role": "node_b" },
+        { "type": "session_absent", "network": "revoked_network", "role": "node_b" },
+        { "type": "session", "network": "control_network", "role": "node_b", "state": "established" },
+        { "type": "old_security_context_absent", "network": "revoked_network" }
+      ]
+    }
+  ]
+}

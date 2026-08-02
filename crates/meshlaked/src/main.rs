@@ -1,6 +1,7 @@
 mod adapter;
 mod data_plane;
 mod port_mapping;
+mod session_observability;
 mod state_backup_command;
 mod transport_health;
 mod upnp;
@@ -29,7 +30,8 @@ use meshlake_core::{
     MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
     NetworkControlPlane, NetworkId, NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys,
     PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
-    RootRegistration, RootResponse, SignedRootResponse, StateFileLock, TransportStatus,
+    RootRegistration, RootResponse, SessionList, SessionPath, SessionQueueCounters,
+    SessionSecurityCounters, SessionState, SignedRootResponse, StateFileLock, TransportStatus,
     UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
     RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
     RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
@@ -55,6 +57,8 @@ use tokio::{
 use transport_health::{select_relay_endpoint, EndpointHealthTable};
 use uuid::Uuid;
 
+use session_observability::{SessionObservability, SessionTelemetry};
+
 const LOCAL_API: &str = "127.0.0.1:51821";
 const AGENT_STATE_SCHEMA_VERSION: u32 = 3;
 const PEER_DIRECTORY_TTL: Duration = Duration::from_secs(120);
@@ -67,6 +71,7 @@ const MAX_HANDSHAKE_REPLAY_ENTRIES: usize = 16_384;
 const TRANSPORT_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const AUTHORIZATION_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const CERTIFICATE_REFRESH_MARGIN_SECONDS: u64 = 300;
+const SESSION_QUEUE_CAPACITY: usize = 8;
 
 #[derive(Parser)]
 #[command(
@@ -215,6 +220,7 @@ struct Agent {
     transport_revision: AtomicU64,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
+    session_observability: SessionObservability,
     transport_reload: Notify,
     shutdown: Notify,
 }
@@ -310,6 +316,8 @@ impl Agent {
             write_state(&path, &state)?;
         }
         cleanup_stale_state_backup(&path)?;
+        let session_observability = SessionObservability::default();
+        session_observability.reset(1);
         Ok(Self {
             path,
             _state_lock: state_lock,
@@ -322,6 +330,7 @@ impl Agent {
             transport_revision: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
+            session_observability,
             transport_reload: Notify::new(),
             shutdown: Notify::new(),
         })
@@ -526,8 +535,13 @@ impl Agent {
     }
 
     fn request_transport_reload(&self) {
-        self.transport_revision.fetch_add(1, Ordering::AcqRel);
+        let revision = self.transport_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.session_observability.reset(revision);
         self.transport_reload.notify_one();
+    }
+
+    fn sessions(&self) -> SessionList {
+        self.session_observability.snapshot()
     }
 
     async fn relay_snapshot(&self) -> (DeviceId, Vec<JoinedNetwork>) {
@@ -909,6 +923,7 @@ impl Agent {
                     break;
                 }
                 let revision = agent.transport_revision.load(Ordering::Acquire);
+                agent.session_observability.reset(revision);
                 let configuration = agent.transport_configuration().await;
                 if configuration.is_empty() {
                     agent.relay_running.store(false, Ordering::Release);
@@ -920,6 +935,7 @@ impl Agent {
                 agent.relay_running.store(true, Ordering::Release);
                 let result = run_relay_worker(Arc::clone(&agent), configuration, revision).await;
                 agent.relay_running.store(false, Ordering::Release);
+                agent.session_observability.clear_if_revision(revision);
                 *agent.transport_health.write().await = TransportHealth::default();
                 if agent.shutting_down.load(Ordering::Acquire) {
                     break;
@@ -939,6 +955,8 @@ impl Agent {
                 }
             }
             agent.relay_running.store(false, Ordering::Release);
+            let revision = agent.transport_revision.load(Ordering::Acquire);
+            agent.session_observability.clear_if_revision(revision);
             agent
                 .transport_supervisor_running
                 .store(false, Ordering::Release);
@@ -1844,6 +1862,9 @@ impl axum::response::IntoResponse for ApiError {
 async fn get_status(State(agent): State<Arc<Agent>>) -> Json<AgentStatus> {
     Json(agent.status().await)
 }
+async fn list_sessions(State(agent): State<Arc<Agent>>) -> Json<SessionList> {
+    Json(agent.sessions())
+}
 async fn list_networks(State(agent): State<Arc<Agent>>) -> Json<Vec<JoinedNetwork>> {
     Json(agent.status().await.networks)
 }
@@ -1931,6 +1952,7 @@ async fn main() -> Result<()> {
     agent.start_relay_worker().await?;
     let app = Router::new()
         .route("/v1/status", get(get_status))
+        .route("/v1/sessions", get(list_sessions))
         .route("/v1/networks", get(list_networks).post(create_network))
         .route("/v1/networks/enroll", post(enroll_network))
         .route("/v1/networks/{id}", delete(leave_network))
@@ -2403,6 +2425,11 @@ enum PeerSessionState {
         created_at: Instant,
         last_sent: Instant,
         queued_packets: VecDeque<Vec<u8>>,
+        path: SessionPath,
+        dropped_packets: u64,
+        handshake_attempts: u64,
+        handshake_retries: u64,
+        rejected_packets_received: u64,
     },
     Established {
         keys: PairwiseSessionKeys,
@@ -2411,6 +2438,12 @@ enum PeerSessionState {
         replay_window: ReplayWindow,
         established_at: Instant,
         cached_response: Option<Vec<u8>>,
+        path: SessionPath,
+        dropped_packets: u64,
+        handshake_attempts: u64,
+        handshake_retries: u64,
+        authenticated_packets_received: u64,
+        rejected_packets_received: u64,
     },
 }
 
@@ -2436,6 +2469,110 @@ impl PeerSessionState {
             }
         }
     }
+
+    fn set_path(&mut self, path: SessionPath) {
+        match self {
+            Self::Pending {
+                path: current_path, ..
+            }
+            | Self::Established {
+                path: current_path, ..
+            } => *current_path = path,
+        }
+    }
+
+    fn record_rejected_packet(&mut self) {
+        match self {
+            Self::Pending {
+                rejected_packets_received,
+                ..
+            }
+            | Self::Established {
+                rejected_packets_received,
+                ..
+            } => {
+                *rejected_packets_received = rejected_packets_received.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_authenticated_packet(&mut self) {
+        if let Self::Established {
+            authenticated_packets_received,
+            ..
+        } = self
+        {
+            *authenticated_packets_received = authenticated_packets_received.saturating_add(1);
+        }
+    }
+
+    fn telemetry(&self) -> SessionTelemetry {
+        match self {
+            Self::Pending {
+                created_at,
+                queued_packets,
+                path,
+                dropped_packets,
+                handshake_attempts,
+                handshake_retries,
+                rejected_packets_received,
+                ..
+            } => SessionTelemetry {
+                state: SessionState::Pending,
+                path: *path,
+                started_at: *created_at,
+                queue: SessionQueueCounters {
+                    queued_packets: queued_packets.len() as u64,
+                    queue_capacity: SESSION_QUEUE_CAPACITY as u64,
+                    dropped_packets: *dropped_packets,
+                },
+                security: SessionSecurityCounters {
+                    handshake_attempts: *handshake_attempts,
+                    handshake_retries: *handshake_retries,
+                    rejected_packets_received: *rejected_packets_received,
+                    ..SessionSecurityCounters::default()
+                },
+            },
+            Self::Established {
+                next_sequence,
+                established_at,
+                path,
+                dropped_packets,
+                handshake_attempts,
+                handshake_retries,
+                authenticated_packets_received,
+                rejected_packets_received,
+                ..
+            } => SessionTelemetry {
+                state: SessionState::Established,
+                path: *path,
+                started_at: *established_at,
+                queue: SessionQueueCounters {
+                    queued_packets: 0,
+                    queue_capacity: SESSION_QUEUE_CAPACITY as u64,
+                    dropped_packets: *dropped_packets,
+                },
+                security: SessionSecurityCounters {
+                    handshake_attempts: *handshake_attempts,
+                    handshake_retries: *handshake_retries,
+                    encrypted_packets_sent: *next_sequence,
+                    authenticated_packets_received: *authenticated_packets_received,
+                    rejected_packets_received: *rejected_packets_received,
+                },
+            },
+        }
+    }
+}
+
+fn publish_session(
+    agent: &Agent,
+    transport_revision: u64,
+    key: PeerKey,
+    session: &PeerSessionState,
+) {
+    agent
+        .session_observability
+        .publish(transport_revision, key.0, key.1, session.telemetry());
 }
 
 enum PreparedPeerPacket {
@@ -2482,13 +2619,20 @@ fn prepare_outbound_peer_packet(
                 init_packet,
                 last_sent,
                 queued_packets,
+                dropped_packets,
+                handshake_attempts,
+                handshake_retries,
                 ..
             } => {
-                if queued_packets.len() < 8 {
+                if queued_packets.len() < SESSION_QUEUE_CAPACITY {
                     queued_packets.push_back(plaintext.to_vec());
+                } else {
+                    *dropped_packets = dropped_packets.saturating_add(1);
                 }
                 if current_time.saturating_duration_since(*last_sent) >= HANDSHAKE_RETRY {
                     *last_sent = current_time;
+                    *handshake_attempts = handshake_attempts.saturating_add(1);
+                    *handshake_retries = handshake_retries.saturating_add(1);
                     return Ok(Some(PreparedPeerPacket::Handshake(init_packet.clone())));
                 }
                 return Ok(None);
@@ -2527,6 +2671,11 @@ fn prepare_outbound_peer_packet(
             created_at: current_time,
             last_sent: current_time,
             queued_packets: VecDeque::from([plaintext.to_vec()]),
+            path: SessionPath::Unknown,
+            dropped_packets: 0,
+            handshake_attempts: 1,
+            handshake_retries: 0,
+            rejected_packets_received: 0,
         },
     );
     Ok(Some(PreparedPeerPacket::Handshake(init_packet)))
@@ -2541,7 +2690,7 @@ async fn send_peer_routed_packet(
     target_device: DeviceId,
     packet: &[u8],
     description: &str,
-) -> bool {
+) -> Option<SessionPath> {
     if !matches!(network.network.relay_policy, RelayPolicy::Required) {
         if let Some(direct_endpoint) = route.best_endpoint(Instant::now()) {
             if sockets.send_to(packet, direct_endpoint).await {
@@ -2549,12 +2698,12 @@ async fn send_peer_routed_packet(
                     "sent {description} for member {} directly to {direct_endpoint}",
                     target_device.0
                 ));
-                return true;
+                return Some(SessionPath::Direct);
             }
         }
     }
     if matches!(network.network.relay_policy, RelayPolicy::Disabled) {
-        return false;
+        return None;
     }
     let Some(relay_endpoint) = select_relay_endpoint(
         network.network.id,
@@ -2562,16 +2711,16 @@ async fn send_peer_routed_packet(
         endpoint_health,
         Instant::now(),
     ) else {
-        return false;
+        return None;
     };
     if sockets.send_to(packet, relay_endpoint).await {
         trace_transport(format!(
             "sent {description} for member {} through relay {relay_endpoint}",
             target_device.0
         ));
-        return true;
+        return Some(SessionPath::Relay);
     }
-    false
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -2753,6 +2902,7 @@ async fn run_relay_worker(
                     &agent,
                     &sockets,
                     &configuration,
+                    configuration_revision,
                     remote,
                     &incoming_ipv4[..size],
                     &mut peers,
@@ -2772,6 +2922,7 @@ async fn run_relay_worker(
                     &agent,
                     &sockets,
                     &configuration,
+                    configuration_revision,
                     remote,
                     &incoming_ipv6[..size],
                     &mut peers,
@@ -2826,12 +2977,24 @@ async fn run_relay_worker(
                             && local_network_is_authorized(network, authorization_time)
                     })
                 });
-                sessions.retain(|(network_id, _), _| {
-                    networks.iter().any(|network| {
-                        network.network.id == *network_id
-                            && local_network_is_authorized(network, authorization_time)
+                let unauthorized_sessions = sessions
+                    .keys()
+                    .copied()
+                    .filter(|(network_id, _)| {
+                        !networks.iter().any(|network| {
+                            network.network.id == *network_id
+                                && local_network_is_authorized(network, authorization_time)
+                        })
                     })
-                });
+                    .collect::<Vec<_>>();
+                for key in unauthorized_sessions {
+                    sessions.remove(&key);
+                    agent.session_observability.remove(
+                        configuration_revision,
+                        key.0,
+                        key.1,
+                    );
+                }
                 if tokio::time::Instant::now() >= next_handshake_retry {
                     let retry_time = Instant::now();
                     let retries = sessions
@@ -2840,11 +3003,15 @@ async fn run_relay_worker(
                             PeerSessionState::Pending {
                                 init_packet,
                                 last_sent,
+                                handshake_attempts,
+                                handshake_retries,
                                 ..
                             } if retry_time.saturating_duration_since(*last_sent)
                                 >= HANDSHAKE_RETRY =>
                             {
                                 *last_sent = retry_time;
+                                *handshake_attempts = handshake_attempts.saturating_add(1);
+                                *handshake_retries = handshake_retries.saturating_add(1);
                                 Some((*key, init_packet.clone()))
                             }
                             _ => None,
@@ -2863,7 +3030,7 @@ async fn run_relay_worker(
                         let Some(route) = peers.get(&(network_id, target_device)) else {
                             continue;
                         };
-                        send_peer_routed_packet(
+                        if let Some(path) = send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network_id),
                             &endpoint_health,
@@ -2873,7 +3040,20 @@ async fn run_relay_worker(
                             &handshake,
                             "session handshake retry",
                         )
-                        .await;
+                        .await
+                        {
+                            if let Some(session) = sessions.get_mut(&(network_id, target_device)) {
+                                session.set_path(path);
+                            }
+                        }
+                        if let Some(session) = sessions.get(&(network_id, target_device)) {
+                            publish_session(
+                                &agent,
+                                configuration_revision,
+                                (network_id, target_device),
+                                session,
+                            );
+                        }
                     }
                     next_handshake_retry =
                         tokio::time::Instant::now() + Duration::from_millis(250);
@@ -2892,13 +3072,33 @@ async fn run_relay_worker(
                             ));
                         }
                     }
-                    sessions.retain(|key, session| {
-                        peers.get(key).is_some_and(|route| {
-                            !route.device_public_key.is_empty()
-                                && route.device_public_key == session.peer_public_key()
-                                && !session.is_expired(probe_time)
+                    let stale_sessions = sessions
+                        .iter()
+                        .filter_map(|(key, session)| {
+                            let identity_valid = peers.get(key).is_some_and(|route| {
+                                !route.device_public_key.is_empty()
+                                    && route.device_public_key == session.peer_public_key()
+                            });
+                            (!identity_valid || session.is_expired(probe_time))
+                                .then_some((*key, session.is_expired(probe_time)))
                         })
-                    });
+                        .collect::<Vec<_>>();
+                    for (key, naturally_expired) in stale_sessions {
+                        if naturally_expired {
+                            agent.session_observability.expire(
+                                configuration_revision,
+                                key.0,
+                                key.1,
+                            );
+                        } else {
+                            agent.session_observability.remove(
+                                configuration_revision,
+                                key.0,
+                                key.1,
+                            );
+                        }
+                        sessions.remove(&key);
+                    }
                     for (peer_endpoint, punch) in probes {
                         sockets.send_to(&punch, peer_endpoint).await;
                     }
@@ -3033,7 +3233,7 @@ async fn run_relay_worker(
                             PreparedPeerPacket::Handshake(packet) => (packet, "session handshake"),
                             PreparedPeerPacket::Data(packet) => (packet, "pairwise-encrypted packet"),
                         };
-                        send_peer_routed_packet(
+                        let selected_path = send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network.network.id),
                             &endpoint_health,
@@ -3044,6 +3244,15 @@ async fn run_relay_worker(
                             description,
                         )
                         .await;
+                        let key = (network.network.id, target_device);
+                        if let (Some(path), Some(session)) =
+                            (selected_path, sessions.get_mut(&key))
+                        {
+                            session.set_path(path);
+                        }
+                        if let Some(session) = sessions.get(&key) {
+                            publish_session(&agent, configuration_revision, key, session);
+                        }
                     }
                 }
             }
@@ -3056,6 +3265,7 @@ async fn receive_udp_packet(
     agent: &Agent,
     sockets: &TransportSockets,
     configuration: &TransportConfiguration,
+    configuration_revision: u64,
     remote: SocketAddr,
     packet: &[u8],
     peers: &mut HashMap<PeerKey, PeerRoute>,
@@ -3103,6 +3313,7 @@ async fn receive_udp_packet(
         packet,
         peers,
         sessions,
+        configuration_revision,
         root_servers,
         root_transactions,
     )
@@ -3170,6 +3381,9 @@ async fn receive_udp_packet(
             match update_peer_membership(peers, &certificate, self_id, &networks) {
                 Some(true) => {
                     sessions.remove(&(network, device));
+                    agent
+                        .session_observability
+                        .remove(configuration_revision, network, device);
                     trace_transport(format!(
                         "discarded the old pairwise session because member {} changed its identity key",
                         device.0
@@ -3253,14 +3467,34 @@ async fn receive_udp_packet(
                 sessions,
                 seen_handshakes,
                 identity,
+                configuration_revision,
             )
             .await?;
         }
         RELAY_SESSION_RESPONSE => {
-            receive_session_response(agent, sockets, remote, packet, peers, sessions).await?;
+            receive_session_response(
+                agent,
+                sockets,
+                relay_endpoints,
+                remote,
+                packet,
+                peers,
+                sessions,
+                configuration_revision,
+            )
+            .await?;
         }
         RELAY_SESSION_DATA => {
-            receive_session_data(agent, relay_endpoints, remote, packet, peers, sessions).await?;
+            receive_session_data(
+                agent,
+                relay_endpoints,
+                remote,
+                packet,
+                peers,
+                sessions,
+                configuration_revision,
+            )
+            .await?;
         }
         RELAY_DATA => {
             trace_transport(
@@ -3279,6 +3513,7 @@ async fn handle_root_response(
     packet: &[u8],
     peers: &mut HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
+    configuration_revision: u64,
     root_servers: &[PlanetRoot],
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
 ) -> Result<bool> {
@@ -3354,6 +3589,9 @@ async fn handle_root_response(
                 match update_peer_membership(peers, &certificate, self_id, &networks) {
                     Some(true) => {
                         sessions.remove(&key);
+                        agent
+                            .session_observability
+                            .remove(configuration_revision, key.0, key.1);
                         trace_transport(format!(
                             "discarded the old pairwise session because member {} changed its identity key",
                             peer.device_id.0
@@ -3402,6 +3640,7 @@ async fn receive_session_init(
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     seen_handshakes: &mut HashMap<(PeerKey, [u8; 16]), Instant>,
     identity: &SigningKey,
+    configuration_revision: u64,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_INIT)
@@ -3445,6 +3684,14 @@ async fn receive_session_init(
         _ => None,
     });
     if let Some(response) = cached_response {
+        if let Some(session) = sessions.get_mut(&peer_key) {
+            session.set_path(if relay_endpoints.contains(&remote) {
+                SessionPath::Relay
+            } else {
+                SessionPath::Direct
+            });
+            publish_session(agent, configuration_revision, peer_key, session);
+        }
         sockets.send_to(&response, remote).await;
         return Ok(());
     }
@@ -3457,10 +3704,24 @@ async fn receive_session_init(
         // the initiator so both sides converge on one session.
         return Ok(());
     }
-    let queued_packets = match sessions.get(&peer_key) {
-        Some(PeerSessionState::Pending { queued_packets, .. }) => queued_packets.clone(),
-        _ => VecDeque::new(),
-    };
+    let (queued_packets, dropped_packets, handshake_attempts, handshake_retries, rejected_packets) =
+        match sessions.get(&peer_key) {
+            Some(PeerSessionState::Pending {
+                queued_packets,
+                dropped_packets,
+                handshake_attempts,
+                handshake_retries,
+                rejected_packets_received,
+                ..
+            }) => (
+                queued_packets.clone(),
+                *dropped_packets,
+                *handshake_attempts,
+                *handshake_retries,
+                *rejected_packets_received,
+            ),
+            _ => (VecDeque::new(), 0, 1, 0, 0),
+        };
     let Ok(network_key) = NetworkKey::from_slice(&network.network_key) else {
         return Ok(());
     };
@@ -3472,6 +3733,10 @@ async fn receive_session_init(
         now(),
         HANDSHAKE_CLOCK_SKEW_SECONDS,
     ) else {
+        if let Some(session) = sessions.get_mut(&peer_key) {
+            session.record_rejected_packet();
+            publish_session(agent, configuration_revision, peer_key, session);
+        }
         trace_transport(format!(
             "rejected an invalid pairwise session initiation from member {}",
             source.0
@@ -3479,6 +3744,10 @@ async fn receive_session_init(
         return Ok(());
     };
     if !record_session_handshake(seen_handshakes, peer_key, session_id, Instant::now()) {
+        if let Some(session) = sessions.get_mut(&peer_key) {
+            session.record_rejected_packet();
+            publish_session(agent, configuration_revision, peer_key, session);
+        }
         trace_transport(format!(
             "rejected replayed pairwise session initiation from member {}",
             source.0
@@ -3500,8 +3769,21 @@ async fn receive_session_init(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: Some(response.clone()),
+            path: if relay_endpoints.contains(&remote) {
+                SessionPath::Relay
+            } else {
+                SessionPath::Direct
+            },
+            dropped_packets,
+            handshake_attempts,
+            handshake_retries,
+            authenticated_packets_received: 0,
+            rejected_packets_received: rejected_packets,
         },
     );
+    if let Some(session) = sessions.get(&peer_key) {
+        publish_session(agent, configuration_revision, peer_key, session);
+    }
     sockets.send_to(&response, remote).await;
     for encrypted in queued_encrypted {
         sockets.send_to(&encrypted, remote).await;
@@ -3522,10 +3804,12 @@ async fn receive_session_init(
 async fn receive_session_response(
     agent: &Agent,
     sockets: &TransportSockets,
+    relay_endpoints: &[SocketAddr],
     remote: SocketAddr,
     packet: &[u8],
     peers: &HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
+    configuration_revision: u64,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_RESPONSE)
@@ -3552,11 +3836,22 @@ async fn receive_session_response(
     let Ok(network_key) = NetworkKey::from_slice(&network.network_key) else {
         return Ok(());
     };
-    let (completed, queued_packets) = match sessions.get(&peer_key) {
+    let (
+        completed,
+        queued_packets,
+        dropped_packets,
+        handshake_attempts,
+        handshake_retries,
+        rejected_packets,
+    ) = match sessions.get(&peer_key) {
         Some(PeerSessionState::Pending {
             handshake,
             peer_public_key,
             queued_packets,
+            dropped_packets,
+            handshake_attempts,
+            handshake_retries,
+            rejected_packets_received,
             ..
         }) if peer_public_key == &route.device_public_key => (
             handshake.complete(
@@ -3567,10 +3862,18 @@ async fn receive_session_response(
                 HANDSHAKE_CLOCK_SKEW_SECONDS,
             ),
             queued_packets.clone(),
+            *dropped_packets,
+            *handshake_attempts,
+            *handshake_retries,
+            *rejected_packets_received,
         ),
         _ => return Ok(()),
     };
     let Ok(keys) = completed else {
+        if let Some(session) = sessions.get_mut(&peer_key) {
+            session.record_rejected_packet();
+            publish_session(agent, configuration_revision, peer_key, session);
+        }
         trace_transport(format!(
             "rejected an invalid pairwise session response from member {}",
             source.0
@@ -3593,8 +3896,21 @@ async fn receive_session_response(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: None,
+            path: if relay_endpoints.contains(&remote) {
+                SessionPath::Relay
+            } else {
+                SessionPath::Direct
+            },
+            dropped_packets,
+            handshake_attempts,
+            handshake_retries,
+            authenticated_packets_received: 0,
+            rejected_packets_received: rejected_packets,
         },
     );
+    if let Some(session) = sessions.get(&peer_key) {
+        publish_session(agent, configuration_revision, peer_key, session);
+    }
     for encrypted in queued_encrypted {
         sockets.send_to(&encrypted, remote).await;
     }
@@ -3613,6 +3929,7 @@ async fn receive_session_data(
     packet: &[u8],
     peers: &mut HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
+    configuration_revision: u64,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_DATA)
@@ -3633,12 +3950,25 @@ async fn receive_session_data(
         _ => return Ok(()),
     };
     let Ok(opened) = opened else {
+        if let Some(session) = sessions.get_mut(&peer_key) {
+            session.record_rejected_packet();
+            publish_session(agent, configuration_revision, peer_key, session);
+        }
         trace_transport(format!(
             "dropped unauthenticated or replayed session packet from member {}",
             source.0
         ));
         return Ok(());
     };
+    if let Some(session) = sessions.get_mut(&peer_key) {
+        session.record_authenticated_packet();
+        session.set_path(if relay_endpoints.contains(&remote) {
+            SessionPath::Relay
+        } else {
+            SessionPath::Direct
+        });
+        publish_session(agent, configuration_revision, peer_key, session);
+    }
     if opened.network_id != network_id
         || opened.source != source
         || opened.destination != destination
@@ -5029,6 +5359,7 @@ mod tests {
             &serde_json::to_vec(&response).unwrap(),
             &mut peers,
             &mut sessions,
+            1,
             &roots,
             &mut root_transactions,
         )
