@@ -36,10 +36,27 @@ agent 和 controller 在恢复、读取或迁移前先锁定与状态路径对�
 
 ## 备份与迁移边界
 
-Windows DPAPI 状态不能作为跨机器备份格式。目前还没有安全导出命令；在该功能完成前，不要把删除原 Windows 系统后的 DPAPI 文件当作可恢复备份。
+Windows DPAPI 正式状态仍然与当前计算机绑定，不能直接复制到另一台机器恢复。跨机器迁移必须使用独立的口令保护备份格式：
 
-计划中的安全导出将使用管理员提供的口令或恢复密钥，通过内存强化 KDF 和认证加密生成独立于操作系统账户的离线备份包。
+```powershell
+# Agent：先停止正在持有状态锁的 meshlaked
+meshlaked.exe --state-file C:\MeshLake\agent.json state backup D:\Backup\agent.mlb
+meshlaked.exe --state-file C:\MeshLake\agent.json state restore D:\Backup\agent.mlb --force
+
+# Controller：先停止正在持有状态锁的 controller
+meshlake-controller.exe --state-file C:\MeshLake\controller.json state backup D:\Backup\controller.mlb
+meshlake-controller.exe --state-file C:\MeshLake\controller.json state restore D:\Backup\controller.mlb --force
+```
+
+- 默认通过终端隐藏输入口令；导出时要求再次确认。`--password-stdin` 只从标准输入读取一行，适合受控自动化，不得把口令写入命令行参数、日志或仓库。
+- 备份使用固定版本的 Argon2id 参数派生 32 字节密钥，再用 XChaCha20-Poly1305 加密完整状态。格式版本、agent/controller 类型、KDF 参数、随机 salt、nonce 均受 AEAD 认证。
+- 错误口令、密文篡改、截断、未知版本、agent/controller 类型混用或解密后状态结构无效都会在覆盖正式状态前失败。
+- 导出和恢复都使用现有 `StateFileLock`。默认拒绝覆盖现有备份或正式状态；只有显式 `--force` 才允许在完整验证后替换。
+- 备份路径不能解析为正式状态、`.lock` 或 `.bak` 的任何 `.`、`..`、符号链接别名；实际读写使用安全解析后的绝对路径。
+- Windows 恢复通过正式状态写入路径重新应用 DPAPI；Linux 恢复文件及备份文件保持 `0600`。
+
+备份当前采用整文件内存处理。不要把来源不可信、异常巨大的文件交给恢复命令；Argon2 参数若未来调整，需要通过新的兼容格式版本演进。
 
 ## 当前验证状态
 
-状态保护改动已通过工作区编译与自动测试；Windows 测试覆盖 DPAPI 信封、旧明文升级、用途隔离、密文篡改拒绝和控制器原子写入。Linux `0600` 权限逻辑已经接入，但仍需在原生 Linux、systemd 服务账户和异常恢复场景中完成运行验证；Windows DPAPI 状态也不支持直接跨机器恢复。
+状态保护与可移植备份已通过 Windows 工作区测试和 Linux 容器测试。自动测试覆盖 DPAPI 信封、旧明文升级、用途隔离、错误口令、密文篡改、未知版本、类型混用、状态锁、默认拒绝覆盖、路径别名拒绝及 Linux `0600`。仍需在真实 systemd 服务账户、Windows SYSTEM 自启动身份和异常断电恢复场景中完成运行验收；DPAPI 正式状态本身仍不支持直接跨机器恢复。

@@ -30,11 +30,15 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - 已签名 NAT 候选传播：Relay 只分发设备签名注册中、且公网 IP 与 Relay 实际观察一致的 PCP、NAT-PMP、UPnP 或 STUN 候选；未签名、跨网络、非法地址和超量候选会失败关闭。
 - 适配器事务安全：Linux TUN 只有在接口成功启用后才发布会话，并严格校验双栈前缀与跨网络重复地址；daemon 串行化入网、退网、授权刷新、激活与关闭操作，新建会话配置失败时会自动回滚。
 - 状态文件保护：Windows 上的 agent 与 controller 状态使用机器级 DPAPI 加密信封，旧明文 JSON 会在首次读取后自动升级；Linux 既有文件和新写入文件都会收紧为 `0600`。状态路径使用进程级独占锁，Windows 通过 `ReplaceFileW` 原子替换并保留目标安全属性，避免自启动与手动实例并发损坏状态。详见 [`docs/state-protection.md`](docs/state-protection.md)。
+- 安全状态备份：agent 与 controller 可用隐藏口令交互导出跨 Windows/Linux、可跨机器恢复的备份包；格式使用 Argon2id 派生密钥和 XChaCha20-Poly1305 认证加密，错误口令、篡改、截断、类型混用和保留路径别名都会失败关闭。恢复后 Windows 重新写入 DPAPI，Linux 保持 `0600`。
+- 签名 DNS 与自定义路由：控制器发布 Ed25519 签名的 `NetworkPolicyManifest`；非默认 IPv4/IPv6 路由必须由当前成员证书的 `allowed_routes` 明确覆盖，客户端联合验证钉扎控制器、授权清单和网关证书后才应用。Windows/Linux 平台配置采用事务更新，回滚无法确认时会停用虚拟网卡数据面。详见 [`docs/network-policy.md`](docs/network-policy.md)。
+- 会话可观测性：本机 `GET /v1/sessions` 与 `meshlake-cli sessions [--json]` 提供按网络隔离的 pending/established/expired、直连/中继路径、队列和安全计数，不暴露密钥、握手包、端点或数据内容。另有不连接外部主机的 Windows/Linux 系统测试计划框架，详见 [`docs/session-observability.md`](docs/session-observability.md)。
 
 尚未实现，因此当前版本**不能作为正式虚拟局域网产品使用**：
 
-- DNS 下发、自定义路由和出口节点；
-- macOS、Android、iOS 客户端，以及 Linux Secret Service/TPM 等更强的平台密钥库集成。
+- 默认路由/出口节点、网关主机自动开启 IP forwarding、防火墙或 NAT；
+- macOS、Android、iOS 客户端，以及 Linux Secret Service/TPM 等更强的平台密钥库集成；
+- 提权真实 Windows/Linux 主机上的路由、DNS、双栈、故障切换与吊销跨主机验收。
 
 ## 架构
 
@@ -53,7 +57,7 @@ meshlake-cli ─────────┼──> meshlaked ──> Wintun/TUN 
 
 控制器首次启动会生成两项内容：管理员令牌与 Ed25519 控制器公钥。管理员令牌只能用于控制器管理接口；控制器公钥应通过可信渠道分发给设备和中继服务。入网时，设备会把收到的成员证书与该公钥进行匹配并验证签名，不能仅因证书“自签名正确”就接受它。
 
-每个虚拟网络另有独立的 32 字节网络密钥，由控制器在成功入网响应中发给成员。它现在只作为设备间 HKDF 会话派生的附加 PSK，不再直接加密成员间 IP 数据。生产控制器必须使用原生 HTTPS 或置于 HTTPS 反向代理之后。Windows 状态已接入机器级 DPAPI；Linux 目前依赖 `0600` 文件权限，Secret Service、TPM 和可移植加密备份尚未完成，因此仍不应存放高价值生产凭据。
+每个虚拟网络另有独立的 32 字节网络密钥，由控制器在成功入网响应中发给成员。它现在只作为设备间 HKDF 会话派生的附加 PSK，不再直接加密成员间 IP 数据。生产控制器必须使用原生 HTTPS 或置于 HTTPS 反向代理之后。Windows 正式状态已接入机器级 DPAPI；Linux 正式状态目前依赖 `0600` 文件权限。两端都可另行导出使用 Argon2id 与 XChaCha20-Poly1305 保护的跨机器备份，但 Linux Secret Service、TPM 和运行时内存强化仍未完成，因此仍不应存放高价值生产凭据。
 
 两个成员首次传输时，会用证书绑定的 Ed25519 设备身份认证一次性 X25519 公钥，并通过 HKDF-SHA256 派生两个方向各自独立的 XChaCha20-Poly1305 密钥。数据帧的网络 ID、源/目标设备 ID、会话 ID 和包序号均作为 AEAD 附加认证数据。每个会话最长使用 1 小时，接收端维护 64 包滑动窗口拒绝重复和过旧数据包。
 
@@ -67,7 +71,7 @@ meshlake-cli ─────────┼──> meshlaked ──> Wintun/TUN 
 
 在管理员权限的 Windows 会话中执行 `meshlake adapter start`，可以创建或打开 MeshLake 虚拟网卡。
 
-后台代理启动网卡时会把控制器分配的 IPv4/IPv6 地址配置到 MeshLake 适配器，并安装相应的直连网段路由，但不会修改系统默认路由。来自 Wintun 的 IPv4 与 IPv6 包都会按目标前缀选择所属逻辑网络并进入加密传输层。
+后台代理启动网卡时会把控制器分配的 IPv4/IPv6 地址配置到 MeshLake 适配器，并安装相应的直连网段路由。经验证的控制器策略还可安装非默认自定义路由和 split-DNS/search domain；本阶段明确拒绝 `0.0.0.0/0` 与 `::/0`。来自 Wintun 的 IPv4 与 IPv6 包都会按最长前缀和本机已分配源地址选择唯一逻辑网络并进入加密传输层。
 
 ## 图形界面与无界面运行
 
@@ -83,9 +87,22 @@ GUI 的“控制器网络管理”页可创建、列出和删除控制器网络�
 meshlaked.exe run
 meshlaked.exe autostart install
 meshlake agent stop
+meshlake-cli.exe sessions --json
 ```
 
 `autostart install` 需要在管理员终端执行，会创建随 Windows 启动、以 SYSTEM 权限运行的任务计划，并把当前状态文件与 Wintun DLL 的绝对路径固定到启动命令中。可以使用 `autostart status` 检查，或用 `autostart uninstall` 停止并移除任务。`meshlake agent stop` 会通过本机 API 正常关闭传输工作线程和虚拟网卡会话。
+
+安全备份要求对应 agent/controller 进程先释放状态锁。默认隐藏提示口令，恢复默认拒绝覆盖：
+
+```powershell
+meshlaked.exe --state-file C:\MeshLake\agent.json state backup D:\Backup\agent.mlb
+meshlaked.exe --state-file C:\MeshLake\agent.json state restore D:\Backup\agent.mlb --force
+
+meshlake-controller.exe --state-file C:\MeshLake\controller.json state backup D:\Backup\controller.mlb
+meshlake-controller.exe --state-file C:\MeshLake\controller.json state restore D:\Backup\controller.mlb --force
+```
+
+自动化环境可显式使用 `--password-stdin` 从标准输入读取一行口令；不要把口令放入命令行参数、脚本源码或 CI 日志。完整边界见 [`docs/state-protection.md`](docs/state-protection.md)。
 
 ## 构建
 
@@ -143,6 +160,8 @@ meshlake-cli.exe controller network list `
 
 删除网络使用 `controller network delete --network <网络ID>`，并同样提供控制器地址与管理员令牌。
 
+控制器还提供签名策略管理 API，用于先给指定网关成员显式授权 `allowed_routes`，再发布非默认路由与 DNS/search domain。策略必须使用 `x-meshlake-admin-token` 管理头，默认路由会被拒绝；请求格式和失败关闭边界见 [`docs/network-policy.md`](docs/network-policy.md)。
+
 中继需要显式钉扎该控制器公钥：
 
 ```powershell
@@ -177,4 +196,4 @@ meshlake-cli network join `
 
 ## 下一步
 
-下一阶段将继续实现安全状态导出/恢复、Linux Secret Service/TPM、DNS/自定义路由、会话可观测状态及更完整的 Windows/Linux 跨主机故障测试。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。
+下一阶段将重点完成提权真实 Windows/Linux 主机上的双栈直连、直连转 Relay、Root/Relay 故障切换、吊销、daemon 重启、路由/DNS 回滚验收，并继续推进出口节点、Linux Secret Service/TPM 与移动客户端。阶段 2 的并行开发、主线审查和剩余风险记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。
