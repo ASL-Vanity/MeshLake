@@ -27,6 +27,8 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - 每网络控制面：每个已加入网络分别保存控制器 URL、钉扎公钥、签名授权清单以及经验证的 Planet 根节点、中继和 STUN 配置；来自不同 Planet 的网络不再共用一份设备全局配置。旧状态会在启动时自动迁移。
 - 传输热重载：加入新网络或修改手动 Planet/中继配置后，后台代理会自动重建 UDP 传输线程，不再要求退出或重启 `meshlaked`。
 - 多 Root/多 Relay 故障切换：健康状态按虚拟网络与公网端点隔离；首选节点失效后会确定性选择健康备用节点，共享同一公网端点的不同网络不会互相借用健康结论。
+- Planet V3 服务身份与注册收敛：Root/Relay 均有独立、受平台保护的 Ed25519 服务身份；Planet V3 钉扎服务 ID 与 current/next 公钥轮换窗口。客户端只接受与已发出事务、目标服务和当前 Planet 策略相符的 target-bound 注册响应；Relay ACK 与 Root 响应均须验签后才可更新健康状态或成员发现结果。详见 [`docs/planet.md`](docs/planet.md) 与 [`docs/root-server.md`](docs/root-server.md)。
+- Planet 刷新与退避：每个网络约每 60 秒重新下载并验证 Planet；拒绝控制器 URL、版本、`issued_at` 或语义摘要回退，刷新或持久化失败保留最后一次已验证配置。Planet 到期时会失败关闭并停止该网络的 Root、Relay 与 STUN 使用；Root/Relay 注册重试按 `(network, endpoint, kind)` 独立指数退避，成功只重置对应目标。
 - 已签名 NAT 候选传播：Relay 只分发设备签名注册中、且公网 IP 与 Relay 实际观察一致的 PCP、NAT-PMP、UPnP 或 STUN 候选；未签名、跨网络、非法地址和超量候选会失败关闭。
 - 适配器事务安全：Linux TUN 只有在接口成功启用后才发布会话，并严格校验双栈前缀与跨网络重复地址；daemon 串行化入网、退网、授权刷新、激活与关闭操作，新建会话配置失败时会自动回滚。
 - 状态文件保护：Windows 上的 agent 与 controller 状态使用机器级 DPAPI 加密信封，旧明文 JSON 会在首次读取后自动升级；Linux 既有文件和新写入文件都会收紧为 `0600`。状态路径使用进程级独占锁，Windows 通过 `ReplaceFileW` 原子替换并保留目标安全属性，避免自启动与手动实例并发损坏状态。详见 [`docs/state-protection.md`](docs/state-protection.md)。
@@ -122,10 +124,12 @@ GitHub Actions 会在推送到 `main` 或提交 Pull Request 时运行 Windows/L
 启动本机控制器：
 
 ```powershell
-cargo run -p meshlake-controller
+New-Item -ItemType Directory -Force .\secrets | Out-Null
+cargo run -p meshlake-controller -- `
+  --initial-admin-token-file .\secrets\administrator.token
 ```
 
-首次启动会把管理员令牌输出到当前进程的标准错误，并在每次启动时输出控制器公钥（Base64）。请在受控终端完成首次初始化并立即安全保存管理员令牌；不要让首次启动输出进入公开日志、共享终端记录或无人管理的日志采集系统。
+首次初始化必须显式选择管理员令牌的安全交付方式：自动化场景使用 `--initial-admin-token-file` 原子创建受限文件；附着交互终端也可改用 `--claim-initial-admin-token` 领取一次。令牌不再无条件写入 stderr，输出文件默认拒绝覆盖；后续使用已有状态启动时应移除这两个初始化参数。控制器仍会在每次启动时输出可公开分发的 Base64 公钥。
 
 使用正式 PEM 证书和私钥直接启动 HTTPS 控制器：
 
@@ -138,7 +142,7 @@ meshlake-controller.exe `
   --planet-relay-endpoint 203.0.113.10:51820
 ```
 
-证书必须覆盖客户端使用的域名。使用公共 CA 时由客户端系统信任；使用自建 CA 时，再提供 `--tls-client-ca-certificate C:\MeshLake\tls\root-ca.pem`，控制器会把公开 CA 证书放进入网链接。客户端收到后只信任该 CA，并将其按网络保存，用于首次入网、Planet 下载和后续授权刷新。使用 HTTPS 反向代理时，控制器继续绑定 `127.0.0.1:51822`，无需提供原生 TLS 证书参数，但仍可用 `--tls-client-ca-certificate` 发布反向代理的私有 CA。
+若该命令使用的控制器状态尚不存在，首次启动时还必须加入 `--initial-admin-token-file <受限新文件>` 或在附着终端加入 `--claim-initial-admin-token`。证书必须覆盖客户端使用的域名。使用公共 CA 时由客户端系统信任；使用自建 CA 时，再提供 `--tls-client-ca-certificate C:\MeshLake\tls\root-ca.pem`，控制器会把公开 CA 证书放进入网链接。客户端收到后只信任该 CA，并将其按网络保存，用于首次入网、Planet 下载和后续授权刷新。使用 HTTPS 反向代理时，控制器继续绑定 `127.0.0.1:51822`，无需提供原生 TLS 证书参数，但仍可用 `--tls-client-ca-certificate` 发布反向代理的私有 CA。
 
 无需 GUI 即可创建和管理双栈网络：
 
@@ -148,7 +152,7 @@ meshlake-cli.exe controller public-key `
 
 meshlake-cli.exe controller network create `
   --controller http://127.0.0.1:51822 `
-  --admin-token <管理员令牌> `
+  --admin-token-file .\secrets\administrator.token `
   --name home `
   --ipv4-prefix 100.64.50.0/24 `
   --ipv6-prefix fd42:4d4c:50::/64 `
@@ -158,7 +162,7 @@ meshlake-cli.exe controller network list `
   --controller http://127.0.0.1:51822
 ```
 
-删除网络使用 `controller network delete --network <网络ID>`，并同样提供控制器地址与管理员令牌。
+删除网络使用 `controller network delete --network <网络ID>`，并同样提供控制器地址以及 `--admin-token-file`、`--admin-token-stdin` 或 `--admin-token-prompt` 中恰好一种令牌来源。
 
 控制器还提供签名策略管理 API，用于先给指定网关成员显式授权 `allowed_routes`，再发布非默认路由与 DNS/search domain。策略必须使用 `x-meshlake-admin-token` 管理头，默认路由会被拒绝；请求格式和失败关闭边界见 [`docs/network-policy.md`](docs/network-policy.md)。
 
@@ -188,14 +192,14 @@ Windows GUI 的“UDP 协调 / 中继地址”默认启用 **UPnP IGD 自动映�
 meshlake-cli network join `
   --controller http://127.0.0.1:51822 `
   --network <网络ID> `
-  --token <一次性入网令牌> `
+  --token-prompt `
   --controller-public-key-base64 <控制器公钥>
 ```
 
-当前 CLI 只能通过命令行参数接收 `--admin-token`、`--token` 和 `network join-link --link` 的完整邀请链接，尚不支持从标准输入或令牌文件读取。这些敏感值可能出现在进程参数、PowerShell/Bash 历史或终端日志中；只应在受控管理终端使用，不要把真实命令复制到 Issue、脚本、聊天或 CI 日志，并在使用后按所在系统的安全策略清理相关历史记录。
+管理员令牌、一次性入网令牌和完整 join link 都支持隐藏提示、单行标准输入或受限文件：分别使用 `--admin-token-{prompt,stdin,file}`、`--token-{prompt,stdin,file}` 和 `--link-{prompt,stdin,file}`，且每次必须恰好选择一种来源。旧 `--admin-token`、`--token`、`--link` argv 形式仅为兼容保留并会发出弃用警告；不要把真实秘密放入命令历史、进程参数、Issue、脚本、聊天或 CI 日志。
 
 ## 下一步
 
-阶段 3 定为“生产化验收与运维安全”：先移除 argv/日志中的秘密输入风险，再把离线系统测试计划器扩展为带强制安全护栏的执行器，并加固 Root/Relay 身份与授权 epoch 收敛。只有用户明确授权后，才会连接指定的可丢弃 Windows/Linux 测试主机执行跨主机、故障注入和路由/DNS 回滚验收。完整任务拆分、合并顺序和完成标准见 [`docs/stage3-development-plan.md`](docs/stage3-development-plan.md)。
+阶段 3“生产化验收与运维安全”的代码与离线安全护栏已完成：秘密输入、受控系统测试执行器、Planet V3 Root/Relay 身份轮换、授权 epoch 收敛、刷新与失败关闭均已合并。**真实跨主机验收尚未执行**：只有用户明确授权后，才会连接指定的可丢弃 Windows/Linux 测试主机进行跨主机、故障注入和路由/DNS 回滚验证。任务拆分、合并顺序与完成记录见 [`docs/stage3-development-plan.md`](docs/stage3-development-plan.md) 和 [`docs/stage3-parallel-development.md`](docs/stage3-parallel-development.md)。
 
 出口节点、默认路由、自动 IP forwarding/NAT 和 TURN 数据面推迟到阶段 4；移动客户端和完整 GUI 产品化推迟到阶段 5。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。阶段 2 的合并记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。

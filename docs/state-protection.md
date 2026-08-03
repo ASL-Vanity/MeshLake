@@ -82,3 +82,15 @@ meshlake-controller.exe --state-file C:\MeshLake\controller.json state restore D
 ## 当前验证状态
 
 状态保护与可移植备份已通过 Windows 工作区测试和 Linux 容器测试。自动测试覆盖 DPAPI 信封、旧明文升级、用途隔离、错误口令、密文篡改、未知版本、类型混用、状态锁、默认拒绝覆盖、路径别名拒绝及 Linux `0600`。仍需在真实 systemd 服务账户、Windows SYSTEM 自启动身份和异常断电恢复场景中完成运行验收；DPAPI 正式状态本身仍不支持直接跨机器恢复。
+
+## Root/Relay 服务身份
+
+Root 与 Relay 的长期服务签名身份（默认文件名分别为 `root-identity.json`、`relay-identity.json`）属于私钥状态，而不是可替换的普通配置。它们绑定身份类型、服务 ID、保护用途和持久化 schema；不能把 Root 文件当作 Relay 文件使用，也不能用不同服务 ID 的文件替换现有身份。
+
+- **Windows：**正式身份文件必须由 Windows DPAPI 保护，且使用 Root/Relay 各自的 protection purpose。当前 schema 的明文身份、无类型的旧格式和未知 schema 一律拒绝；不会为了兼容而自动迁移或降级为明文。
+- **Unix：**当前实现要求身份文件为常规文件、权限为 `0600`，并且文件 owner 必须是当前 Unix 用户；组或其他用户可读/写、owner 不匹配、错误类型、错误服务 ID、未知 schema 或异常大文件均失败关闭。Unix 身份**尚未接入** systemd credential provider；不要把 agent/controller 的 Linux state-key provider 支持表述为 Root/Relay 身份已经由 systemd credential 保护。
+- **安全路径解析：**读取、创建、替换、恢复和清理都拒绝符号链接；Windows 同时拒绝 reparse point。状态路径及其备份路径不得含 `..`（`ParentDir`）；拒绝后不会沿别名、链接或父目录分量继续 I/O。
+- **中断恢复：**仅当正式身份缺失且 `.bak` 通过安全打开、常规文件、权限/owner、平台保护和完整 schema/身份绑定验证后，才从已经捕获并验证的 backup bytes 写回正式路径。恢复不会在验证后再次按路径重读攻击者可替换的备份；不合格备份保留在原处并失败关闭。
+- **备份清理：**当前身份成功解码和验证后才清理遗留 `.bak`。因此，Windows 的替换中断可恢复，但明文、legacy、权限过宽、错误 owner、链接/reparse 或篡改的备份都不能被安装。
+
+这些机制保护的是磁盘上的长期身份材料，不消除已获得服务账户、DPAPI 解密能力、Unix 文件 owner 权限或进程内存访问能力的高权限攻击者风险。真实服务账户和异常断电恢复仍须在用户授权的 Windows/Linux 主机上验收。

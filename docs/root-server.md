@@ -1,66 +1,87 @@
-# MeshLake 根服务器（meshlake-root）
+# MeshLake Root 服务器（`meshlake-root`）
 
-`meshlake-root` 是 Windows/Linux 通用的 UDP 节点发现与 NAT 协调服务。它不是控制器，也不是流量中继：
+`meshlake-root` 是 Windows/Linux 通用的 UDP 节点发现与 NAT 协调服务：它验证成员注册并交换同网络对等候选地址；它不是控制器，也不转发虚拟网络数据或持有网络流量密钥。加密数据中继由 `meshlake-relay` 提供。
 
-- 控制器负责创建网络、分配地址和签发成员证书；
-- 根服务器验证成员证书，交换节点候选地址；
-- 中继只在节点无法直连时转发端到端加密数据。
+默认端口：
 
-根服务器不会收到虚拟网络流量密钥。
+- `51819/UDP`：Root 注册、发现与候选交换；
+- `51820/UDP`：Relay 加密数据中继；
+- `51822/TCP`：控制器 HTTPS API（原生 TLS 或回环监听后的 HTTPS 反向代理）。
 
-## 端口
+## Root 服务身份与文件保护
 
-当前默认端口：
-
-- `51819/UDP`：根发现和候选地址交换；
-- `51820/UDP`：加密数据中继；
-- `51822/TCP`：控制器 HTTPS API；可由控制器原生 Rustls 提供，也可仅监听回环并置于 HTTPS 反向代理之后。
-
-## 生成根身份
-
-先生成根服务器长期身份并读取公钥：
+Root 第一次启动会生成持久化 Ed25519 服务身份。它有稳定的 Root UUID（`root_id`）和私钥；Planet V3 只发布 UUID 与公钥，绝不发布身份文件。
 
 ```powershell
 meshlake-root.exe `
-  --identity-file .\root-identity.json `
-  --print-public-key
+  --identity-file C:\ProgramData\MeshLake\root-identity.json `
+  --print-identity
 ```
 
-Linux 使用相同参数。`root-identity.json` 包含根私钥，不可公开、不可提交到源码仓库。Planet 中只填写输出的 Base64 公钥。
+身份文件包括私钥，不能复制到 Planet、仓库、日志、命令行参数或备份以外的受保护介质。实现对身份状态和中断原子替换留下的 `.bak` 恢复文件均失败关闭：
 
-## 配置 Planet V2
+- **Windows**：Root/Relay 身份使用机器级 DPAPI 保护；当前格式的明文身份文件或未受保护备份会被拒绝，不会静默升级。
+- **Unix/Linux**：文件必须为 `0600`（没有组/其他权限），并且拥有者必须是运行服务的有效 Unix 用户；权限宽松或所有者不符会被拒绝。
+- 路径必须是安全的真实路径；符号链接/重解析点、错误服务种类、错误服务 ID、未知 schema 或不安全备份均不被接纳。
 
-控制器支持多个根和多个中继。参数顺序就是初始优先级：
+默认身份路径遵循 `MESHLAKE_STATE_DIR`，否则 Windows 为 `%LOCALAPPDATA%\MeshLake\root-identity.json`，Unix 为 `$XDG_STATE_HOME/meshlake/root-identity.json` 或 `~/.local/state/meshlake/root-identity.json`。生产部署建议显式指定仅服务帐户可访问的路径，例如 `C:\ProgramData\MeshLake` 或 `/var/lib/meshlake`。
+
+## Planet V3 配置与双签轮换
+
+把 Root 身份中的公开字段写入控制器的 Planet V3：
 
 ```powershell
 meshlake-controller.exe `
   --bind 127.0.0.1:51822 `
   --planet-controller-url https://planet.example.com `
-  --planet-root "<根公钥Base64>@203.0.113.10:51819" `
-  --planet-root "<第二根公钥Base64>@203.0.113.11:51819" `
-  --planet-relay-endpoint 203.0.113.10:51820 `
-  --planet-relay-endpoint 203.0.113.11:51820 `
-  --planet-stun stun.example.com:3478
+  --planet-root-identity '<ROOT_UUID>@<CURRENT_PUBLIC_KEY_B64>@203.0.113.10:51819' `
+  --planet-relay-identity '<RELAY_UUID>@<RELAY_PUBLIC_KEY_B64>@203.0.113.10:51820'
 ```
 
-控制器通过 `/v1/planet` 返回签名 Planet V2，其中包含根节点公钥、根节点地址、中继顺序和 STUN 列表。
+轮换时先创建与 current **相同** `root_id` 的 next 身份。下面的 `--print-identity` 命令只生成/检查公开字段并退出，不会启动服务：
 
-## 启动根服务器
+```powershell
+meshlake-root.exe `
+  --identity-file C:\ProgramData\MeshLake\root-current.json `
+  --transition-identity-file C:\ProgramData\MeshLake\root-next.json `
+  --print-identity
+```
 
-读取控制器启动时输出的控制器公钥，然后启动根服务：
+将输出的 current/next 公钥和明确的 Unix 秒窗口发布为：
+
+```text
+<ROOT_UUID>@<CURRENT_KEY_B64>@<NEXT_KEY_B64>@<NOT_BEFORE>@<NOT_AFTER>@203.0.113.10:51819
+```
+
+客户端在 `NOT_BEFORE` 前只接受 current，在 `[NOT_BEFORE, NOT_AFTER]` 内要求 current+next 两个签名，窗口结束后则拒绝仍处于 transition 状态的策略。Root 本身不会读取这些时间戳：只要启动参数含 `--transition-identity-file`，它就一直双签。因此实际切换必须按受控维护流程执行：
+
+1. 先发布带未来 `NOT_BEFORE` 的 transition Planet，并保持 Root 仅以 current 身份运行，让客户端刷新策略；
+2. 到达 `NOT_BEFORE` 后，重启 Root 并加入 `--transition-identity-file`，在窗口内双签；
+3. `NOT_AFTER` 前安排切换，把 next 文件作为唯一 `--identity-file`、移除 transition 参数，并发布新的 stable 策略，同时撤销旧公钥；
+4. 由于旧 transition 策略要求双签，而新 stable 策略只接受 next，切换期间可能出现有界的注册/健康状态中断，必须预留客户端 Planet 刷新时间并监控收敛，不能宣称自动无缝轮换。
+
+stable/revoked 描述符为：
+
+```text
+<ROOT_UUID>@<NEXT_KEY_B64>@<OLD_CURRENT_KEY_B64>@203.0.113.10:51819
+```
+
+Relay 使用同样的流程与 `--transition-identity-file`、`--print-identity`，但其身份类型必须为 Relay，不能共用 Root 身份文件；当前 Relay CLI 即使只打印身份也仍要求提供 `--controller-public-key-base64`。Planet V3 具体信任与刷新规则见 [`planet.md`](planet.md)。
+
+## 启动 Root
+
+从可信渠道取得控制器公钥，然后启动公开 UDP 监听：
 
 ```powershell
 meshlake-root.exe `
   --bind 0.0.0.0:51819 `
-  --identity-file .\root-identity.json `
+  --identity-file C:\ProgramData\MeshLake\root-identity.json `
   --controller-public-key-base64 <控制器公钥Base64>
 ```
 
-可以重复 `--controller-public-key-base64`，让同一根服务器服务多个可信控制器。
+可重复 `--controller-public-key-base64` 以服务多个可信控制器。Root 只接受其成员证书和授权清单可由这些控制器验证的注册。
 
-## 持久化配置与自动启动
-
-先将命令行参数保存为 JSON。建议配置文件和根身份文件放在同一个仅管理员可读写的目录：
+持久化配置与启动项：
 
 ```powershell
 meshlake-root.exe `
@@ -68,50 +89,49 @@ meshlake-root.exe `
   --identity-file C:\ProgramData\MeshLake\root-identity.json `
   --controller-public-key-base64 <控制器公钥Base64> `
   --write-config C:\ProgramData\MeshLake\root.json
-```
 
-验证配置能够运行：
-
-```powershell
 meshlake-root.exe --config C:\ProgramData\MeshLake\root.json run
-```
-
-Windows 以管理员权限安装 SYSTEM 开机任务：
-
-```powershell
 meshlake-root.exe --config C:\ProgramData\MeshLake\root.json autostart install
 meshlake-root.exe autostart status
-meshlake-root.exe autostart uninstall
 ```
 
-Linux 使用相同配置格式，并通过 systemd 安装：
+在 Linux 使用相同 JSON 配置，再通过 systemd 集成：
 
 ```bash
 sudo meshlake-root --config /etc/meshlake/root.json autostart install
 meshlake-root autostart status
-sudo meshlake-root autostart uninstall
+sudo meshlake-root --config /etc/meshlake/root.json autostart uninstall
 ```
 
-Linux systemd 单元会限制文件系统写入范围，因此 `identity_file` 应放在配置文件所在目录内。
+systemd 单元会限制文件系统写入范围，所以 `identity_file` 必须位于配置文件所在目录内。运行服务的帐户必须拥有身份文件，且该文件保持 `0600`。
 
-## 当前协议行为
+## 注册协议与失败关闭
 
-1. 节点首次启动生成自己的 Ed25519 身份；
-2. 控制器将设备 ID 和设备公钥同时写入成员证书；
-3. 节点通过当前 UDP 映射向 Planet 中的所有根节点发送签名注册；
-4. 根节点验证设备签名、设备公钥、控制器成员证书及覆盖该证书的当前签名授权清单；
-5. 根节点返回同网络其他设备的公网、STUN、UPnP 等候选地址；
-6. 节点并行发送 UDP 探测，成功后优先直连；
-7. 无法直连时继续使用加密中继。
+客户端以当前 UDP 映射向 Planet 中每个 Root 发送设备签名注册。Root 对每个注册验证：成员证书、设备公钥与设备 ID、控制器签名授权清单、网络密钥 epoch、到期时间、候选地址、nonce 防重放与时钟偏差。
 
-V1 根服务采用内存在线表，节点需要周期性刷新。根节点之间暂不复制数据库；客户端同时注册所有根节点，因此单个根节点离线不会阻止其他根节点发现成员。
+对于 Planet V3，客户端使用**目标绑定注册 V2**（target-bound registration V2）；注册还必须绑定目标 **Root** 服务种类和 Planet 中的 `root_id`。Root 返回由自身服务身份签名的响应，客户端仅在以下条件全部成立后才使用响应：
 
-客户端也会使用同一个 UDP socket 向 Planet 中所有同地址族中继注册。Root 和 Relay 都拒绝不带授权清单、清单过期、证书已吊销或网络密钥 epoch 落后的注册；中继只有在严格验证成功后才发送注册确认。客户端按 Planet 顺序选择仍在正常确认的最高优先级中继。首选中继停止确认后，会自动改用下一台中继，节点不需要重新加入网络。
+1. 请求 nonce 仍存在且未超时；
+2. UDP 源端点与原始目标 Root 相同；
+3. Root 仍属于该网络当前 Planet，公钥、服务 ID 和轮换策略均一致；
+4. 响应符合 current/next 双签规则（如在轮换窗口内）。
 
-中继注册确认会回显已签名注册中的随机 nonce。客户端将该确认与网络、设备、目标中继及 30 秒有效期绑定，成功后立即消费该事务，因此不匹配、跨网络、跨中继、过期或重放的确认都不能把中继标记为健康。该确认没有 Relay 身份签名，只用于端点活性和故障切换：随机 nonce 与预期 UDP 源端点可抵御离路径伪造，但能观察注册包并伪造源地址的在路径攻击者仍可能抢先伪造确认；这不会赋予其解密或伪造成对加密数据的能力。
+通过验证的 `Registered` 响应才会刷新该 `(network, endpoint)` 的 Root 健康状态、观察到的地址和同网络对等候选。跨网络、跨 Root、重放、过期或签名失败响应没有副作用。Root 将网络内对等注册保留约 90 秒，客户端会周期性重新注册；多 Root 不复制内存状态，客户端向全部已配置 Root 注册以获得故障切换。
 
-## 兼容性说明
+Root 可能携带控制器签名的 authorization epoch hint，但它只通知客户端执行完整刷新，绝不直接更改本地授权或信任状态。
 
-旧成员证书没有绑定设备公钥，不能使用新的认证根协议。测试旧网络时，需要让设备退出该网络并使用新邀请链接重新加入。
+客户端的 Root/Relay 注册以 `(network, endpoint, kind)` 独立退避：约 20 秒起、带确定性抖动、最高 120 秒。某个成功 Root 响应只重置该 Root 目标；不会将一个网络或 Relay 的成功误作另一目标健康。
 
-`RELAY_REGISTER_ACK` 已由 37 字节升级为携带 16 字节注册 nonce 的 53 字节格式。新旧 daemon 与 Relay 会互相拒绝对方的确认帧，部署时必须同步升级；数据中继协议本身不受此帧长度变化影响。
+## Legacy V1 仅限显式迁移
+
+`meshlake-root` 默认 `allow_legacy_registration=false`，拒绝 legacy V1 注册。在已经计划退出的 V1/V2 Planet 迁移窗口内，才可显式启动：
+
+```powershell
+meshlake-root.exe `
+  --bind 0.0.0.0:51819 `
+  --identity-file C:\ProgramData\MeshLake\root-identity.json `
+  --controller-public-key-base64 <控制器公钥Base64> `
+  --allow-legacy-registration
+```
+
+此开关只允许短期兼容旧注册，不降低 Planet V3 的验证要求，也不能让未签名旧响应成为 V3 健康证据。迁移完成后应删除该参数（或配置中的同名字段）并重新启动；旧证书若没有设备公钥绑定，成员必须使用新邀请链接重新加入。
