@@ -602,8 +602,9 @@ impl Agent {
             ));
         }
         let mut state = self.state.write().await;
+        let mut candidate = state.clone();
         let mut network_updates = Vec::new();
-        for (index, joined) in state.networks.iter().enumerate() {
+        for (index, joined) in candidate.networks.iter().enumerate() {
             if joined.control_plane.pinned_controller_public_key != pinned_key {
                 continue;
             }
@@ -616,18 +617,18 @@ impl Agent {
             )?;
             network_updates.push((index, update));
         }
-        state.relay_endpoints = global_update
+        candidate.relay_endpoints = global_update
             .relays
             .iter()
             .map(|relay| relay.endpoint)
             .collect();
-        if state.relay_endpoints.is_empty() {
-            state.relay_endpoints.push(manifest.relay_endpoint);
+        if candidate.relay_endpoints.is_empty() {
+            candidate.relay_endpoints.push(manifest.relay_endpoint);
         }
-        state.relay_endpoint = state.relay_endpoints.first().copied();
-        state.root_servers = global_update.roots.clone();
-        state.stun_servers = global_update.stun_servers.clone();
-        state.planet = Some(PersistedPlanet {
+        candidate.relay_endpoint = candidate.relay_endpoints.first().copied();
+        candidate.root_servers = global_update.roots.clone();
+        candidate.stun_servers = global_update.stun_servers.clone();
+        candidate.planet = Some(PersistedPlanet {
             manifest_url: manifest_url.clone(),
             controller_url: global_update.controller_url.clone(),
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
@@ -635,14 +636,16 @@ impl Agent {
         });
         for (index, update) in network_updates {
             apply_configured_planet_update(
-                &mut state.networks[index].control_plane,
+                &mut candidate.networks[index].control_plane,
                 manifest_url.clone(),
                 tls_ca_pem.clone(),
                 &update,
             );
         }
-        write_state_with_protection(&self.path, &state, &self.state_protection)
-            .map_err(ApiError::internal)?;
+        persist_state_candidate(&mut state, candidate, |candidate| {
+            write_state_with_protection(&self.path, candidate, &self.state_protection)
+        })
+        .map_err(ApiError::internal)?;
         drop(state);
         self.request_transport_reload();
         Ok(())
@@ -2009,34 +2012,56 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
     let mut changed = false;
     for joined in &mut state.networks {
         let control_plane = &mut joined.control_plane;
-        if control_plane.controller_url.is_none() {
+        let configured_key = (!control_plane.pinned_controller_public_key.is_empty())
+            .then_some(control_plane.pinned_controller_public_key.as_slice());
+        let certificate_key = joined
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.controller_public_key.as_slice());
+        let normalized_network_controller_url = control_plane
+            .controller_url
+            .as_deref()
+            .and_then(|url| normalize_http_url(url, "network controller URL").ok());
+        let legacy_url_is_compatible = match control_plane.controller_url.as_deref() {
+            None => true,
+            Some(_) => {
+                normalized_network_controller_url.as_deref() == legacy_controller_url.as_deref()
+            }
+        };
+        let legacy_binding_is_safe = legacy_url_is_compatible
+            && legacy_controller_url.is_some()
+            && legacy_controller_key.as_ref().is_some_and(|legacy_key| {
+                [configured_key, certificate_key]
+                    .into_iter()
+                    .flatten()
+                    .all(|key| key.len() == 32 && key == legacy_key.as_slice())
+            });
+        if control_plane.controller_url.is_none() && legacy_binding_is_safe {
             if let Some(controller_url) = &legacy_controller_url {
                 control_plane.controller_url = Some(controller_url.clone());
                 changed = true;
             }
         }
-        let uses_legacy_controller = control_plane
-            .controller_url
-            .as_deref()
-            .and_then(|url| normalize_http_url(url, "network controller URL").ok())
-            .zip(legacy_controller_url.as_deref())
-            .is_some_and(|(network, legacy)| network == legacy);
-        if control_plane.pinned_controller_public_key.is_empty() {
-            let key = joined
-                .certificate
-                .as_ref()
-                .map(|certificate| certificate.controller_public_key.clone())
+        if control_plane.pinned_controller_public_key.is_empty() && legacy_binding_is_safe {
+            let key = certificate_key
                 .filter(|key| key.len() == 32)
-                .or_else(|| {
-                    uses_legacy_controller
-                        .then(|| legacy_controller_key.clone())
-                        .flatten()
-                });
+                .map(ToOwned::to_owned)
+                .or_else(|| legacy_controller_key.clone());
             if let Some(key) = key {
                 control_plane.pinned_controller_public_key = key;
                 changed = true;
             }
         }
+        let uses_legacy_controller = legacy_binding_is_safe
+            && control_plane
+                .controller_url
+                .as_deref()
+                .and_then(|url| normalize_http_url(url, "network controller URL").ok())
+                .zip(legacy_controller_url.as_deref())
+                .is_some_and(|(network, legacy)| network == legacy)
+            && legacy_controller_key.as_ref().is_some_and(|legacy_key| {
+                control_plane.pinned_controller_public_key == *legacy_key
+            });
         if uses_legacy_controller {
             if control_plane.controller_tls_ca_pem.is_none()
                 && (legacy_tls_ca_pem.is_none() || legacy_tls_urls_are_https)
@@ -2291,6 +2316,16 @@ fn write_state_with_protection(
 ) -> Result<()> {
     write_protected_state_file_with(path, state, AGENT_STATE_PROTECTION_PURPOSE, protection)
         .map_err(Into::into)
+}
+
+fn persist_state_candidate(
+    live: &mut PersistedState,
+    candidate: PersistedState,
+    persist: impl FnOnce(&PersistedState) -> Result<()>,
+) -> Result<()> {
+    persist(&candidate)?;
+    *live = candidate;
+    Ok(())
 }
 
 fn migrate_and_validate_agent_state(state: &mut PersistedState) -> Result<bool> {
@@ -7500,6 +7535,111 @@ mod tests {
         cleanup_test_state(&path, &directory);
     }
 
+    #[test]
+    fn failed_planet_state_persistence_keeps_live_global_and_network_trust() {
+        let controller = SigningKey::from_bytes(&[102; 32]);
+        let foreign_controller = SigningKey::from_bytes(&[103; 32]);
+        let old_root: SocketAddr = "203.0.113.102:51819".parse().unwrap();
+        let old_relay: SocketAddr = "203.0.113.102:51820".parse().unwrap();
+        let mut matching = test_joined_network();
+        matching.control_plane.controller_url = Some("https://old-controller.example".into());
+        matching.control_plane.planet_manifest_url =
+            Some("https://old-controller.example/v1/planet".into());
+        matching.control_plane.controller_tls_ca_pem = Some("old-private-ca".into());
+        matching.control_plane.pinned_controller_public_key =
+            controller.verifying_key().to_bytes().to_vec();
+        matching.control_plane.planet_manifest_version = Some(2);
+        matching.control_plane.planet_last_issued_at_unix_seconds = Some(100);
+        matching.control_plane.planet_semantic_digest = vec![1; 32];
+        matching.control_plane.verified_roots = vec![PlanetRoot {
+            public_key: vec![1; 32],
+            endpoints: vec![old_root],
+            priority: 0,
+            identity: None,
+        }];
+        matching.control_plane.verified_relays = vec![PlanetRelay {
+            endpoint: old_relay,
+            priority: 0,
+            identity: None,
+        }];
+        let mut foreign = test_joined_network();
+        foreign.network.id = NetworkId(Uuid::from_u128(1030));
+        foreign.control_plane.controller_url = Some("https://foreign.example".into());
+        foreign.control_plane.planet_manifest_url =
+            Some("https://foreign.example/v1/planet".into());
+        foreign.control_plane.controller_tls_ca_pem = Some("foreign-private-ca".into());
+        foreign.control_plane.pinned_controller_public_key =
+            foreign_controller.verifying_key().to_bytes().to_vec();
+        foreign.control_plane.planet_manifest_version = Some(3);
+        foreign.control_plane.planet_last_issued_at_unix_seconds = Some(101);
+        foreign.control_plane.planet_semantic_digest = vec![2; 32];
+        let mut live = PersistedState::new();
+        live.relay_endpoint = Some(old_relay);
+        live.relay_endpoints = vec![old_relay];
+        live.root_servers = matching.control_plane.verified_roots.clone();
+        live.stun_servers = vec!["old-stun.example:3478".into()];
+        live.planet = Some(PersistedPlanet {
+            manifest_url: "https://old-controller.example/v1/planet".into(),
+            controller_url: "https://old-controller.example".into(),
+            controller_public_key_base64: STANDARD.encode(controller.verifying_key().to_bytes()),
+            controller_tls_ca_pem: Some("old-private-ca".into()),
+        });
+        live.networks = vec![matching, foreign];
+        let mut candidate = live.clone();
+        candidate.relay_endpoint = Some("203.0.113.104:51820".parse().unwrap());
+        candidate.relay_endpoints = vec![candidate.relay_endpoint.unwrap()];
+        candidate.root_servers = vec![PlanetRoot {
+            public_key: vec![3; 32],
+            endpoints: vec!["203.0.113.104:51819".parse().unwrap()],
+            priority: 0,
+            identity: None,
+        }];
+        candidate.planet.as_mut().unwrap().controller_url = "https://new-controller.example".into();
+        candidate.planet.as_mut().unwrap().controller_tls_ca_pem = None;
+        let control_plane = &mut candidate.networks[0].control_plane;
+        control_plane.controller_url = Some("https://new-controller.example".into());
+        control_plane.controller_tls_ca_pem = None;
+        control_plane.planet_manifest_version = Some(3);
+        control_plane.planet_last_issued_at_unix_seconds = Some(200);
+        control_plane.planet_semantic_digest = vec![4; 32];
+
+        assert!(persist_state_candidate(&mut live, candidate, |_| {
+            anyhow::bail!("injected Planet state write failure")
+        })
+        .is_err());
+        let global = live.planet.as_ref().unwrap();
+        assert_eq!(global.controller_url, "https://old-controller.example");
+        assert_eq!(
+            global.controller_tls_ca_pem.as_deref(),
+            Some("old-private-ca")
+        );
+        assert_eq!(live.root_servers[0].endpoints, vec![old_root]);
+        let matching = &live.networks[0].control_plane;
+        assert_eq!(
+            matching.controller_url.as_deref(),
+            Some("https://old-controller.example")
+        );
+        assert_eq!(
+            matching.controller_tls_ca_pem.as_deref(),
+            Some("old-private-ca")
+        );
+        assert_eq!(matching.planet_manifest_version, Some(2));
+        assert_eq!(matching.planet_last_issued_at_unix_seconds, Some(100));
+        assert_eq!(matching.planet_semantic_digest, vec![1; 32]);
+        let foreign = &live.networks[1].control_plane;
+        assert_eq!(
+            foreign.controller_url.as_deref(),
+            Some("https://foreign.example")
+        );
+        assert_eq!(
+            foreign.controller_tls_ca_pem.as_deref(),
+            Some("foreign-private-ca")
+        );
+        assert_eq!(foreign.planet_manifest_version, Some(3));
+        assert_eq!(foreign.planet_last_issued_at_unix_seconds, Some(101));
+        assert_eq!(foreign.planet_semantic_digest, vec![2; 32]);
+    }
+
     #[tokio::test]
     async fn configure_planet_clears_old_per_network_ca_atomically() {
         let directory =
@@ -8108,6 +8248,64 @@ mod tests {
         assert!(foreign.verified_roots.is_empty());
         assert!(foreign.verified_relays.is_empty());
         assert!(foreign.verified_stun_servers.is_empty());
+    }
+
+    #[test]
+    fn legacy_planet_migration_does_not_adopt_trust_for_a_foreign_certificate_without_url() {
+        let legacy_controller = SigningKey::from_bytes(&[104; 32]);
+        let foreign_controller = SigningKey::from_bytes(&[105; 32]);
+        let device = SigningKey::from_bytes(&[106; 32]);
+        let mut foreign = test_joined_network();
+        let network_id = foreign.network.id;
+        let device_id = DeviceId(Uuid::from_u128(1040));
+        foreign.certificate = Some(
+            MembershipCertificate::sign(
+                MembershipClaims {
+                    network_id,
+                    device_id,
+                    device_public_key: device.verifying_key().to_bytes().to_vec(),
+                    assigned_addresses: vec!["100.64.90.1".parse().unwrap()],
+                    allowed_routes: vec!["100.64.90.0/24".into()],
+                    issued_at_unix_seconds: now(),
+                    expires_at_unix_seconds: Some(now() + 90),
+                },
+                &foreign_controller,
+            )
+            .unwrap(),
+        );
+        assert!(foreign.control_plane.controller_url.is_none());
+        assert!(foreign
+            .control_plane
+            .pinned_controller_public_key
+            .is_empty());
+
+        let mut state = PersistedState::new();
+        state.networks = vec![foreign];
+        state.relay_endpoints = vec!["203.0.113.104:51820".parse().unwrap()];
+        state.root_servers = vec![PlanetRoot {
+            public_key: vec![104; 32],
+            endpoints: vec!["203.0.113.104:51819".parse().unwrap()],
+            priority: 0,
+            identity: None,
+        }];
+        state.stun_servers = vec!["stun.legacy.example:3478".into()];
+        state.planet = Some(PersistedPlanet {
+            manifest_url: "https://legacy.example/v1/planet".into(),
+            controller_url: "https://legacy.example".into(),
+            controller_public_key_base64: STANDARD
+                .encode(legacy_controller.verifying_key().to_bytes()),
+            controller_tls_ca_pem: Some("legacy-private-ca".into()),
+        });
+
+        assert!(!migrate_legacy_network_control_planes(&mut state));
+        let control_plane = &state.networks[0].control_plane;
+        assert!(control_plane.controller_url.is_none());
+        assert!(control_plane.pinned_controller_public_key.is_empty());
+        assert!(control_plane.controller_tls_ca_pem.is_none());
+        assert!(control_plane.planet_manifest_url.is_none());
+        assert!(control_plane.verified_roots.is_empty());
+        assert!(control_plane.verified_relays.is_empty());
+        assert!(control_plane.verified_stun_servers.is_empty());
     }
 
     #[test]

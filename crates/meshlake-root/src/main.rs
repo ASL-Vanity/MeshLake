@@ -56,6 +56,9 @@ struct Cli {
     /// Maximum accepted clock difference for a signed registration.
     #[arg(long)]
     maximum_clock_skew_seconds: Option<u64>,
+    /// Accept legacy V1 registrations during an explicit Planet V1/V2 migration.
+    #[arg(long)]
+    allow_legacy_registration: bool,
     /// Save the resolved settings as JSON and exit.
     #[arg(long)]
     write_config: Option<PathBuf>,
@@ -94,6 +97,8 @@ struct RootConfig {
     controller_public_keys_base64: Vec<String>,
     peer_ttl_seconds: u64,
     maximum_clock_skew_seconds: u64,
+    #[serde(default)]
+    allow_legacy_registration: bool,
 }
 
 impl Default for RootConfig {
@@ -104,6 +109,7 @@ impl Default for RootConfig {
             controller_public_keys_base64: Vec::new(),
             peer_ttl_seconds: 90,
             maximum_clock_skew_seconds: 120,
+            allow_legacy_registration: false,
         }
     }
 }
@@ -144,6 +150,9 @@ async fn main() -> Result<()> {
     }
     if let Some(maximum_clock_skew_seconds) = cli.maximum_clock_skew_seconds {
         config.maximum_clock_skew_seconds = maximum_clock_skew_seconds;
+    }
+    if cli.allow_legacy_registration {
+        config.allow_legacy_registration = true;
     }
     if let Some(path) = cli.write_config {
         write_json(&path, &config)?;
@@ -204,6 +213,7 @@ async fn main() -> Result<()> {
             registration,
             remote,
             current_identity.service_id,
+            config.allow_legacy_registration,
             &trusted_controller_keys,
             maximum_clock_skew_seconds,
             peer_ttl,
@@ -237,6 +247,7 @@ fn process_registration(
     registration: RootRegistration,
     observed_endpoint: SocketAddr,
     root_id: uuid::Uuid,
+    allow_legacy_registration: bool,
     trusted_controller_keys: &[Vec<u8>],
     maximum_clock_skew_seconds: u64,
     peer_ttl: Duration,
@@ -248,11 +259,11 @@ fn process_registration(
         bail!("registration contains too many memberships");
     }
     match registration.payload.version {
-        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => registration.verify_authorized(
-            trusted_controller_keys,
-            now(),
-            maximum_clock_skew_seconds,
-        ),
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY if allow_legacy_registration => registration
+            .verify_authorized(trusted_controller_keys, now(), maximum_clock_skew_seconds),
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => {
+            Err(meshlake_core::RootProtocolError::LegacyRegistrationDisabled)
+        }
         ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND => registration
             .verify_authorized_for_service(
                 trusted_controller_keys,
@@ -672,6 +683,42 @@ mod tests {
         .unwrap()
     }
 
+    fn legacy_authorized_registration(
+        controller: &SigningKey,
+        node: &SigningKey,
+        certificate: MembershipCertificate,
+        candidates: Vec<SocketAddr>,
+        nonce: [u8; 16],
+    ) -> RootRegistration {
+        let timestamp = now();
+        let authorization = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: certificate.claims.device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            controller,
+        )
+        .unwrap();
+        RootRegistration::sign_authorized(
+            certificate.claims.device_id,
+            vec![certificate],
+            vec![authorization],
+            candidates,
+            timestamp,
+            nonce,
+            node,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn registration_returns_existing_peer_on_the_same_network() {
         let controller = SigningKey::from_bytes(&[1_u8; 32]);
@@ -723,6 +770,7 @@ mod tests {
             registration,
             "203.0.113.2:41000".parse().unwrap(),
             test_root_id(),
+            false,
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -793,6 +841,7 @@ mod tests {
             registration,
             "203.0.113.21:41000".parse().unwrap(),
             test_root_id(),
+            false,
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -832,6 +881,7 @@ mod tests {
             registration.clone(),
             "203.0.113.30:41000".parse().unwrap(),
             test_root_id(),
+            false,
             &trusted_keys,
             120,
             Duration::from_secs(90),
@@ -844,6 +894,7 @@ mod tests {
             registration,
             "203.0.113.31:42000".parse().unwrap(),
             test_root_id(),
+            false,
             &trusted_keys,
             120,
             Duration::from_secs(90),
@@ -872,6 +923,7 @@ mod tests {
             registration,
             "203.0.113.34:41000".parse().unwrap(),
             test_root_id(),
+            false,
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -880,6 +932,98 @@ mod tests {
             &mut HashMap::new(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_registration_requires_explicit_opt_in_without_mutating_root_state() {
+        let controller = SigningKey::from_bytes(&[36; 32]);
+        let node = SigningKey::from_bytes(&[37; 32]);
+        let network = NetworkId(Uuid::from_u128(38));
+        let device = DeviceId(Uuid::from_u128(39));
+        let certificate = test_certificate(&controller, &node, network, device, "100.64.38.2");
+        let registration = legacy_authorized_registration(
+            &controller,
+            &node,
+            certificate.clone(),
+            vec![],
+            [40; 16],
+        );
+        let timestamp = now();
+        let sentinel_nonce = [41; 16];
+        let sentinel_hint = AuthorizationEpochHint::sign(
+            network,
+            2,
+            certificate.network_key_epoch,
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let mut peers = HashMap::from([(
+            (network, device),
+            PeerRecord {
+                candidates: vec!["198.51.100.38:41000".parse().unwrap()],
+                assigned_addresses: certificate.claims.assigned_addresses.clone(),
+                certificate: certificate.clone(),
+                authorization_expires_at_unix_seconds: timestamp + 90,
+                last_seen: Instant::now(),
+            },
+        )]);
+        let mut seen_nonces = HashMap::from([(sentinel_nonce, Instant::now())]);
+        let mut hints = HashMap::from([(network, sentinel_hint.clone())]);
+        let trusted = [controller.verifying_key().to_bytes().to_vec()];
+        assert!(process_registration(
+            registration.clone(),
+            "203.0.113.38:41000".parse().unwrap(),
+            test_root_id(),
+            false,
+            &trusted,
+            120,
+            Duration::from_secs(90),
+            &mut peers,
+            &mut seen_nonces,
+            &mut hints,
+        )
+        .is_err());
+        assert!(peers.contains_key(&(network, device)));
+        assert!(seen_nonces.contains_key(&sentinel_nonce));
+        assert_eq!(hints.get(&network), Some(&sentinel_hint));
+
+        let mut accepted_peers = HashMap::new();
+        let mut accepted_nonces = HashMap::new();
+        assert!(matches!(
+            process_registration(
+                registration,
+                "203.0.113.38:41000".parse().unwrap(),
+                test_root_id(),
+                true,
+                &trusted,
+                120,
+                Duration::from_secs(90),
+                &mut accepted_peers,
+                &mut accepted_nonces,
+                &mut HashMap::new(),
+            )
+            .unwrap(),
+            RootResponse::Registered { .. }
+        ));
+        assert!(accepted_peers.contains_key(&(network, device)));
+        assert!(accepted_nonces.contains_key(&[40; 16]));
+    }
+
+    #[test]
+    fn persisted_root_config_defaults_legacy_registration_to_disabled() {
+        let config: RootConfig = serde_json::from_str(
+            r#"{
+                "bind": "127.0.0.1:51819",
+                "identity_file": "root.identity",
+                "controller_public_keys_base64": [],
+                "peer_ttl_seconds": 90,
+                "maximum_clock_skew_seconds": 120
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.allow_legacy_registration);
     }
 
     #[test]
@@ -958,6 +1102,7 @@ mod tests {
             registration,
             "203.0.113.44:41000".parse().unwrap(),
             test_root_id(),
+            false,
             &trusted,
             120,
             Duration::from_secs(90),
@@ -990,6 +1135,7 @@ mod tests {
                 cross_target,
                 "203.0.113.44:41000".parse().unwrap(),
                 test_root_id(),
+                false,
                 &trusted,
                 120,
                 Duration::from_secs(90),

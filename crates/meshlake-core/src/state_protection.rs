@@ -28,6 +28,7 @@ const LINUX_MASTER_KEY_LEN: usize = 32;
 const LINUX_NONCE_LEN: usize = 24;
 #[cfg(unix)]
 const MAX_PROVIDER_KEY_FILE_BYTES: u64 = 64 * 1024;
+const MAX_GENERIC_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 pub const AGENT_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake agent state v1";
 pub const CONTROLLER_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake controller state v1";
 pub const ROOT_IDENTITY_PROTECTION_PURPOSE: &[u8] = b"MeshLake root service identity v1";
@@ -201,20 +202,7 @@ impl StateFileLock {
         let lock_path = suffixed_path(state_path, ".lock");
         reject_symlink_path(&lock_path)?;
         let file = secure_open_lock(&lock_path)?;
-        if !file
-            .metadata()
-            .map_err(|source| state_io_error("inspect state lock", &lock_path, source))?
-            .is_file()
-        {
-            return Err(state_io_error(
-                "open a regular state lock",
-                &lock_path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "state lock is not a regular file",
-                ),
-            ));
-        }
+        verify_open_regular_state_file(&file, &lock_path, "open a regular state lock")?;
         restrict_state_file_permissions(&lock_path)?;
         FileExt::try_lock_exclusive(&file).map_err(|source| StateFileError::Lock {
             path: state_path.to_path_buf(),
@@ -249,28 +237,10 @@ where
     E: From<StateFileError>,
 {
     reject_symlink_path(path).map_err(E::from)?;
-    let file = secure_open_read(path).map_err(E::from)?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| state_io_error("inspect state", path, source))
+    let mut file = secure_open_read(path).map_err(E::from)?;
+    let metadata = verify_open_regular_state_file(&file, path, "open a regular state file")
         .map_err(E::from)?;
-    if !metadata.is_file() || metadata.len() > maximum_bytes as u64 {
-        return Err(E::from(state_io_error(
-            "read state within its size limit",
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "state file is not a regular file or exceeds its size limit",
-            ),
-        )));
-    }
-    validate_metadata(&metadata)?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
-    file.take(maximum_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|source| state_io_error("read state", path, source))
-        .map_err(E::from)?;
-    if bytes.len() > maximum_bytes {
+    if metadata.len() > maximum_bytes as u64 {
         return Err(E::from(state_io_error(
             "read state within its size limit",
             path,
@@ -280,9 +250,46 @@ where
             ),
         )));
     }
+    validate_metadata(&metadata)?;
+    let bytes = read_open_state_file(&mut file, path, &metadata, maximum_bytes, "read state")
+        .map_err(E::from)?;
     decode_protected_state(&bytes, purpose)
         .map_err(StateFileError::from)
         .map_err(E::from)
+}
+
+fn read_open_state_file(
+    file: &mut File,
+    path: &Path,
+    metadata: &fs::Metadata,
+    maximum_bytes: usize,
+    action: &'static str,
+) -> Result<Zeroizing<Vec<u8>>, StateFileError> {
+    if metadata.len() > maximum_bytes as u64 {
+        return Err(state_io_error(
+            action,
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state file exceeds its size limit",
+            ),
+        ));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(maximum_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| state_io_error(action, path, source))?;
+    if bytes.len() > maximum_bytes {
+        return Err(state_io_error(
+            action,
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state file exceeds its size limit",
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 impl Drop for StateFileLock {
@@ -452,11 +459,57 @@ fn decode_platform_state<T: DeserializeOwned>(
 ///
 /// Callers must hold [`StateFileLock`] before invoking this function.
 pub fn recover_protected_state_file(path: &Path) -> Result<(), StateFileError> {
-    let backup = backup_path(path);
-    if !path.exists() && backup.exists() {
-        install_recovered_backup(&backup, path)?;
-        restrict_state_file_permissions(path)?;
+    recover_protected_state_file_with_validation(path, MAX_GENERIC_RECOVERY_BYTES, |_, _, _| Ok(()))
+}
+
+/// Internal recovery variant for secret-bearing state owners. The backup is
+/// opened without following links and validated through that exact handle
+/// before it can replace the primary path or have its permissions tightened.
+pub(crate) fn recover_protected_state_file_with_validation<E>(
+    path: &Path,
+    maximum_bytes: usize,
+    validate_backup: impl FnOnce(&Path, &fs::Metadata, &[u8]) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<StateFileError>,
+{
+    reject_symlink_path(path).map_err(E::from)?;
+    let primary_missing = match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => true,
+        Err(source) => {
+            return Err(E::from(state_io_error(
+                "inspect state before recovery",
+                path,
+                source,
+            )));
+        }
+    };
+    if !primary_missing {
+        return Ok(());
     }
+    let backup = backup_path(path);
+    let mut backup_file = match secure_open_read(&backup) {
+        Ok(file) => file,
+        Err(StateFileError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(E::from(error)),
+    };
+    let metadata =
+        verify_open_regular_state_file(&backup_file, &backup, "open a regular recovery backup")
+            .map_err(E::from)?;
+    let backup_bytes = read_open_state_file(
+        &mut backup_file,
+        &backup,
+        &metadata,
+        maximum_bytes,
+        "read recovery backup",
+    )
+    .map_err(E::from)?;
+    validate_backup(&backup, &metadata, &backup_bytes)?;
+    drop(backup_file);
+    install_recovered_backup_bytes(path, &backup, &backup_bytes).map_err(E::from)?;
     Ok(())
 }
 
@@ -574,6 +627,74 @@ fn reject_symlink_path(path: &Path) -> Result<(), StateFileError> {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => break,
             Err(source) => return Err(state_io_error("inspect state path", &current, source)),
         }
+    }
+    Ok(())
+}
+
+fn verify_open_regular_state_file(
+    file: &File,
+    path: &Path,
+    action: &'static str,
+) -> Result<fs::Metadata, StateFileError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| state_io_error("inspect opened state file", path, source))?;
+    if !metadata.is_file() {
+        return Err(state_io_error(
+            action,
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state file is not a regular file",
+            ),
+        ));
+    }
+    verify_open_state_file_platform_type(file, path, action)?;
+    Ok(metadata)
+}
+
+#[cfg(not(windows))]
+fn verify_open_state_file_platform_type(
+    _: &File,
+    _: &Path,
+    _: &'static str,
+) -> Result<(), StateFileError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_open_state_file_platform_type(
+    file: &File,
+    path: &Path,
+    action: &'static str,
+) -> Result<(), StateFileError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT,
+        },
+    };
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(state_io_error(
+            action,
+            path,
+            std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32),
+        ));
+    }
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(state_io_error(
+            action,
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "opened state file is a directory or reparse point",
+            ),
+        ));
     }
     Ok(())
 }
@@ -740,15 +861,103 @@ fn replace_state_file(temporary: &Path, path: &Path) -> Result<(), StateFileErro
     Ok(())
 }
 
+fn install_recovered_backup_bytes(
+    path: &Path,
+    backup: &Path,
+    bytes: &[u8],
+) -> Result<(), StateFileError> {
+    reject_symlink_path(path)?;
+    let parent = state_parent(path);
+    fs::create_dir_all(parent)
+        .map_err(|source| state_io_error("create recovery state directory", parent, source))?;
+    let temporary = temporary_path(path);
+    let result = (|| {
+        let mut file = create_recovery_temporary_file(&temporary)?;
+        restrict_state_file_permissions(&temporary)?;
+        file.write_all(bytes)
+            .map_err(|source| state_io_error("write recovered state", &temporary, source))?;
+        file.sync_all()
+            .map_err(|source| state_io_error("sync recovered state", &temporary, source))?;
+        drop(file);
+        install_recovery_temporary_file(&temporary, path)?;
+        restrict_state_file_permissions(path)?;
+
+        let mut installed = secure_open_read(path)?;
+        let installed_metadata =
+            verify_open_regular_state_file(&installed, path, "verify recovered state file")?;
+        if installed_metadata.len() != bytes.len() as u64 {
+            return Err(state_io_error(
+                "verify recovered state file",
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "recovered state file changed while it was installed",
+                ),
+            ));
+        }
+        let installed_bytes = read_open_state_file(
+            &mut installed,
+            path,
+            &installed_metadata,
+            bytes.len(),
+            "verify recovered state file",
+        )?;
+        if installed_bytes.as_slice() != bytes {
+            return Err(state_io_error(
+                "verify recovered state file",
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "recovered state file changed while it was installed",
+                ),
+            ));
+        }
+        fs::remove_file(backup)
+            .map_err(|source| state_io_error("remove verified recovery backup", backup, source))?;
+        sync_state_parent(parent)?;
+        Ok(())
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(unix)]
-fn install_recovered_backup(backup: &Path, path: &Path) -> Result<(), StateFileError> {
-    fs::rename(backup, path)
-        .map_err(|source| state_io_error("recover state backup", backup, source))?;
-    sync_state_parent(state_parent(path))
+fn create_recovery_temporary_file(path: &Path) -> Result<File, StateFileError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| state_io_error("create recovered state temporary", path, source))
 }
 
 #[cfg(windows)]
-fn install_recovered_backup(backup: &Path, path: &Path) -> Result<(), StateFileError> {
+fn create_recovery_temporary_file(path: &Path) -> Result<File, StateFileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| state_io_error("create recovered state temporary", path, source))
+}
+
+#[cfg(unix)]
+fn install_recovery_temporary_file(temporary: &Path, path: &Path) -> Result<(), StateFileError> {
+    fs::hard_link(temporary, path).map_err(|source| {
+        state_io_error("install recovered state without replacing", path, source)
+    })?;
+    fs::remove_file(temporary)
+        .map_err(|source| state_io_error("remove recovered state temporary", temporary, source))
+}
+
+#[cfg(windows)]
+fn install_recovery_temporary_file(temporary: &Path, path: &Path) -> Result<(), StateFileError> {
     use std::{iter::once, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
@@ -759,19 +968,19 @@ fn install_recovered_backup(backup: &Path, path: &Path) -> Result<(), StateFileE
             .chain(once(0))
             .collect::<Vec<_>>()
     };
-    let backup_wide = wide(backup);
+    let temporary_wide = wide(temporary);
     let path_wide = wide(path);
-    let succeeded = unsafe {
+    if unsafe {
         MoveFileExW(
-            backup_wide.as_ptr(),
+            temporary_wide.as_ptr(),
             path_wide.as_ptr(),
             MOVEFILE_WRITE_THROUGH,
         )
-    };
-    if succeeded == 0 {
+    } == 0
+    {
         return Err(state_io_error(
-            "recover state backup",
-            backup,
+            "install recovered state without replacing",
+            path,
             std::io::Error::last_os_error(),
         ));
     }
@@ -1338,6 +1547,134 @@ mod tests {
         }
 
         drop(state_lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_a_symlink_backup_before_installing_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "meshlake-state-recovery-symlink-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        let backup = backup_path(&path);
+        let target = directory.join("attacker.json");
+        fs::write(&target, b"attacker-controlled").unwrap();
+        symlink(&target, &backup).unwrap();
+        let lock = StateFileLock::acquire(&path).unwrap();
+
+        assert!(recover_protected_state_file(&path).is_err());
+        assert!(!path.exists());
+        assert!(backup.exists());
+
+        drop(lock);
+        fs::remove_file(&backup).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_installs_the_bytes_read_from_the_validated_backup_handle() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-state-recovery-handle-{}", Uuid::new_v4()));
+        let path = directory.join("state.json");
+        let lock = StateFileLock::acquire(&path).unwrap();
+        let original = ExampleState {
+            secret: "original".into(),
+        };
+        let replacement = ExampleState {
+            secret: "replacement".into(),
+        };
+        write_protected_state_file(&path, &original, b"recovery-handle-test").unwrap();
+        let backup = backup_path(&path);
+        fs::rename(&path, &backup).unwrap();
+        let moved = directory.join("validated-backup.json");
+        let replacement_bytes =
+            encode_protected_state(&replacement, b"recovery-handle-test").unwrap();
+
+        recover_protected_state_file_with_validation(&path, 16 * 1024, |backup_path, _, bytes| {
+            let decoded: DecodedState<ExampleState> =
+                decode_protected_state(bytes, b"recovery-handle-test")?;
+            assert_eq!(decoded.value, original);
+            fs::rename(backup_path, &moved).map_err(|source| {
+                state_io_error("replace recovery backup during test", backup_path, source)
+            })?;
+            fs::write(backup_path, &replacement_bytes).map_err(|source| {
+                state_io_error("replace recovery backup during test", backup_path, source)
+            })?;
+            Ok::<(), StateFileError>(())
+        })
+        .unwrap();
+
+        let recovered: DecodedState<ExampleState> =
+            decode_protected_state(&fs::read(&path).unwrap(), b"recovery-handle-test").unwrap();
+        assert_eq!(recovered.value, original);
+        assert!(!backup.exists());
+
+        drop(lock);
+        fs::remove_file(&moved).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_rejects_a_reparse_backup_when_the_fixture_can_be_created() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = std::env::temp_dir().join(format!(
+            "meshlake-state-recovery-reparse-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        let backup = backup_path(&path);
+        let target = directory.join("attacker.json");
+        fs::write(&target, b"attacker-controlled").unwrap();
+        if let Err(error) = symlink_file(&target, &backup) {
+            eprintln!("reparse recovery fixture unavailable: {error}");
+            fs::remove_file(&target).unwrap();
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+        let lock = StateFileLock::acquire(&path).unwrap();
+        assert!(recover_protected_state_file(&path).is_err());
+        assert!(!path.exists());
+        drop(lock);
+        fs::remove_file(&backup).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_reparse_handle_is_rejected_when_the_fixture_can_be_created() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-state-handle-reparse-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target.json");
+        let link = directory.join("link.json");
+        fs::write(&target, b"state").unwrap();
+        if let Err(error) = symlink_file(&target, &link) {
+            eprintln!("opened reparse fixture unavailable: {error}");
+            fs::remove_file(&target).unwrap();
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+        if let Ok(file) = secure_open_read(&link) {
+            assert!(
+                verify_open_regular_state_file(&file, &link, "verify opened reparse fixture")
+                    .is_err()
+            );
+        }
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&target).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

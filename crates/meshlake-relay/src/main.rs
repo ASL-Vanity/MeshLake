@@ -40,6 +40,9 @@ struct Cli {
     /// Optional next identity used to dual-sign during a Planet V3 rotation window.
     #[arg(long)]
     transition_identity_file: Option<PathBuf>,
+    /// Accept legacy V1 registrations during an explicit Planet V1/V2 migration.
+    #[arg(long)]
+    allow_legacy_registration: bool,
     /// Print the public Relay identity document and exit.
     #[arg(long)]
     print_identity: bool,
@@ -130,6 +133,7 @@ async fn main() -> Result<()> {
             &socket,
             &trusted_key,
             &identity,
+            cli.allow_legacy_registration,
             &mut peers,
             &mut seen_nonces,
             &mut authorization_hints,
@@ -144,6 +148,7 @@ async fn handle_packet(
     socket: &UdpSocket,
     trusted_key: &Vec<u8>,
     identity: &RelayIdentity,
+    allow_legacy_registration: bool,
     peers: &mut HashMap<PeerKey, PeerRecord>,
     seen_nonces: &mut HashMap<(NetworkId, DeviceId, [u8; 16]), Instant>,
     authorization_hints: &mut HashMap<NetworkId, AuthorizationEpochHint>,
@@ -152,9 +157,12 @@ async fn handle_packet(
 ) -> Result<()> {
     match packet[4] {
         RELAY_REGISTER_SIGNED => {
-            if let Some(registration) =
-                parse_signed_registration(&packet[5..], trusted_key, identity.relay_id)
-            {
+            if let Some(registration) = parse_signed_registration(
+                &packet[5..],
+                trusted_key,
+                identity.relay_id,
+                allow_legacy_registration,
+            ) {
                 let AuthenticatedRegistration {
                     key,
                     certificate,
@@ -435,11 +443,15 @@ fn parse_signed_registration(
     bytes: &[u8],
     trusted_controller_key: &Vec<u8>,
     relay_id: Uuid,
+    allow_legacy_registration: bool,
 ) -> Option<AuthenticatedRegistration> {
     let registration: RootRegistration = serde_json::from_slice(bytes).ok()?;
     match registration.payload.version {
-        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => {
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY if allow_legacy_registration => {
             registration.verify_authorized(std::slice::from_ref(trusted_controller_key), now(), 120)
+        }
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => {
+            Err(meshlake_core::RootProtocolError::LegacyRegistrationDisabled)
         }
         ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND => registration
             .verify_authorized_for_service(
@@ -554,6 +566,7 @@ mod tests {
             socket,
             trusted_key,
             &test_relay_identity(),
+            false,
             peers,
             seen_nonces,
             &mut HashMap::new(),
@@ -634,6 +647,44 @@ mod tests {
         packet
     }
 
+    fn legacy_signed_registration_packet(
+        controller: &SigningKey,
+        node: &SigningKey,
+        certificate: MembershipCertificate,
+    ) -> Vec<u8> {
+        let timestamp = now();
+        let authorization = NetworkAuthorizationManifest::sign(
+            certificate.claims.network_id,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: certificate.claims.device_id,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            controller,
+        )
+        .unwrap();
+        let registration = RootRegistration::sign_authorized(
+            certificate.claims.device_id,
+            vec![certificate],
+            vec![authorization],
+            vec![],
+            timestamp,
+            [6; 16],
+            node,
+        )
+        .unwrap();
+        let mut packet = Vec::from(RELAY_MAGIC);
+        packet.push(RELAY_REGISTER_SIGNED);
+        packet.extend_from_slice(&serde_json::to_vec(&registration).unwrap());
+        packet
+    }
+
     async fn receive_datagram(socket: &UdpSocket) -> Vec<u8> {
         let mut buffer = vec![0_u8; u16::MAX as usize];
         let (length, _) =
@@ -659,6 +710,7 @@ mod tests {
             &raw,
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -672,6 +724,7 @@ mod tests {
             &raw,
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xbeef),
+            false,
         )
         .is_none());
 
@@ -691,6 +744,7 @@ mod tests {
             &serde_json::to_vec(&root_target).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
         )
         .is_none());
 
@@ -708,6 +762,14 @@ mod tests {
             &serde_json::to_vec(&legacy_authorized).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
+        )
+        .is_none());
+        assert!(parse_signed_registration(
+            &serde_json::to_vec(&legacy_authorized).unwrap(),
+            &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
+            true,
         )
         .is_some());
 
@@ -724,6 +786,7 @@ mod tests {
             &serde_json::to_vec(&legacy).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
         )
         .is_none());
 
@@ -742,8 +805,92 @@ mod tests {
             &serde_json::to_vec(&replay).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_registration_requires_opt_in_before_relay_state_change() {
+        let controller = SigningKey::from_bytes(&[91; 32]);
+        let node = SigningKey::from_bytes(&[92; 32]);
+        let network = NetworkId(Uuid::from_u128(93));
+        let device = DeviceId(Uuid::from_u128(94));
+        let certificate = test_certificate(&controller, &node, network, device, "100.64.93.2");
+        let packet = legacy_signed_registration_packet(&controller, &node, certificate);
+        let trusted_key = controller.verifying_key().to_bytes().to_vec();
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = client_socket.local_addr().unwrap();
+        let identity = test_relay_identity();
+        let mut peers = HashMap::new();
+        let mut seen_nonces = HashMap::new();
+        let mut hints = HashMap::new();
+
+        super::handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &identity,
+            false,
+            &mut peers,
+            &mut seen_nonces,
+            &mut hints,
+            remote,
+            &packet,
+        )
+        .await
+        .unwrap();
+        assert!(peers.is_empty());
+        assert!(seen_nonces.is_empty());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            client_socket.recv_from(&mut [0_u8; 256])
+        )
+        .await
+        .is_err());
+
+        super::handle_packet(
+            &relay_socket,
+            &trusted_key,
+            &identity,
+            true,
+            &mut peers,
+            &mut seen_nonces,
+            &mut hints,
+            remote,
+            &packet,
+        )
+        .await
+        .unwrap();
+        assert!(peers.contains_key(&(network, device)));
+        assert_eq!(seen_nonces.len(), 1);
+        assert_eq!(
+            receive_datagram(&client_socket).await[4],
+            RELAY_REGISTER_ACK_SIGNED
+        );
+    }
+
+    #[test]
+    fn relay_cli_defaults_legacy_registration_to_disabled() {
+        assert!(
+            !Cli::try_parse_from([
+                "meshlake-relay",
+                "--controller-public-key-base64",
+                "test-key",
+            ])
+            .unwrap()
+            .allow_legacy_registration
+        );
+        assert!(
+            Cli::try_parse_from([
+                "meshlake-relay",
+                "--controller-public-key-base64",
+                "test-key",
+                "--allow-legacy-registration",
+            ])
+            .unwrap()
+            .allow_legacy_registration
+        );
     }
 
     #[test]
@@ -943,6 +1090,7 @@ mod tests {
             &packet[5..],
             &controller.verifying_key().to_bytes().to_vec(),
             Uuid::from_u128(0xfeed),
+            false,
         )
         .unwrap();
         let candidates = accepted_candidates(observed, registration.candidates);

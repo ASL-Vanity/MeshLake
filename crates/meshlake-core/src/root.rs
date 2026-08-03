@@ -138,6 +138,8 @@ pub enum RootProtocolError {
     RevokedMembership,
     #[error("root registration target service does not match this service")]
     TargetMismatch,
+    #[error("legacy root registration is disabled")]
+    LegacyRegistrationDisabled,
     #[error("root protocol message cannot be encoded")]
     EncodingFailed,
     #[error(transparent)]
