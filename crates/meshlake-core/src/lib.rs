@@ -68,9 +68,9 @@ pub use state_backup::{
 pub use state_protection::{
     cleanup_stale_state_backup, decode_protected_state, decode_protected_state_with,
     encode_protected_state, encode_protected_state_with, read_protected_state_file,
-    recover_protected_state_file, restrict_state_file_permissions,
-    write_protected_state_file, write_protected_state_file_with, DecodedState, StateFileError,
-    StateFileLock, StateKeyProvider, StateProtection, StateProtectionError, StateProtectionLevel,
-    AGENT_STATE_PROTECTION_PURPOSE, CONTROLLER_STATE_PROTECTION_PURPOSE,
-    RELAY_IDENTITY_PROTECTION_PURPOSE, ROOT_IDENTITY_PROTECTION_PURPOSE,
+    recover_protected_state_file, restrict_state_file_permissions, write_protected_state_file,
+    write_protected_state_file_with, DecodedState, StateFileError, StateFileLock, StateKeyProvider,
+    StateProtection, StateProtectionError, StateProtectionLevel, AGENT_STATE_PROTECTION_PURPOSE,
+    CONTROLLER_STATE_PROTECTION_PURPOSE, RELAY_IDENTITY_PROTECTION_PURPOSE,
+    ROOT_IDENTITY_PROTECTION_PURPOSE,
 };

@@ -2318,6 +2318,11 @@ fn write_state_with_protection(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
+    write_state_with_protection(path, state, &StateProtection::platform_default())
+}
+
 fn persist_state_candidate(
     live: &mut PersistedState,
     candidate: PersistedState,
