@@ -66,6 +66,16 @@ pub struct NetworkControlPlane {
     /// Verified Planet wire version. V3 explicitly requires signed Relay acknowledgements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planet_manifest_version: Option<u8>,
+    /// Issued-at time of the last accepted Planet manifest for rollback checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planet_last_issued_at_unix_seconds: Option<u64>,
+    /// Expiry of the last accepted Planet manifest. Expired per-network
+    /// discovery state is not extended when refresh fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planet_expires_at_unix_seconds: Option<u64>,
+    /// SHA-256 of the last accepted public Planet semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planet_semantic_digest: Vec<u8>,
     /// Roots copied from a verified Planet manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_roots: Vec<crate::crypto::PlanetRoot>,
@@ -91,6 +101,9 @@ impl NetworkControlPlane {
             && self.controller_tls_ca_pem.is_none()
             && self.planet_manifest_url.is_none()
             && self.planet_manifest_version.is_none()
+            && self.planet_last_issued_at_unix_seconds.is_none()
+            && self.planet_expires_at_unix_seconds.is_none()
+            && self.planet_semantic_digest.is_empty()
             && self.verified_roots.is_empty()
             && self.verified_relays.is_empty()
             && self.verified_stun_servers.is_empty()
@@ -327,6 +340,9 @@ mod tests {
                 ),
                 planet_manifest_url: Some("https://planet.example/manifest.json".into()),
                 planet_manifest_version: Some(3),
+                planet_last_issued_at_unix_seconds: Some(100),
+                planet_expires_at_unix_seconds: Some(200),
+                planet_semantic_digest: vec![5; 32],
                 verified_roots: vec![PlanetRoot {
                     public_key: vec![8; 32],
                     endpoints: vec!["203.0.113.1:51819".parse().unwrap()],

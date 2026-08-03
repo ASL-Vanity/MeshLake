@@ -1,4 +1,4 @@
-use meshlake_core::NetworkId;
+use meshlake_core::{DeviceId, NetworkId};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -35,6 +35,102 @@ pub(crate) fn registration_retry_delay(seed: &[u8], consecutive_failures: u8) ->
 struct NetworkEndpoint {
     network_id: NetworkId,
     endpoint: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RegistrationServiceKind {
+    Root,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RegistrationTarget {
+    pub(crate) network_id: NetworkId,
+    pub(crate) endpoint: SocketAddr,
+    pub(crate) kind: RegistrationServiceKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RegistrationSchedule {
+    seed: [u8; 8],
+    consecutive_failures: u8,
+    awaiting_since: Option<Instant>,
+    next_attempt: Instant,
+    last_delay: Duration,
+}
+
+impl RegistrationSchedule {
+    pub(crate) fn new(device_id: DeviceId, target: RegistrationTarget, now: Instant) -> Self {
+        Self {
+            seed: registration_seed(device_id, target),
+            consecutive_failures: 0,
+            awaiting_since: None,
+            next_attempt: now,
+            last_delay: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.awaiting_since.is_none() && now >= self.next_attempt
+    }
+
+    pub(crate) fn mark_sent(&mut self, now: Instant) {
+        self.awaiting_since = Some(now);
+    }
+
+    pub(crate) fn mark_send_failure(&mut self, now: Instant) {
+        self.awaiting_since = None;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.schedule_next(now);
+    }
+
+    pub(crate) fn expire_if_timed_out(&mut self, now: Instant, timeout: Duration) -> bool {
+        let Some(sent) = self.awaiting_since else {
+            return false;
+        };
+        if now.saturating_duration_since(sent) < timeout {
+            return false;
+        }
+        self.mark_send_failure(now);
+        true
+    }
+
+    pub(crate) fn mark_success(&mut self, now: Instant) {
+        self.awaiting_since = None;
+        self.consecutive_failures = 0;
+        self.schedule_next(now);
+    }
+
+    pub(crate) fn last_delay(&self) -> Duration {
+        self.last_delay
+    }
+
+    fn schedule_next(&mut self, now: Instant) {
+        self.last_delay = registration_retry_delay(&self.seed, self.consecutive_failures);
+        self.next_attempt = now + self.last_delay;
+    }
+}
+
+fn registration_seed(device_id: DeviceId, target: RegistrationTarget) -> [u8; 8] {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in device_id
+        .0
+        .as_bytes()
+        .iter()
+        .chain(target.network_id.0.as_bytes())
+        .chain(target.endpoint.to_string().as_bytes())
+        .chain(
+            [match target.kind {
+                RegistrationServiceKind::Root => 1,
+                RegistrationServiceKind::Relay => 2,
+            }]
+            .iter(),
+        )
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash.to_be_bytes()
 }
 
 impl NetworkEndpoint {
@@ -325,5 +421,34 @@ mod tests {
             registration_retry_delay(b"device-a", 1),
             registration_retry_delay(b"device-b", 1)
         );
+    }
+
+    #[test]
+    fn endpoint_backoff_is_independent_and_success_resets_only_its_target() {
+        let device = DeviceId(Uuid::from_u128(10));
+        let network = network(11);
+        let started = Instant::now();
+        let healthy_target = RegistrationTarget {
+            network_id: network,
+            endpoint: "203.0.113.70:51820".parse().unwrap(),
+            kind: RegistrationServiceKind::Relay,
+        };
+        let failing_target = RegistrationTarget {
+            network_id: network,
+            endpoint: "203.0.113.71:51820".parse().unwrap(),
+            kind: RegistrationServiceKind::Relay,
+        };
+        let mut healthy = RegistrationSchedule::new(device, healthy_target, started);
+        let mut failing = RegistrationSchedule::new(device, failing_target, started);
+        healthy.mark_sent(started);
+        failing.mark_sent(started);
+        healthy.mark_success(started + Duration::from_secs(1));
+        assert!(
+            failing.expire_if_timed_out(started + Duration::from_secs(31), Duration::from_secs(30))
+        );
+        assert!(healthy.last_delay() < failing.last_delay());
+        let failing_delay = failing.last_delay();
+        healthy.mark_success(started + Duration::from_secs(32));
+        assert_eq!(failing.last_delay(), failing_delay);
     }
 }

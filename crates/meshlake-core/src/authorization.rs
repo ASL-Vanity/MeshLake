@@ -34,6 +34,23 @@ struct AuthorizationEpochHintPayload<'a> {
 }
 
 impl AuthorizationEpochHint {
+    pub fn is_expired(&self, now_unix_seconds: u64) -> bool {
+        now_unix_seconds > self.expires_at_unix_seconds
+    }
+
+    pub fn supersedes(&self, current: &Self) -> bool {
+        self.network_id == current.network_id
+            && (
+                self.authorization_epoch,
+                self.issued_at_unix_seconds,
+                self.expires_at_unix_seconds,
+            ) > (
+                current.authorization_epoch,
+                current.issued_at_unix_seconds,
+                current.expires_at_unix_seconds,
+            )
+    }
+
     pub fn sign(
         network_id: NetworkId,
         authorization_epoch: u64,
@@ -456,5 +473,33 @@ mod tests {
         assert!(tampered
             .verify_from_controller(&controller.verifying_key().to_bytes(), 110)
             .is_err());
+    }
+
+    #[test]
+    fn epoch_hint_expiry_and_equal_epoch_replacement_are_explicit() {
+        let controller = SigningKey::from_bytes(&[55; 32]);
+        let network_id = NetworkId(Uuid::from_u128(56));
+        let current =
+            AuthorizationEpochHint::sign(network_id, 8, 3, 100, 120, &controller).unwrap();
+        let later_issued =
+            AuthorizationEpochHint::sign(network_id, 8, 3, 101, 120, &controller).unwrap();
+        let later_expiry =
+            AuthorizationEpochHint::sign(network_id, 8, 3, 101, 130, &controller).unwrap();
+        let other_network = AuthorizationEpochHint::sign(
+            NetworkId(Uuid::from_u128(57)),
+            9,
+            3,
+            102,
+            140,
+            &controller,
+        )
+        .unwrap();
+
+        assert!(!current.is_expired(120));
+        assert!(current.is_expired(121));
+        assert!(later_issued.supersedes(&current));
+        assert!(later_expiry.supersedes(&later_issued));
+        assert!(!current.supersedes(&later_expiry));
+        assert!(!other_network.supersedes(&current));
     }
 }

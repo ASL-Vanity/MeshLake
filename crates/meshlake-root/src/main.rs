@@ -6,10 +6,9 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
-use ed25519_dalek::SigningKey;
 use meshlake_core::{
-    AuthorizationEpochHint, DeviceId, MembershipCertificate, NetworkId, RootPeer, RootRegistration,
-    RootResponse, SignedRootResponse,
+    load_or_create_root_identity, AuthorizationEpochHint, DeviceId, MembershipCertificate,
+    NetworkId, RootPeer, RootRegistration, RootResponse, SignedRootResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,7 +19,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::UdpSocket;
-use uuid::Uuid;
 
 const MAX_DATAGRAM_SIZE: usize = 65_507;
 const MAX_CERTIFICATES_PER_REGISTRATION: usize = 64;
@@ -108,19 +106,6 @@ impl Default for RootConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedIdentity {
-    schema_version: u32,
-    #[serde(default)]
-    service_id: Option<Uuid>,
-    secret_key: Vec<u8>,
-}
-
-struct LoadedRootIdentity {
-    service_id: Uuid,
-    signing_key: SigningKey,
-}
-
 #[derive(Debug, Clone)]
 struct PeerRecord {
     candidates: Vec<SocketAddr>,
@@ -168,11 +153,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let identity_path = config.identity_file.clone();
-    let current_identity = load_or_create_identity(&identity_path, None)?;
+    let current_identity = load_or_create_root_identity(&identity_path, None)?;
     let transition_identity = cli
         .transition_identity_file
         .as_deref()
-        .map(|path| load_or_create_identity(path, Some(current_identity.service_id)))
+        .map(|path| load_or_create_root_identity(path, Some(current_identity.service_id)))
         .transpose()?;
     let root_public_key = STANDARD.encode(current_identity.signing_key.verifying_key().to_bytes());
     if cli.print_public_key {
@@ -269,6 +254,7 @@ fn process_registration(
         bail!("registration nonce was already used");
     }
     let timestamp = now();
+    authorization_hints.retain(|_, hint| !hint.is_expired(timestamp));
     peers.retain(|_, peer| {
         peer.last_seen.elapsed() <= peer_ttl
             && timestamp <= peer.authorization_expires_at_unix_seconds
@@ -293,7 +279,7 @@ fn process_registration(
         if let Some(hint) = authorization.epoch_hint.clone() {
             let replace = authorization_hints
                 .get(&hint.network_id)
-                .is_none_or(|current| hint.authorization_epoch > current.authorization_epoch);
+                .is_none_or(|current| hint.supersedes(current));
             if replace {
                 authorization_hints.insert(hint.network_id, hint);
             }
@@ -423,72 +409,6 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         fs::remove_file(path).with_context(|| format!("cannot replace {}", path.display()))?;
     }
     fs::rename(&temporary, path).with_context(|| format!("cannot install {}", path.display()))?;
-    Ok(())
-}
-
-fn load_or_create_identity(
-    path: &Path,
-    expected_service_id: Option<Uuid>,
-) -> Result<LoadedRootIdentity> {
-    if path.exists() {
-        let mut identity: PersistedIdentity = serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
-        )
-        .with_context(|| format!("invalid root identity {}", path.display()))?;
-        let service_id = identity
-            .service_id
-            .unwrap_or_else(|| expected_service_id.unwrap_or_else(Uuid::new_v4));
-        if expected_service_id.is_some_and(|expected| expected != service_id) {
-            bail!("transition Root identity belongs to a different root ID");
-        }
-        if identity.service_id.is_none() {
-            identity.service_id = Some(service_id);
-            identity.schema_version = 2;
-            write_json(path, &identity)?;
-            restrict_identity_permissions(path)?;
-        }
-        let bytes: [u8; 32] = identity
-            .secret_key
-            .as_slice()
-            .try_into()
-            .context("root identity secret key must contain exactly 32 bytes")?;
-        return Ok(LoadedRootIdentity {
-            service_id,
-            signing_key: SigningKey::from_bytes(&bytes),
-        });
-    }
-    let mut secret_key = [0_u8; 32];
-    getrandom::fill(&mut secret_key)
-        .map_err(|error| anyhow::anyhow!("cannot generate root identity: {error:?}"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    let service_id = expected_service_id.unwrap_or_else(Uuid::new_v4);
-    write_json(
-        path,
-        &PersistedIdentity {
-            schema_version: 2,
-            service_id: Some(service_id),
-            secret_key: secret_key.to_vec(),
-        },
-    )?;
-    restrict_identity_permissions(path)?;
-    Ok(LoadedRootIdentity {
-        service_id,
-        signing_key: SigningKey::from_bytes(&secret_key),
-    })
-}
-
-#[cfg(unix)]
-fn restrict_identity_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_identity_permissions(_: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -48,8 +48,8 @@ pub use secret_file::{
     verify_restricted_secret_file, SecretFileError,
 };
 pub use service_identity::{
-    load_or_create_service_identity, ServiceIdentityError, ServiceIdentityFileError,
-    ServiceIdentityPolicy, ServiceSignature, ServiceSigningIdentity,
+    load_or_create_relay_identity, load_or_create_root_identity, ServiceIdentityError,
+    ServiceIdentityFileError, ServiceIdentityPolicy, ServiceSignature, ServiceSigningIdentity,
 };
 pub use session::{
     accept_pairwise_handshake, parse_session_routing_header, session_handshake_id,
@@ -66,9 +66,10 @@ pub use state_backup::{
 };
 pub use state_protection::{
     cleanup_stale_state_backup, decode_protected_state, decode_protected_state_with,
-    encode_protected_state, encode_protected_state_with, recover_protected_state_file,
-    restrict_state_file_permissions, write_protected_state_file, write_protected_state_file_with,
-    DecodedState, StateFileError, StateFileLock, StateKeyProvider, StateProtection,
-    StateProtectionError, StateProtectionLevel, AGENT_STATE_PROTECTION_PURPOSE,
-    CONTROLLER_STATE_PROTECTION_PURPOSE,
+    encode_protected_state, encode_protected_state_with, read_protected_state_file,
+    recover_protected_state_file, restrict_state_file_permissions,
+    write_protected_state_file, write_protected_state_file_with, DecodedState, StateFileError,
+    StateFileLock, StateKeyProvider, StateProtection, StateProtectionError, StateProtectionLevel,
+    AGENT_STATE_PROTECTION_PURPOSE, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    RELAY_IDENTITY_PROTECTION_PURPOSE, ROOT_IDENTITY_PROTECTION_PURPOSE,
 };

@@ -56,7 +56,10 @@ use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock},
 };
-use transport_health::{registration_retry_delay, select_relay_endpoint, EndpointHealthTable};
+use transport_health::{
+    select_relay_endpoint, EndpointHealthTable, RegistrationSchedule, RegistrationServiceKind,
+    RegistrationTarget,
+};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -75,6 +78,7 @@ const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(300);
 const MAX_HANDSHAKE_REPLAY_ENTRIES: usize = 16_384;
 const TRANSPORT_TRANSACTION_TTL: Duration = Duration::from_secs(30);
 const AUTHORIZATION_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+const PLANET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CERTIFICATE_REFRESH_MARGIN_SECONDS: u64 = 300;
 const SESSION_QUEUE_CAPACITY: usize = 8;
 
@@ -258,6 +262,7 @@ struct NetworkTransportConfiguration {
     relay_endpoints: Vec<SocketAddr>,
     relay_identities: HashMap<SocketAddr, ServiceIdentityPolicy>,
     planet_manifest_version: Option<u8>,
+    planet_expires_at_unix_seconds: Option<u64>,
     root_servers: Vec<PlanetRoot>,
 }
 
@@ -278,6 +283,27 @@ struct AuthorizationRefreshTarget {
     pinned_controller_public_key: Vec<u8>,
     certificate: MembershipCertificate,
     authorization_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PlanetRefreshTarget {
+    network_id: NetworkId,
+    manifest_url: String,
+    controller_url: String,
+    controller_tls_ca_pem: Option<String>,
+    pinned_controller_public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedPlanetUpdate {
+    version: u8,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: Option<u64>,
+    semantic_digest: Vec<u8>,
+    controller_url: String,
+    roots: Vec<PlanetRoot>,
+    relays: Vec<PlanetRelay>,
+    stun_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +355,14 @@ impl TransportConfiguration {
 
     fn planet_manifest_version_for(&self, network_id: NetworkId) -> Option<u8> {
         self.networks.get(&network_id)?.planet_manifest_version
+    }
+
+    fn has_expired_planet(&self, now_unix_seconds: u64) -> bool {
+        self.networks.values().any(|network| {
+            network
+                .planet_expires_at_unix_seconds
+                .is_some_and(|expiry| now_unix_seconds > expiry)
+        })
     }
 }
 
@@ -555,57 +589,56 @@ impl Agent {
                 "Planet controller public key must contain exactly 32 bytes",
             ));
         }
-        let response = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
-            .map_err(ApiError::internal)?
-            .get(&manifest_url)
-            .send()
+        let client = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
+            .map_err(ApiError::internal)?;
+        let manifest = fetch_planet_manifest(&client, &manifest_url)
             .await
             .map_err(ApiError::bad_request)?;
-        if !response.status().is_success() {
-            return Err(ApiError::bad_request(format!(
-                "Planet manifest request returned {}",
-                response.status()
-            )));
-        }
-        let manifest: PlanetManifest = response.json().await.map_err(ApiError::bad_request)?;
-        manifest
-            .verify_from_controller(&pinned_key, now())
-            .map_err(ApiError::bad_request)?;
-        let controller_url = normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
-        if tls_ca_pem.is_some() && !controller_url.starts_with("https://") {
+        let baseline = NetworkControlPlane::default();
+        let global_update = validate_planet_update(&baseline, &manifest, &pinned_key, None, now())?;
+        if tls_ca_pem.is_some() && !global_update.controller_url.starts_with("https://") {
             return Err(ApiError::bad_request(
                 "a pinned TLS CA requires an https:// Planet controller URL",
             ));
         }
         let mut state = self.state.write().await;
-        let manifest_version = manifest.version;
-        let mut relays = manifest.relays;
-        relays.sort_by_key(|relay| relay.priority);
-        state.relay_endpoints = relays.iter().map(|relay| relay.endpoint).collect();
+        let mut network_updates = Vec::new();
+        for (index, joined) in state.networks.iter().enumerate() {
+            if joined.control_plane.pinned_controller_public_key != pinned_key {
+                continue;
+            }
+            let update = validate_planet_update(
+                &joined.control_plane,
+                &manifest,
+                &pinned_key,
+                joined.control_plane.controller_url.as_deref(),
+                now(),
+            )?;
+            network_updates.push((index, update));
+        }
+        state.relay_endpoints = global_update
+            .relays
+            .iter()
+            .map(|relay| relay.endpoint)
+            .collect();
         if state.relay_endpoints.is_empty() {
             state.relay_endpoints.push(manifest.relay_endpoint);
         }
         state.relay_endpoint = state.relay_endpoints.first().copied();
-        state.root_servers = manifest.roots;
-        state.root_servers.sort_by_key(|root| root.priority);
-        let verified_roots = state.root_servers.clone();
-        state.stun_servers = manifest
-            .stun_servers
-            .into_iter()
-            .map(|server| server.trim().to_owned())
-            .filter(|server| !server.is_empty())
-            .take(8)
-            .collect();
+        state.root_servers = global_update.roots.clone();
+        state.stun_servers = global_update.stun_servers.clone();
         state.planet = Some(PersistedPlanet {
-            manifest_url,
-            controller_url,
+            manifest_url: manifest_url.clone(),
+            controller_url: global_update.controller_url.clone(),
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
             controller_tls_ca_pem: tls_ca_pem,
         });
-        for joined in &mut state.networks {
-            joined.control_plane.planet_manifest_version = Some(manifest_version);
-            joined.control_plane.verified_relays = relays.clone();
-            joined.control_plane.verified_roots = verified_roots.clone();
+        for (index, update) in network_updates {
+            apply_planet_update(
+                &mut state.networks[index].control_plane,
+                Some(manifest_url.clone()),
+                &update,
+            );
         }
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
@@ -711,6 +744,89 @@ impl Agent {
             })
             .collect();
         Ok((state.device_id, identity_signing_key(&state)?, targets))
+    }
+
+    async fn planet_refresh_targets(&self) -> Vec<PlanetRefreshTarget> {
+        let state = self.state.read().await;
+        state
+            .networks
+            .iter()
+            .filter_map(|network| {
+                Some(PlanetRefreshTarget {
+                    network_id: network.network.id,
+                    manifest_url: network.control_plane.planet_manifest_url.clone()?,
+                    controller_url: network.control_plane.controller_url.clone()?,
+                    controller_tls_ca_pem: network.control_plane.controller_tls_ca_pem.clone(),
+                    pinned_controller_public_key: (!network
+                        .control_plane
+                        .pinned_controller_public_key
+                        .is_empty())
+                    .then(|| network.control_plane.pinned_controller_public_key.clone())?,
+                })
+            })
+            .collect()
+    }
+
+    async fn refresh_planets_once(&self, default_client: &reqwest::Client) -> Result<()> {
+        for target in self.planet_refresh_targets().await {
+            if let Err(error) = self.refresh_one_planet(default_client, &target).await {
+                eprintln!(
+                    "MeshLake could not refresh Planet for network {}: {error:#}",
+                    target.network_id.0
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_one_planet(
+        &self,
+        default_client: &reqwest::Client,
+        target: &PlanetRefreshTarget,
+    ) -> Result<()> {
+        let pinned_client = target
+            .controller_tls_ca_pem
+            .as_deref()
+            .map(|pem| controller_http_client(Some(pem), Duration::from_secs(8)))
+            .transpose()?;
+        let client = pinned_client.as_ref().unwrap_or(default_client);
+        let manifest = fetch_planet_manifest(client, &target.manifest_url).await?;
+        let mut state = self.state.write().await;
+        let Some(network) = state
+            .networks
+            .iter_mut()
+            .find(|network| network.network.id == target.network_id)
+        else {
+            return Ok(());
+        };
+        if network.control_plane.planet_manifest_url.as_deref()
+            != Some(target.manifest_url.as_str())
+            || network.control_plane.pinned_controller_public_key
+                != target.pinned_controller_public_key
+        {
+            return Ok(());
+        }
+        let update = validate_planet_update(
+            &network.control_plane,
+            &manifest,
+            &target.pinned_controller_public_key,
+            Some(&target.controller_url),
+            now(),
+        )
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+        let changed = apply_planet_update(
+            &mut network.control_plane,
+            Some(target.manifest_url.clone()),
+            &update,
+        );
+        if changed {
+            write_state(&self.path, &state)?;
+        }
+        drop(state);
+        if changed {
+            self.request_transport_reload();
+        }
+        Ok(())
     }
 
     async fn apply_authorization_action(
@@ -1004,12 +1120,19 @@ impl Agent {
         let client = controller_http_client(None, Duration::from_secs(8))?;
         let agent = Arc::clone(self);
         tokio::spawn(async move {
+            let mut next_planet_refresh = tokio::time::Instant::now();
             loop {
                 if agent.shutting_down.load(Ordering::Acquire) {
                     break;
                 }
                 if let Err(error) = agent.refresh_authorizations_once(&client).await {
                     eprintln!("MeshLake authorization supervisor failed: {error:#}");
+                }
+                if tokio::time::Instant::now() >= next_planet_refresh {
+                    if let Err(error) = agent.refresh_planets_once(&client).await {
+                        eprintln!("MeshLake Planet refresh failed: {error:#}");
+                    }
+                    next_planet_refresh = tokio::time::Instant::now() + PLANET_REFRESH_INTERVAL;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(AUTHORIZATION_REFRESH_INTERVAL) => {}
@@ -1161,28 +1284,51 @@ impl Agent {
                 "certificate network id does not match enrollment",
             ));
         }
+        let existing_control_plane = {
+            let state = self.state.read().await;
+            if enrollment.certificate.claims.device_id != state.device_id {
+                return Err(ApiError::bad_request(
+                    "certificate belongs to another device",
+                ));
+            }
+            let local_public_key = identity_signing_key(&state)
+                .map_err(ApiError::internal)?
+                .verifying_key()
+                .to_bytes();
+            if enrollment.certificate.claims.device_public_key != local_public_key {
+                return Err(ApiError::bad_request(
+                    "certificate belongs to a different node identity",
+                ));
+            }
+            state
+                .networks
+                .iter()
+                .find(|entry| entry.network.id == enrollment.network.id)
+                .map(|entry| entry.control_plane.clone())
+        };
+        if let Some(existing) = existing_control_plane.as_ref() {
+            let existing_controller_key = if !existing.pinned_controller_public_key.is_empty() {
+                existing.pinned_controller_public_key.as_slice()
+            } else {
+                &[]
+            };
+            if !existing_controller_key.is_empty()
+                && existing_controller_key != controller_public_key.as_slice()
+            {
+                return Err(ApiError::conflict(
+                    "this network id is already pinned to a different controller",
+                ));
+            }
+        }
         let persisted_control_plane = resolve_enrollment_control_plane(
             control_plane,
             &controller_public_key,
             enrollment.authorization.clone(),
+            existing_control_plane.as_ref(),
         )
         .await?;
         let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
-        if enrollment.certificate.claims.device_id != state.device_id {
-            return Err(ApiError::bad_request(
-                "certificate belongs to another device",
-            ));
-        }
-        let local_public_key = identity_signing_key(&state)
-            .map_err(ApiError::internal)?
-            .verifying_key()
-            .to_bytes();
-        if enrollment.certificate.claims.device_public_key != local_public_key {
-            return Err(ApiError::bad_request(
-                "certificate belongs to a different node identity",
-            ));
-        }
         let joined = JoinedNetwork {
             network: enrollment.network,
             assigned_addresses: enrollment.certificate.claims.assigned_addresses.clone(),
@@ -1219,6 +1365,12 @@ impl Agent {
                     "this network id is already pinned to a different controller",
                 ));
             }
+            validate_planet_acceptance_metadata(
+                &existing.control_plane,
+                joined.control_plane.planet_manifest_version,
+                joined.control_plane.planet_last_issued_at_unix_seconds,
+                &joined.control_plane.planet_semantic_digest,
+            )?;
             Some(std::mem::replace(
                 &mut state.networks[index],
                 joined.clone(),
@@ -1312,12 +1464,11 @@ async fn resolve_enrollment_control_plane(
     configured: Option<EnrollmentControlPlane>,
     pinned_controller_public_key: &[u8],
     authorization_manifest: meshlake_core::NetworkAuthorizationManifest,
+    current: Option<&NetworkControlPlane>,
 ) -> Result<NetworkControlPlane, ApiError> {
-    let mut control_plane = NetworkControlPlane {
-        pinned_controller_public_key: pinned_controller_public_key.to_vec(),
-        authorization_manifest: Some(authorization_manifest),
-        ..NetworkControlPlane::default()
-    };
+    let mut control_plane = current.cloned().unwrap_or_default();
+    control_plane.pinned_controller_public_key = pinned_controller_public_key.to_vec();
+    control_plane.authorization_manifest = Some(authorization_manifest);
     let Some(configured) = configured else {
         return Ok(control_plane);
     };
@@ -1353,39 +1504,78 @@ async fn resolve_enrollment_control_plane(
     let Some(manifest_url) = manifest_url else {
         return Ok(control_plane);
     };
-    let response = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
-        .map_err(ApiError::internal)?
-        .get(&manifest_url)
-        .send()
+    let client = controller_http_client(tls_ca_pem.as_deref(), Duration::from_secs(8))
+        .map_err(ApiError::internal)?;
+    let manifest = fetch_planet_manifest(&client, &manifest_url)
         .await
         .map_err(ApiError::bad_request)?;
-    if !response.status().is_success() {
-        return Err(ApiError::bad_request(format!(
-            "Planet manifest request returned {}",
-            response.status()
-        )));
-    }
-    let manifest: PlanetManifest = response.json().await.map_err(ApiError::bad_request)?;
-    manifest
-        .verify_from_controller(pinned_controller_public_key, now())
-        .map_err(ApiError::bad_request)?;
-    let manifest_controller_url =
-        normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
-    if tls_ca_pem.is_some() && !manifest_controller_url.starts_with("https://") {
+    let update = validate_planet_update(
+        current.unwrap_or(&control_plane),
+        &manifest,
+        pinned_controller_public_key,
+        Some(&controller_url),
+        now(),
+    )?;
+    if tls_ca_pem.is_some() && !update.controller_url.starts_with("https://") {
         return Err(ApiError::bad_request(
             "a pinned controller TLS CA requires an https:// Planet controller URL",
         ));
     }
-    if manifest_controller_url != controller_url {
-        return Err(ApiError::bad_request(
-            "Planet controller URL does not match the invitation controller URL",
-        ));
-    }
+    apply_planet_update(&mut control_plane, Some(manifest_url), &update);
+    Ok(control_plane)
+}
 
-    let manifest_version = manifest.version;
-    let mut roots = manifest.roots;
+async fn fetch_planet_manifest(
+    client: &reqwest::Client,
+    manifest_url: &str,
+) -> Result<PlanetManifest> {
+    let response = client
+        .get(manifest_url)
+        .send()
+        .await
+        .with_context(|| format!("cannot fetch Planet manifest from {manifest_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("Planet manifest request returned {}", response.status());
+    }
+    response
+        .json::<PlanetManifest>()
+        .await
+        .context("Planet server returned an invalid manifest")
+}
+
+fn validate_planet_update(
+    current: &NetworkControlPlane,
+    manifest: &PlanetManifest,
+    pinned_controller_public_key: &[u8],
+    expected_controller_url: Option<&str>,
+    now_unix_seconds: u64,
+) -> Result<VerifiedPlanetUpdate, ApiError> {
+    manifest
+        .verify_from_controller(pinned_controller_public_key, now_unix_seconds)
+        .map_err(ApiError::bad_request)?;
+    let controller_url = normalize_http_url(&manifest.controller_url, "Planet controller URL")?;
+    if let Some(expected) = expected_controller_url {
+        let expected = normalize_http_url(expected, "network controller URL")?;
+        if controller_url != expected {
+            return Err(ApiError::bad_request(
+                "Planet controller URL does not match the enrolled controller URL",
+            ));
+        }
+    }
+    let semantic_digest = manifest
+        .semantic_digest()
+        .map_err(ApiError::bad_request)?
+        .to_vec();
+    validate_planet_acceptance_metadata(
+        current,
+        Some(manifest.version),
+        Some(manifest.issued_at_unix_seconds),
+        &semantic_digest,
+    )?;
+
+    let mut roots = manifest.roots.clone();
     roots.sort_by_key(|root| root.priority);
-    let mut relays = manifest.relays;
+    let mut relays = manifest.relays.clone();
     relays.sort_by_key(|relay| relay.priority);
     if relays.is_empty() {
         relays.push(PlanetRelay {
@@ -1396,19 +1586,102 @@ async fn resolve_enrollment_control_plane(
     }
     let mut stun_servers = manifest
         .stun_servers
-        .into_iter()
+        .iter()
         .map(|server| server.trim().to_owned())
         .filter(|server| !server.is_empty())
         .take(8)
         .collect::<Vec<_>>();
     stun_servers.sort();
     stun_servers.dedup();
-    control_plane.planet_manifest_url = Some(manifest_url);
-    control_plane.planet_manifest_version = Some(manifest_version);
-    control_plane.verified_roots = roots;
-    control_plane.verified_relays = relays;
-    control_plane.verified_stun_servers = stun_servers;
-    Ok(control_plane)
+    Ok(VerifiedPlanetUpdate {
+        version: manifest.version,
+        issued_at_unix_seconds: manifest.issued_at_unix_seconds,
+        expires_at_unix_seconds: manifest.expires_at_unix_seconds,
+        semantic_digest,
+        controller_url,
+        roots,
+        relays,
+        stun_servers,
+    })
+}
+
+fn validate_planet_acceptance_metadata(
+    current: &NetworkControlPlane,
+    candidate_version: Option<u8>,
+    candidate_issued_at: Option<u64>,
+    candidate_semantic_digest: &[u8],
+) -> Result<(), ApiError> {
+    if !current.planet_semantic_digest.is_empty() && current.planet_semantic_digest.len() != 32 {
+        return Err(ApiError::bad_request(
+            "persisted Planet semantic digest has an invalid length",
+        ));
+    }
+    let Some(previous_version) = current.planet_manifest_version else {
+        return Ok(());
+    };
+    let Some(candidate_version) = candidate_version else {
+        return Err(ApiError::bad_request(
+            "Planet manifest version rollback was rejected",
+        ));
+    };
+    if candidate_semantic_digest.len() != 32 {
+        return Err(ApiError::bad_request(
+            "candidate Planet semantic digest has an invalid length",
+        ));
+    }
+    if candidate_version < previous_version {
+        return Err(ApiError::bad_request(
+            "Planet manifest version rollback was rejected",
+        ));
+    }
+    if let Some(previous_issued_at) = current.planet_last_issued_at_unix_seconds {
+        let Some(candidate_issued_at) = candidate_issued_at else {
+            return Err(ApiError::bad_request(
+                "Planet manifest issued_at rollback was rejected",
+            ));
+        };
+        if candidate_issued_at < previous_issued_at {
+            return Err(ApiError::bad_request(
+                "Planet manifest issued_at rollback was rejected",
+            ));
+        }
+        if candidate_version == previous_version
+            && candidate_issued_at == previous_issued_at
+            && !current.planet_semantic_digest.is_empty()
+            && current.planet_semantic_digest != candidate_semantic_digest
+        {
+            return Err(ApiError::bad_request(
+                "Planet manifest changed semantics without advancing issued_at",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_planet_update(
+    control_plane: &mut NetworkControlPlane,
+    manifest_url: Option<String>,
+    update: &VerifiedPlanetUpdate,
+) -> bool {
+    let changed = control_plane.planet_manifest_url != manifest_url
+        || control_plane.planet_manifest_version != Some(update.version)
+        || control_plane.planet_last_issued_at_unix_seconds != Some(update.issued_at_unix_seconds)
+        || control_plane.planet_expires_at_unix_seconds != update.expires_at_unix_seconds
+        || control_plane.planet_semantic_digest != update.semantic_digest
+        || control_plane.controller_url.as_deref() != Some(update.controller_url.as_str())
+        || control_plane.verified_roots != update.roots
+        || control_plane.verified_relays != update.relays
+        || control_plane.verified_stun_servers != update.stun_servers;
+    control_plane.planet_manifest_url = manifest_url;
+    control_plane.planet_manifest_version = Some(update.version);
+    control_plane.planet_last_issued_at_unix_seconds = Some(update.issued_at_unix_seconds);
+    control_plane.planet_expires_at_unix_seconds = update.expires_at_unix_seconds;
+    control_plane.planet_semantic_digest = update.semantic_digest.clone();
+    control_plane.controller_url = Some(update.controller_url.clone());
+    control_plane.verified_roots = update.roots.clone();
+    control_plane.verified_relays = update.relays.clone();
+    control_plane.verified_stun_servers = update.stun_servers.clone();
+    changed
 }
 
 fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError> {
@@ -1782,6 +2055,7 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
                 changed = true;
             }
         }
+        changed |= migrate_planet_acceptance_metadata(control_plane);
     }
     if !state.authorizations.is_empty()
         && state.networks.iter().all(|joined| {
@@ -1791,6 +2065,65 @@ fn migrate_legacy_network_control_planes(state: &mut PersistedState) -> bool {
     {
         state.authorizations.clear();
         changed = true;
+    }
+    changed
+}
+
+fn migrate_planet_acceptance_metadata(control_plane: &mut NetworkControlPlane) -> bool {
+    if control_plane.verified_relays.is_empty()
+        || control_plane.controller_url.is_none()
+        || control_plane.pinned_controller_public_key.len() != 32
+    {
+        return false;
+    }
+    let mut changed = false;
+    let inferred_version = if control_plane
+        .verified_relays
+        .iter()
+        .all(|relay| relay.identity.is_some())
+        && control_plane
+            .verified_roots
+            .iter()
+            .all(|root| root.identity.is_some())
+    {
+        3
+    } else {
+        2
+    };
+    if control_plane.planet_manifest_version.is_none() {
+        control_plane.planet_manifest_version = Some(inferred_version);
+        changed = true;
+    }
+    if control_plane.planet_last_issued_at_unix_seconds.is_none() {
+        control_plane.planet_last_issued_at_unix_seconds = Some(0);
+        changed = true;
+    }
+    if control_plane.planet_semantic_digest.is_empty() {
+        let mut roots = control_plane.verified_roots.clone();
+        roots.sort_by_key(|root| root.priority);
+        let mut relays = control_plane.verified_relays.clone();
+        relays.sort_by_key(|relay| relay.priority);
+        let mut stun_servers = control_plane.verified_stun_servers.clone();
+        stun_servers.sort();
+        stun_servers.dedup();
+        let manifest = PlanetManifest {
+            version: control_plane
+                .planet_manifest_version
+                .unwrap_or(inferred_version),
+            controller_url: control_plane.controller_url.clone().unwrap_or_default(),
+            relay_endpoint: relays[0].endpoint,
+            roots,
+            relays,
+            stun_servers,
+            issued_at_unix_seconds: 0,
+            expires_at_unix_seconds: None,
+            controller_public_key: control_plane.pinned_controller_public_key.clone(),
+            signature: Vec::new(),
+        };
+        if let Ok(digest) = manifest.semantic_digest() {
+            control_plane.planet_semantic_digest = digest.to_vec();
+            changed = true;
+        }
     }
     changed
 }
@@ -1831,6 +2164,7 @@ fn discard_invalid_persisted_policies(state: &mut PersistedState, current_time: 
 }
 
 fn transport_configuration_from_state(state: &PersistedState) -> TransportConfiguration {
+    let current_time = now();
     let mut legacy_relays = state.relay_endpoints.clone();
     if legacy_relays.is_empty() {
         legacy_relays.extend(state.relay_endpoint);
@@ -1849,7 +2183,16 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
     };
 
     for joined in &state.networks {
-        let mut relays = joined.control_plane.verified_relays.clone();
+        let planet_expired = joined
+            .control_plane
+            .planet_expires_at_unix_seconds
+            .is_some_and(|expiry| current_time > expiry);
+        let planet_was_accepted = joined.control_plane.planet_manifest_version.is_some();
+        let mut relays = if planet_expired {
+            Vec::new()
+        } else {
+            joined.control_plane.verified_relays.clone()
+        };
         relays.sort_by_key(|relay| relay.priority);
         let relay_identities = relays
             .iter()
@@ -1859,14 +2202,18 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
             .iter()
             .map(|relay| relay.endpoint)
             .collect::<Vec<_>>();
-        if relay_endpoints.is_empty() {
+        if relay_endpoints.is_empty() && !planet_was_accepted {
             relay_endpoints = legacy_relays.clone();
         }
         relay_endpoints.dedup();
 
-        let mut root_servers = joined.control_plane.verified_roots.clone();
+        let mut root_servers = if planet_expired {
+            Vec::new()
+        } else {
+            joined.control_plane.verified_roots.clone()
+        };
         root_servers.sort_by_key(|root| root.priority);
-        if root_servers.is_empty() {
+        if root_servers.is_empty() && !planet_was_accepted {
             root_servers = state.root_servers.clone();
             root_servers.sort_by_key(|root| root.priority);
         }
@@ -1881,7 +2228,12 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
                 configuration.root_servers.push(root.clone());
             }
         }
-        for server in &joined.control_plane.verified_stun_servers {
+        for server in joined
+            .control_plane
+            .verified_stun_servers
+            .iter()
+            .filter(|_| !planet_expired)
+        {
             let server = server.trim();
             if !server.is_empty()
                 && !configuration
@@ -1898,6 +2250,9 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
                 relay_endpoints,
                 relay_identities,
                 planet_manifest_version: joined.control_plane.planet_manifest_version,
+                planet_expires_at_unix_seconds: (!planet_expired)
+                    .then_some(joined.control_plane.planet_expires_at_unix_seconds)
+                    .flatten(),
                 root_servers,
             },
         );
@@ -3119,13 +3474,13 @@ async fn run_relay_worker(
     let mut root_transactions = HashMap::<[u8; 16], RootTransaction>::new();
     let mut relay_registration_transactions =
         HashMap::<[u8; 16], RelayRegistrationTransaction>::new();
+    let mut registration_schedules = HashMap::<RegistrationTarget, RegistrationSchedule>::new();
     let mut endpoint_health = EndpointHealthTable::default();
     let mut incoming_ipv4 = vec![0_u8; u16::MAX as usize];
     let mut incoming_ipv6 = vec![0_u8; u16::MAX as usize];
     let mut tick = tokio::time::interval(Duration::from_millis(5));
-    let mut next_registration = tokio::time::Instant::now();
-    let mut registration_failures = 0_u8;
-    let mut registration_succeeded = true;
+    let mut next_registration_scan = tokio::time::Instant::now();
+    let mut next_stun_refresh = tokio::time::Instant::now();
     let mut next_port_mapping_refresh = tokio::time::Instant::now() + Duration::from_secs(1_800);
     let mut next_peer_probe = tokio::time::Instant::now();
     let mut next_handshake_retry = tokio::time::Instant::now();
@@ -3152,7 +3507,7 @@ async fn run_relay_worker(
                     &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
-                    &mut registration_succeeded,
+                    &mut registration_schedules,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -3173,7 +3528,7 @@ async fn run_relay_worker(
                     &mut relay_registration_transactions,
                     &mut advertised_candidates,
                     &mut endpoint_health,
-                    &mut registration_succeeded,
+                    &mut registration_schedules,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -3181,6 +3536,12 @@ async fn run_relay_worker(
                     != configuration_revision
                 {
                     trace_transport("transport configuration changed; rebuilding UDP sockets");
+                    break;
+                }
+                if configuration.has_expired_planet(now()) {
+                    trace_transport(
+                        "accepted Planet manifest expired; rebuilding transport fail closed",
+                    );
                     break;
                 }
                 if tokio::time::Instant::now() >= next_port_mapping_refresh {
@@ -3346,21 +3707,33 @@ async fn run_relay_worker(
                     next_peer_probe =
                         tokio::time::Instant::now() + Duration::from_secs(5);
                 }
-                if tokio::time::Instant::now() >= next_registration {
-                    if registration_succeeded {
-                        registration_failures = 0;
-                    } else {
-                        registration_failures = registration_failures.saturating_add(1);
-                    }
-                    registration_succeeded = false;
-                    let mut sent_registration = false;
+                if tokio::time::Instant::now() >= next_registration_scan {
+                    next_registration_scan = tokio::time::Instant::now() + Duration::from_millis(250);
+                    let schedule_time = Instant::now();
                     let (root_device, identity, memberships) =
                         agent.root_registration_material().await?;
+                    let mut active_targets = Vec::new();
                     for membership in &memberships {
                         let certificate = &membership.certificate;
                         for relay_endpoint in configuration
                             .relay_endpoints_for(certificate.claims.network_id)
                         {
+                            let target = RegistrationTarget {
+                                network_id: certificate.claims.network_id,
+                                endpoint: *relay_endpoint,
+                                kind: RegistrationServiceKind::Relay,
+                            };
+                            active_targets.push(target);
+                            let schedule = registration_schedules
+                                .entry(target)
+                                .or_insert_with(|| RegistrationSchedule::new(root_device, target, schedule_time));
+                            schedule.expire_if_timed_out(
+                                schedule_time,
+                                TRANSPORT_TRANSACTION_TTL,
+                            );
+                            if !schedule.is_due(schedule_time) {
+                                continue;
+                            }
                             let transaction_key =
                                 (certificate.claims.network_id, *relay_endpoint);
                             relay_registration_transactions.retain(|_, transaction| {
@@ -3380,7 +3753,7 @@ async fn run_relay_worker(
                             registration.push(RELAY_REGISTER_SIGNED);
                             registration.extend_from_slice(&serde_json::to_vec(&signed)?);
                             if sockets.send_to(&registration, *relay_endpoint).await {
-                                sent_registration = true;
+                                schedule.mark_sent(schedule_time);
                                 relay_registration_transactions.insert(
                                     nonce,
                                     RelayRegistrationTransaction {
@@ -3400,6 +3773,8 @@ async fn run_relay_worker(
                                         issued_at: Instant::now(),
                                     },
                                 );
+                            } else {
+                                schedule.mark_send_failure(schedule_time);
                             }
                         }
                         trace_transport(format!(
@@ -3410,6 +3785,26 @@ async fn run_relay_worker(
                             configuration.root_servers_for(certificate.claims.network_id)
                         {
                             for root_endpoint in root.endpoints.iter().copied() {
+                                let target = RegistrationTarget {
+                                    network_id: certificate.claims.network_id,
+                                    endpoint: root_endpoint,
+                                    kind: RegistrationServiceKind::Root,
+                                };
+                                active_targets.push(target);
+                                let schedule = registration_schedules
+                                    .entry(target)
+                                    .or_insert_with(|| RegistrationSchedule::new(root_device, target, schedule_time));
+                                schedule.expire_if_timed_out(
+                                    schedule_time,
+                                    TRANSPORT_TRANSACTION_TTL,
+                                );
+                                if !schedule.is_due(schedule_time) {
+                                    continue;
+                                }
+                                root_transactions.retain(|_, transaction| {
+                                    transaction.network_id != certificate.claims.network_id
+                                        || transaction.endpoint != root_endpoint
+                                });
                                 let nonce = new_root_nonce();
                                 let registration = RootRegistration::sign_authorized(
                                     root_device,
@@ -3424,7 +3819,7 @@ async fn run_relay_worker(
                                     .send_to(&serde_json::to_vec(&registration)?, root_endpoint)
                                     .await
                                 {
-                                    sent_registration = true;
+                                    schedule.mark_sent(schedule_time);
                                     root_transactions.insert(
                                         nonce,
                                         RootTransaction {
@@ -3435,24 +3830,30 @@ async fn run_relay_worker(
                                             issued_at: Instant::now(),
                                         },
                                     );
+                                } else {
+                                    schedule.mark_send_failure(schedule_time);
                                 }
                             }
                         }
                     }
-                    for server in &stun_servers {
-                        let transaction_id = new_stun_transaction_id();
-                        if sockets
-                            .send_to(&stun_binding_request(transaction_id), *server)
-                            .await
-                        {
-                            stun_transactions.insert(
-                                transaction_id,
-                                StunTransaction {
-                                    server: *server,
-                                    issued_at: Instant::now(),
-                                },
-                            );
+                    registration_schedules.retain(|target, _| active_targets.contains(target));
+                    if tokio::time::Instant::now() >= next_stun_refresh {
+                        for server in &stun_servers {
+                            let transaction_id = new_stun_transaction_id();
+                            if sockets
+                                .send_to(&stun_binding_request(transaction_id), *server)
+                                .await
+                            {
+                                stun_transactions.insert(
+                                    transaction_id,
+                                    StunTransaction {
+                                        server: *server,
+                                        issued_at: Instant::now(),
+                                    },
+                                );
+                            }
                         }
+                        next_stun_refresh = tokio::time::Instant::now() + Duration::from_secs(20);
                     }
                     stun_transactions.retain(|_, transaction| {
                         transaction.issued_at.elapsed() < Duration::from_secs(30)
@@ -3463,17 +3864,14 @@ async fn run_relay_worker(
                     relay_registration_transactions.retain(|_, transaction| {
                         transaction.issued_at.elapsed() < TRANSPORT_TRANSACTION_TTL
                     });
-                    if !sent_registration {
-                        registration_succeeded = true;
-                    }
-                    let retry_delay = registration_retry_delay(
-                        root_device.0.as_bytes(),
-                        registration_failures,
-                    );
+                    let maximum_backoff = registration_schedules
+                        .values()
+                        .map(RegistrationSchedule::last_delay)
+                        .max()
+                        .unwrap_or_default();
                     agent
                         .registration_backoff_seconds
-                        .store(retry_delay.as_secs(), Ordering::Relaxed);
-                    next_registration = tokio::time::Instant::now() + retry_delay;
+                        .store(maximum_backoff.as_secs(), Ordering::Relaxed);
                 }
                 if !agent.adapter.is_active() {
                     continue;
@@ -3556,7 +3954,7 @@ async fn receive_udp_packet(
     relay_registration_transactions: &mut HashMap<[u8; 16], RelayRegistrationTransaction>,
     advertised_candidates: &mut Vec<SocketAddr>,
     endpoint_health: &mut EndpointHealthTable,
-    registration_succeeded: &mut bool,
+    registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     let root_servers = configuration.root_servers.as_slice();
@@ -3596,7 +3994,7 @@ async fn receive_udp_packet(
         configuration_revision,
         root_servers,
         root_transactions,
-        registration_succeeded,
+        registration_schedules,
     )
     .await?
     {
@@ -3631,7 +4029,13 @@ async fn receive_udp_packet(
             agent
                 .relay_confirmations_accepted
                 .fetch_add(1, Ordering::Relaxed);
-            *registration_succeeded = true;
+            if let Some(schedule) = registration_schedules.get_mut(&RegistrationTarget {
+                network_id: network,
+                endpoint: remote,
+                kind: RegistrationServiceKind::Relay,
+            }) {
+                schedule.mark_success(Instant::now());
+            }
             agent.mark_relay_acknowledged(network, remote).await;
             if let Some(hint) = authorization_hint.as_ref() {
                 if agent.consider_authorization_hint(hint).await {
@@ -3678,6 +4082,13 @@ async fn receive_udp_packet(
             agent
                 .relay_confirmations_accepted
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(schedule) = registration_schedules.get_mut(&RegistrationTarget {
+                network_id: network,
+                endpoint: remote,
+                kind: RegistrationServiceKind::Relay,
+            }) {
+                schedule.mark_success(acknowledged);
+            }
             agent.mark_relay_acknowledged(network, remote).await;
             trace_transport(format!(
                 "relay {remote} registration acknowledged for network {}",
@@ -3846,7 +4257,7 @@ async fn handle_root_response(
     configuration_revision: u64,
     root_servers: &[PlanetRoot],
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
-    registration_succeeded: &mut bool,
+    registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
 ) -> Result<bool> {
     let Ok(response) = serde_json::from_slice::<SignedRootResponse>(packet) else {
         return Ok(false);
@@ -3878,7 +4289,13 @@ async fn handle_root_response(
             authorization_hints,
             ..
         } => {
-            *registration_succeeded = true;
+            if let Some(schedule) = registration_schedules.get_mut(&RegistrationTarget {
+                network_id: transaction.network_id,
+                endpoint: remote,
+                kind: RegistrationServiceKind::Root,
+            }) {
+                schedule.mark_success(Instant::now());
+            }
             agent
                 .mark_root_responsive(transaction.network_id, remote)
                 .await;
@@ -4952,6 +5369,36 @@ mod tests {
         }
     }
 
+    fn signed_planet_v3(
+        controller: &SigningKey,
+        controller_url: &str,
+        issued_at_unix_seconds: u64,
+        root_endpoint: SocketAddr,
+        root_identity: ServiceIdentityPolicy,
+        relay_endpoint: SocketAddr,
+        relay_identity: ServiceIdentityPolicy,
+    ) -> PlanetManifest {
+        PlanetManifest::sign_v3(
+            controller_url.into(),
+            vec![PlanetRoot {
+                public_key: root_identity.current_public_key.clone(),
+                endpoints: vec![root_endpoint],
+                priority: 0,
+                identity: Some(root_identity),
+            }],
+            vec![PlanetRelay {
+                endpoint: relay_endpoint,
+                priority: 0,
+                identity: Some(relay_identity),
+            }],
+            vec!["stun.example:3478".into()],
+            issued_at_unix_seconds,
+            Some(issued_at_unix_seconds + 300),
+            controller,
+        )
+        .unwrap()
+    }
+
     fn refresh_target(network: &JoinedNetwork) -> AuthorizationRefreshTarget {
         AuthorizationRefreshTarget {
             network_id: network.network.id,
@@ -5986,7 +6433,7 @@ mod tests {
             1,
             &roots,
             &mut root_transactions,
-            &mut false,
+            &mut HashMap::new(),
         )
         .await
         .unwrap());
@@ -6118,6 +6565,43 @@ mod tests {
     }
 
     #[test]
+    fn expired_planet_discovery_fails_closed_without_legacy_fallback() {
+        let mut joined = test_joined_network();
+        let network_id = joined.network.id;
+        joined.control_plane.planet_manifest_version = Some(3);
+        joined.control_plane.planet_last_issued_at_unix_seconds = Some(now().saturating_sub(100));
+        joined.control_plane.planet_expires_at_unix_seconds = Some(now().saturating_sub(1));
+        joined.control_plane.planet_semantic_digest = vec![1; 32];
+        joined.control_plane.verified_relays = vec![PlanetRelay {
+            endpoint: "203.0.113.95:51820".parse().unwrap(),
+            priority: 0,
+            identity: None,
+        }];
+        joined.control_plane.verified_roots = vec![PlanetRoot {
+            public_key: vec![2; 32],
+            endpoints: vec!["203.0.113.95:51819".parse().unwrap()],
+            priority: 0,
+            identity: None,
+        }];
+
+        let mut state = PersistedState::new();
+        state.relay_endpoints = vec!["192.0.2.95:51820".parse().unwrap()];
+        state.root_servers = vec![PlanetRoot {
+            public_key: vec![3; 32],
+            endpoints: vec!["192.0.2.95:51819".parse().unwrap()],
+            priority: 0,
+            identity: None,
+        }];
+        state.networks.push(joined);
+
+        let configuration = transport_configuration_from_state(&state);
+        assert!(configuration.relay_endpoints_for(network_id).is_empty());
+        assert!(configuration.root_servers_for(network_id).is_empty());
+        assert!(configuration.relay_endpoints.is_empty());
+        assert!(configuration.root_servers.is_empty());
+    }
+
+    #[test]
     fn legacy_global_planet_state_migrates_into_each_network() {
         let controller = SigningKey::from_bytes(&[31_u8; 32]);
         let mut state = PersistedState::new();
@@ -6169,7 +6653,460 @@ mod tests {
             control_plane.authorization_manifest.as_ref(),
             Some(&authorization)
         );
+        assert_eq!(control_plane.planet_manifest_version, Some(2));
+        assert_eq!(control_plane.planet_last_issued_at_unix_seconds, Some(0));
+        assert_eq!(control_plane.planet_expires_at_unix_seconds, None);
+        assert_eq!(control_plane.planet_semantic_digest.len(), 32);
         assert!(state.authorizations.is_empty());
+    }
+
+    #[test]
+    fn planet_update_rejects_version_time_and_equal_time_semantic_rollbacks() {
+        let controller = SigningKey::from_bytes(&[82; 32]);
+        let root = SigningKey::from_bytes(&[83; 32]);
+        let relay = SigningKey::from_bytes(&[84; 32]);
+        let other_relay = SigningKey::from_bytes(&[85; 32]);
+        let timestamp = now();
+        let controller_url = "https://controller.example";
+        let root_endpoint = "203.0.113.82:51819".parse().unwrap();
+        let relay_endpoint = "203.0.113.82:51820".parse().unwrap();
+        let current = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp,
+            root_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(83),
+                root.verifying_key().to_bytes().to_vec(),
+            ),
+            relay_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(84),
+                relay.verifying_key().to_bytes().to_vec(),
+            ),
+        );
+        let mut control_plane = NetworkControlPlane::default();
+        let update = validate_planet_update(
+            &control_plane,
+            &current,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_planet_update(&mut control_plane, None, &update);
+
+        let downgraded = PlanetManifest::sign_v2(
+            controller_url.into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec![root_endpoint],
+                priority: 0,
+                identity: None,
+            }],
+            vec![PlanetRelay {
+                endpoint: relay_endpoint,
+                priority: 0,
+                identity: None,
+            }],
+            vec![],
+            timestamp + 1,
+            Some(timestamp + 300),
+            &controller,
+        )
+        .unwrap();
+        let error = validate_planet_update(
+            &control_plane,
+            &downgraded,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp + 1,
+        )
+        .unwrap_err();
+        assert!(error.1.contains("version rollback"));
+
+        let older = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp.saturating_sub(1),
+            root_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(83),
+                root.verifying_key().to_bytes().to_vec(),
+            ),
+            relay_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(84),
+                relay.verifying_key().to_bytes().to_vec(),
+            ),
+        );
+        let error = validate_planet_update(
+            &control_plane,
+            &older,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap_err();
+        assert!(error.1.contains("issued_at rollback"));
+
+        let changed_at_equal_time = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp,
+            root_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(83),
+                root.verifying_key().to_bytes().to_vec(),
+            ),
+            "203.0.113.85:51820".parse().unwrap(),
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(85),
+                other_relay.verifying_key().to_bytes().to_vec(),
+            ),
+        );
+        let error = validate_planet_update(
+            &control_plane,
+            &changed_at_equal_time,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap_err();
+        assert!(error.1.contains("without advancing issued_at"));
+    }
+
+    #[tokio::test]
+    async fn enrollment_control_plane_cannot_downgrade_an_accepted_v3_planet() {
+        let controller = SigningKey::from_bytes(&[94; 32]);
+        let root = SigningKey::from_bytes(&[95; 32]);
+        let relay = SigningKey::from_bytes(&[96; 32]);
+        let network_id = NetworkId(Uuid::from_u128(940));
+        let timestamp = now();
+        let controller_url = "http://controller.example";
+        let root_endpoint = "203.0.113.94:51819".parse().unwrap();
+        let relay_endpoint = "203.0.113.94:51820".parse().unwrap();
+        let v3 = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp,
+            root_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(941),
+                root.verifying_key().to_bytes().to_vec(),
+            ),
+            relay_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(942),
+                relay.verifying_key().to_bytes().to_vec(),
+            ),
+        );
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            2,
+            1,
+            Vec::new(),
+            Vec::new(),
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let mut current = NetworkControlPlane {
+            controller_url: Some(controller_url.into()),
+            pinned_controller_public_key: controller.verifying_key().to_bytes().to_vec(),
+            authorization_manifest: Some(authorization.clone()),
+            ..NetworkControlPlane::default()
+        };
+        let update = validate_planet_update(
+            &current,
+            &v3,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_planet_update(&mut current, None, &update);
+
+        let v2 = PlanetManifest::sign_v2(
+            controller_url.into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec![root_endpoint],
+                priority: 0,
+                identity: None,
+            }],
+            vec![PlanetRelay {
+                endpoint: relay_endpoint,
+                priority: 0,
+                identity: None,
+            }],
+            vec![],
+            timestamp + 1,
+            Some(timestamp + 300),
+            &controller,
+        )
+        .unwrap();
+        let (address, server) = spawn_json_server(vec![serde_json::to_vec(&v2).unwrap()]).await;
+        let error = resolve_enrollment_control_plane(
+            Some(EnrollmentControlPlane {
+                controller_url: controller_url.into(),
+                planet_manifest_url: Some(format!("http://{address}/v1/planet")),
+                controller_tls_ca_pem: None,
+            }),
+            &controller.verifying_key().to_bytes(),
+            authorization,
+            Some(&current),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(error.1.contains("version rollback"));
+    }
+
+    #[tokio::test]
+    async fn periodic_planet_refresh_promotes_rotated_service_identities() {
+        let directory = env::temp_dir().join(format!("meshlake-planet-refresh-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let (device_id, device_identity) = {
+            let state = agent.state.read().await;
+            (state.device_id, identity_signing_key(&state).unwrap())
+        };
+        let controller = SigningKey::from_bytes(&[86; 32]);
+        let old_root = SigningKey::from_bytes(&[87; 32]);
+        let new_root = SigningKey::from_bytes(&[88; 32]);
+        let old_relay = SigningKey::from_bytes(&[89; 32]);
+        let new_relay = SigningKey::from_bytes(&[90; 32]);
+        let network_id = NetworkId(Uuid::from_u128(860));
+        let controller_url = "http://controller.example";
+        let timestamp = now();
+        let old_root_endpoint = "203.0.113.86:51819".parse().unwrap();
+        let new_root_endpoint = "203.0.113.87:51819".parse().unwrap();
+        let old_relay_endpoint = "203.0.113.86:51820".parse().unwrap();
+        let new_relay_endpoint = "203.0.113.87:51820".parse().unwrap();
+        let current = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp,
+            old_root_endpoint,
+            ServiceIdentityPolicy {
+                service_id: Uuid::from_u128(861),
+                current_public_key: old_root.verifying_key().to_bytes().to_vec(),
+                next_public_key: Some(new_root.verifying_key().to_bytes().to_vec()),
+                transition_not_before_unix_seconds: Some(timestamp),
+                transition_not_after_unix_seconds: Some(timestamp + 60),
+                revoked_public_keys: Vec::new(),
+            },
+            old_relay_endpoint,
+            ServiceIdentityPolicy {
+                service_id: Uuid::from_u128(862),
+                current_public_key: old_relay.verifying_key().to_bytes().to_vec(),
+                next_public_key: Some(new_relay.verifying_key().to_bytes().to_vec()),
+                transition_not_before_unix_seconds: Some(timestamp),
+                transition_not_after_unix_seconds: Some(timestamp + 60),
+                revoked_public_keys: Vec::new(),
+            },
+        );
+        let promoted = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp + 1,
+            new_root_endpoint,
+            ServiceIdentityPolicy {
+                service_id: Uuid::from_u128(861),
+                current_public_key: new_root.verifying_key().to_bytes().to_vec(),
+                next_public_key: None,
+                transition_not_before_unix_seconds: None,
+                transition_not_after_unix_seconds: None,
+                revoked_public_keys: vec![old_root.verifying_key().to_bytes().to_vec()],
+            },
+            new_relay_endpoint,
+            ServiceIdentityPolicy {
+                service_id: Uuid::from_u128(862),
+                current_public_key: new_relay.verifying_key().to_bytes().to_vec(),
+                next_public_key: None,
+                transition_not_before_unix_seconds: None,
+                transition_not_after_unix_seconds: None,
+                revoked_public_keys: vec![old_relay.verifying_key().to_bytes().to_vec()],
+            },
+        );
+        let (address, server) =
+            spawn_json_server(vec![serde_json::to_vec(&promoted).unwrap()]).await;
+        let manifest_url = format!("http://{address}/v1/planet");
+        let mut network = joined_network_with_authorization(
+            &controller,
+            &device_identity,
+            device_id,
+            network_id,
+            Uuid::from_u128(863),
+            1,
+            1,
+            controller_url.into(),
+        );
+        let update = validate_planet_update(
+            &network.control_plane,
+            &current,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_planet_update(
+            &mut network.control_plane,
+            Some(manifest_url.clone()),
+            &update,
+        );
+        {
+            let mut state = agent.state.write().await;
+            state.networks.push(network);
+            write_state(&path, &state).unwrap();
+        }
+
+        let previous_revision = agent.transport_revision.load(Ordering::Acquire);
+        agent
+            .refresh_planets_once(&reqwest::Client::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let state = agent.state.read().await;
+        let refreshed = &state.networks[0].control_plane;
+        assert_eq!(refreshed.planet_manifest_version, Some(3));
+        assert_eq!(
+            refreshed.planet_last_issued_at_unix_seconds,
+            Some(timestamp + 1)
+        );
+        assert_eq!(
+            refreshed.verified_roots[0].endpoints,
+            vec![new_root_endpoint]
+        );
+        assert_eq!(refreshed.verified_relays[0].endpoint, new_relay_endpoint);
+        assert_eq!(
+            refreshed.verified_roots[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .revoked_public_keys,
+            vec![old_root.verifying_key().to_bytes().to_vec()]
+        );
+        drop(state);
+        assert!(agent.transport_revision.load(Ordering::Acquire) > previous_revision);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn periodic_planet_refresh_keeps_last_verified_state_on_failure() {
+        let directory = env::temp_dir().join(format!(
+            "meshlake-planet-refresh-failure-{}",
+            Uuid::new_v4()
+        ));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let (device_id, device_identity) = {
+            let state = agent.state.read().await;
+            (state.device_id, identity_signing_key(&state).unwrap())
+        };
+        let controller = SigningKey::from_bytes(&[91; 32]);
+        let root = SigningKey::from_bytes(&[92; 32]);
+        let relay = SigningKey::from_bytes(&[93; 32]);
+        let network_id = NetworkId(Uuid::from_u128(910));
+        let controller_url = "http://controller.example";
+        let timestamp = now();
+        let root_endpoint = "203.0.113.91:51819".parse().unwrap();
+        let relay_endpoint = "203.0.113.91:51820".parse().unwrap();
+        let current = signed_planet_v3(
+            &controller,
+            controller_url,
+            timestamp,
+            root_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(911),
+                root.verifying_key().to_bytes().to_vec(),
+            ),
+            relay_endpoint,
+            ServiceIdentityPolicy::stable(
+                Uuid::from_u128(912),
+                relay.verifying_key().to_bytes().to_vec(),
+            ),
+        );
+        let downgraded = PlanetManifest::sign_v2(
+            controller_url.into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec![root_endpoint],
+                priority: 0,
+                identity: None,
+            }],
+            vec![PlanetRelay {
+                endpoint: relay_endpoint,
+                priority: 0,
+                identity: None,
+            }],
+            vec![],
+            timestamp + 1,
+            Some(timestamp + 300),
+            &controller,
+        )
+        .unwrap();
+        let mut tampered = current.clone();
+        tampered.issued_at_unix_seconds = timestamp + 2;
+        let (address, server) = spawn_json_server(vec![
+            serde_json::to_vec(&downgraded).unwrap(),
+            serde_json::to_vec(&tampered).unwrap(),
+        ])
+        .await;
+        let manifest_url = format!("http://{address}/v1/planet");
+        let mut network = joined_network_with_authorization(
+            &controller,
+            &device_identity,
+            device_id,
+            network_id,
+            Uuid::from_u128(913),
+            1,
+            1,
+            controller_url.into(),
+        );
+        let update = validate_planet_update(
+            &network.control_plane,
+            &current,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_planet_update(&mut network.control_plane, Some(manifest_url), &update);
+        {
+            let mut state = agent.state.write().await;
+            state.networks.push(network);
+            write_state(&path, &state).unwrap();
+        }
+        let previous_revision = agent.transport_revision.load(Ordering::Acquire);
+
+        agent
+            .refresh_planets_once(&reqwest::Client::new())
+            .await
+            .unwrap();
+        agent
+            .refresh_planets_once(&reqwest::Client::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let state = agent.state.read().await;
+        let retained = &state.networks[0].control_plane;
+        assert_eq!(retained.planet_manifest_version, Some(3));
+        assert_eq!(retained.planet_last_issued_at_unix_seconds, Some(timestamp));
+        assert_eq!(retained.verified_roots[0].endpoints, vec![root_endpoint]);
+        assert_eq!(retained.verified_relays[0].endpoint, relay_endpoint);
+        drop(state);
+        assert_eq!(
+            agent.transport_revision.load(Ordering::Acquire),
+            previous_revision
+        );
+        drop(agent);
+        cleanup_test_state(&path, &directory);
     }
 
     #[test]
@@ -6279,6 +7216,7 @@ mod tests {
             }),
             &controller.verifying_key().to_bytes(),
             authorization.clone(),
+            None,
         )
         .await
         .unwrap_err();
@@ -6292,6 +7230,7 @@ mod tests {
             }),
             &controller.verifying_key().to_bytes(),
             authorization,
+            None,
         )
         .await
         .unwrap_err();
@@ -6357,6 +7296,7 @@ mod tests {
             }),
             &controller.verifying_key().to_bytes(),
             authorization.clone(),
+            None,
         )
         .await
         .unwrap();

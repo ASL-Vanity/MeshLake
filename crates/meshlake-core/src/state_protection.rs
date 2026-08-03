@@ -13,7 +13,7 @@ use fs2::FileExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -30,6 +30,8 @@ const LINUX_NONCE_LEN: usize = 24;
 const MAX_PROVIDER_KEY_FILE_BYTES: u64 = 64 * 1024;
 pub const AGENT_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake agent state v1";
 pub const CONTROLLER_STATE_PROTECTION_PURPOSE: &[u8] = b"MeshLake controller state v1";
+pub const ROOT_IDENTITY_PROTECTION_PURPOSE: &[u8] = b"MeshLake root service identity v1";
+pub const RELAY_IDENTITY_PROTECTION_PURPOSE: &[u8] = b"MeshLake relay service identity v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateKeyProvider {
@@ -191,17 +193,28 @@ pub struct StateFileLock {
 
 impl StateFileLock {
     pub fn acquire(state_path: &Path) -> Result<Self, StateFileError> {
+        reject_symlink_path(state_path)?;
         let parent = state_parent(state_path);
         fs::create_dir_all(parent)
             .map_err(|source| state_io_error("create state directory", parent, source))?;
+        reject_symlink_path(state_path)?;
         let lock_path = suffixed_path(state_path, ".lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|source| state_io_error("open state lock", &lock_path, source))?;
+        reject_symlink_path(&lock_path)?;
+        let file = secure_open_lock(&lock_path)?;
+        if !file
+            .metadata()
+            .map_err(|source| state_io_error("inspect state lock", &lock_path, source))?
+            .is_file()
+        {
+            return Err(state_io_error(
+                "open a regular state lock",
+                &lock_path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "state lock is not a regular file",
+                ),
+            ));
+        }
         restrict_state_file_permissions(&lock_path)?;
         FileExt::try_lock_exclusive(&file).map_err(|source| StateFileError::Lock {
             path: state_path.to_path_buf(),
@@ -209,6 +222,46 @@ impl StateFileLock {
         })?;
         Ok(Self { file })
     }
+}
+
+/// Securely reads one locked state file with a hard size limit. The final
+/// component is opened without following links and every existing parent
+/// component is rejected when it is a symlink/reparse point.
+pub fn read_protected_state_file<T: DeserializeOwned>(
+    path: &Path,
+    purpose: &[u8],
+    maximum_bytes: usize,
+) -> Result<DecodedState<T>, StateFileError> {
+    reject_symlink_path(path)?;
+    let file = secure_open_read(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| state_io_error("inspect state", path, source))?;
+    if !metadata.is_file() || metadata.len() > maximum_bytes as u64 {
+        return Err(state_io_error(
+            "read state within its size limit",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state file is not a regular file or exceeds its size limit",
+            ),
+        ));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(maximum_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| state_io_error("read state", path, source))?;
+    if bytes.len() > maximum_bytes {
+        return Err(state_io_error(
+            "read state within its size limit",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "state file exceeds its size limit",
+            ),
+        ));
+    }
+    decode_protected_state(&bytes, purpose).map_err(Into::into)
 }
 
 impl Drop for StateFileLock {
@@ -436,6 +489,7 @@ pub fn write_protected_state_file_with<T: Serialize>(
     purpose: &[u8],
     protection: &StateProtection,
 ) -> Result<(), StateFileError> {
+    reject_symlink_path(path)?;
     let parent = state_parent(path);
     fs::create_dir_all(parent)
         .map_err(|source| state_io_error("create state directory", parent, source))?;
@@ -462,6 +516,93 @@ pub fn write_protected_state_file_with<T: Serialize>(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn reject_symlink_path(path: &Path) -> Result<(), StateFileError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(state_io_error(
+                    "use a non-symlink state path",
+                    &current,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "state path contains a symbolic link or reparse point",
+                    ),
+                ));
+            }
+            Ok(metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        return Err(state_io_error(
+                            "use a non-reparse state path",
+                            &current,
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "state path contains a symbolic link or reparse point",
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => return Err(state_io_error("inspect state path", &current, source)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_open_read(path: &Path) -> Result<File, StateFileError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| state_io_error("open state without following links", path, source))
+}
+
+#[cfg(unix)]
+fn secure_open_lock(path: &Path) -> Result<File, StateFileError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| state_io_error("open state lock without following links", path, source))
+}
+
+#[cfg(windows)]
+fn secure_open_read(path: &Path) -> Result<File, StateFileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| state_io_error("open state without following links", path, source))
+}
+
+#[cfg(windows)]
+fn secure_open_lock(path: &Path) -> Result<File, StateFileError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| state_io_error("open state lock without following links", path, source))
 }
 
 #[cfg(unix)]

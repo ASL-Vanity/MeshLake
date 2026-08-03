@@ -8,11 +8,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
-    load_or_create_service_identity, peer_identity_announcement, AuthorizationEpochHint, DeviceId,
-    MembershipCertificate, NetworkId, RootRegistration, SignedRelayRegistrationAck,
-    RELAY_CANDIDATE, RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC, RELAY_PEER,
-    RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT,
-    RELAY_SESSION_RESPONSE,
+    load_or_create_relay_identity, peer_identity_announcement, AuthorizationEpochHint, DeviceId,
+    MembershipCertificate, NetworkId, RootRegistration, ServiceSigningIdentity,
+    SignedRelayRegistrationAck, RELAY_CANDIDATE, RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC,
+    RELAY_PEER, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
+    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use std::{
     collections::HashMap,
@@ -72,6 +72,9 @@ struct RelayIdentity {
     relay_id: Uuid,
     current: SigningKey,
     next: Option<SigningKey>,
+    // Retain both protected-state locks for the service lifetime. The signing
+    // keys are cloned separately so unit tests can use in-memory identities.
+    _identity_guards: Vec<ServiceSigningIdentity>,
 }
 
 #[tokio::main]
@@ -79,16 +82,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let trusted_key = decode_controller_key(&cli.controller_public_key_base64)?;
     let identity_path = cli.identity_file.unwrap_or_else(default_identity_path);
-    let current = load_or_create_service_identity(&identity_path, None)?;
+    let current = load_or_create_relay_identity(&identity_path, None)?;
     let next = cli
         .transition_identity_file
         .as_deref()
-        .map(|path| load_or_create_service_identity(path, Some(current.service_id)))
+        .map(|path| load_or_create_relay_identity(path, Some(current.service_id)))
         .transpose()?;
     let identity = RelayIdentity {
         relay_id: current.service_id,
-        current: current.signing_key,
-        next: next.map(|identity| identity.signing_key),
+        current: current.signing_key.clone(),
+        next: next.as_ref().map(|identity| identity.signing_key.clone()),
+        _identity_guards: next.into_iter().chain(std::iter::once(current)).collect(),
     };
     if cli.print_identity {
         println!(
@@ -116,6 +120,7 @@ async fn main() -> Result<()> {
             continue;
         }
         let timestamp = now();
+        authorization_hints.retain(|_, hint| !hint.is_expired(timestamp));
         peers.retain(|_, peer| {
             peer.last_seen.elapsed() <= PEER_TTL
                 && timestamp <= peer.authorization_expires_at_unix_seconds
@@ -199,9 +204,9 @@ async fn handle_packet(
                     },
                 );
                 if let Some(hint) = authorization_hint {
-                    let replace = authorization_hints.get(&key.0).is_none_or(|current| {
-                        hint.authorization_epoch > current.authorization_epoch
-                    });
+                    let replace = authorization_hints
+                        .get(&key.0)
+                        .is_none_or(|current| hint.supersedes(current));
                     if replace {
                         authorization_hints.insert(key.0, hint);
                     }
@@ -517,6 +522,7 @@ mod tests {
             relay_id: Uuid::from_u128(0xfeed),
             current: SigningKey::from_bytes(&[90; 32]),
             next: None,
+            _identity_guards: Vec::new(),
         }
     }
 

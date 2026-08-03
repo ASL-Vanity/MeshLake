@@ -10,6 +10,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use thiserror::Error;
 
@@ -255,7 +256,35 @@ struct PlanetManifestV3Payload<'a> {
     controller_public_key: &'a [u8],
 }
 
+#[derive(Serialize)]
+struct PlanetManifestSemanticPayload<'a> {
+    version: u8,
+    controller_url: &'a str,
+    relay_endpoint: SocketAddr,
+    roots: &'a [PlanetRoot],
+    relays: &'a [PlanetRelay],
+    stun_servers: &'a [String],
+    controller_public_key: &'a [u8],
+}
+
 impl PlanetManifest {
+    /// Digest of public Planet routing and identity semantics. Timestamps,
+    /// expiry, and signatures are intentionally excluded so equal-time
+    /// mutation detection compares only the signed configuration meaning.
+    pub fn semantic_digest(&self) -> Result<[u8; 32], CryptoError> {
+        let encoded = serde_json::to_vec(&PlanetManifestSemanticPayload {
+            version: self.version,
+            controller_url: &self.controller_url,
+            relay_endpoint: self.relay_endpoint,
+            roots: &self.roots,
+            relays: &self.relays,
+            stun_servers: &self.stun_servers,
+            controller_public_key: &self.controller_public_key,
+        })
+        .map_err(|_| CryptoError::CertificateEncodingFailed)?;
+        Ok(Sha256::digest(encoded).into())
+    }
+
     pub fn sign(
         controller_url: String,
         relay_endpoint: SocketAddr,
