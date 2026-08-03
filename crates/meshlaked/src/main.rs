@@ -25,19 +25,19 @@ use ed25519_dalek::SigningKey;
 use meshlake_core::{
     accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state_with,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
-    restrict_state_file_permissions, session_handshake_id, write_protected_state_file,
-    write_protected_state_file_with, AgentStatus, AuthorizationEpochHint, DeviceId,
-    EnrollmentResponse, InitiatorHandshake, JoinedNetwork, MembershipCertificate,
-    MembershipRefreshRequest, MembershipRefreshResponse, NetworkAuthorizationManifest,
-    NetworkControlPlane, NetworkId, NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys,
-    PeerPathStatus, PlanetManifest, PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow,
-    RootRegistration, RootResponse, ServiceIdentityPolicy, SessionList, SessionPath,
-    SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRelayRegistrationAck,
-    SignedRootResponse, StateFileLock, StateKeyProvider, StateProtection, TransportStatus,
-    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
-    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
-    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED,
-    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    restrict_state_file_permissions, session_handshake_id, write_protected_state_file_with,
+    AgentStatus, AuthorizationEpochHint, DeviceId, EnrollmentResponse, InitiatorHandshake,
+    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
+    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey,
+    NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay,
+    PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration, RootRegistrationServiceKind,
+    RootResponse, ServiceIdentityPolicy, SessionList, SessionPath, SessionQueueCounters,
+    SessionSecurityCounters, SessionState, SignedRelayRegistrationAck, SignedRootResponse,
+    StateFileLock, StateKeyProvider, StateProtection, TransportStatus, UpsertNetworkRequest,
+    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
+    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -631,12 +631,13 @@ impl Agent {
             manifest_url: manifest_url.clone(),
             controller_url: global_update.controller_url.clone(),
             controller_public_key_base64: config.controller_public_key_base64.trim().to_owned(),
-            controller_tls_ca_pem: tls_ca_pem,
+            controller_tls_ca_pem: tls_ca_pem.clone(),
         });
         for (index, update) in network_updates {
-            apply_planet_update(
+            apply_configured_planet_update(
                 &mut state.networks[index].control_plane,
-                Some(manifest_url.clone()),
+                manifest_url.clone(),
+                tls_ca_pem.clone(),
                 &update,
             );
         }
@@ -801,6 +802,9 @@ impl Agent {
         };
         if network.control_plane.planet_manifest_url.as_deref()
             != Some(target.manifest_url.as_str())
+            || network.control_plane.controller_url.as_deref()
+                != Some(target.controller_url.as_str())
+            || network.control_plane.controller_tls_ca_pem != target.controller_tls_ca_pem
             || network.control_plane.pinned_controller_public_key
                 != target.pinned_controller_public_key
         {
@@ -820,7 +824,7 @@ impl Agent {
             &update,
         );
         if changed {
-            write_state(&self.path, &state)?;
+            write_state_with_protection(&self.path, &state, &self.state_protection)?;
         }
         drop(state);
         if changed {
@@ -1684,6 +1688,18 @@ fn apply_planet_update(
     changed
 }
 
+fn apply_configured_planet_update(
+    control_plane: &mut NetworkControlPlane,
+    manifest_url: String,
+    controller_tls_ca_pem: Option<String>,
+    update: &VerifiedPlanetUpdate,
+) -> bool {
+    let ca_changed = control_plane.controller_tls_ca_pem != controller_tls_ca_pem;
+    control_plane.controller_tls_ca_pem = controller_tls_ca_pem;
+    let manifest_changed = apply_planet_update(control_plane, Some(manifest_url), update);
+    ca_changed || manifest_changed
+}
+
 fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError> {
     let value = value.trim();
     let Some((raw_scheme, authority_and_path)) = value.split_once("://") else {
@@ -2268,10 +2284,6 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
     configuration
 }
 
-fn write_state(path: &FsPath, state: &PersistedState) -> Result<()> {
-    write_protected_state_file(path, state, AGENT_STATE_PROTECTION_PURPOSE).map_err(Into::into)
-}
-
 fn write_state_with_protection(
     path: &FsPath,
     state: &PersistedState,
@@ -2531,15 +2543,19 @@ fn manage_autostart(
     command: AutostartCommand,
     state_path: &FsPath,
     wintun_dll: &FsPath,
-    _state_key_provider: Option<&StateKeyProvider>,
+    state_key_provider: Option<&StateKeyProvider>,
 ) -> Result<()> {
     const TASK_NAME: &str = "MeshLake Agent";
     match command {
         AutostartCommand::Install => {
+            let state_protection = match state_key_provider {
+                Some(provider) => StateProtection::from_provider(state_path, provider.clone())?,
+                None => StateProtection::platform_default(),
+            };
             let _state_lock = StateFileLock::acquire(state_path)?;
             recover_protected_state_file(state_path)?;
             if !state_path.exists() {
-                write_state(state_path, &PersistedState::new())?;
+                write_state_with_protection(state_path, &PersistedState::new(), &state_protection)?;
             } else {
                 restrict_state_file_permissions(state_path)?;
             }
@@ -3325,6 +3341,51 @@ struct RootTransaction {
     issued_at: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn sign_registration_for_planet_service(
+    planet_manifest_version: Option<u8>,
+    service_kind: RootRegistrationServiceKind,
+    service_identity: Option<&ServiceIdentityPolicy>,
+    device_id: DeviceId,
+    certificate: &MembershipCertificate,
+    authorization: &NetworkAuthorizationManifest,
+    advertised_candidates: &[SocketAddr],
+    issued_at_unix_seconds: u64,
+    nonce: [u8; 16],
+    signing_key: &SigningKey,
+) -> std::result::Result<Option<RootRegistration>, meshlake_core::RootProtocolError> {
+    match planet_manifest_version {
+        Some(3) => {
+            let Some(identity) = service_identity else {
+                return Ok(None);
+            };
+            RootRegistration::sign_authorized_for_service(
+                device_id,
+                vec![certificate.clone()],
+                vec![authorization.clone()],
+                advertised_candidates.to_vec(),
+                issued_at_unix_seconds,
+                nonce,
+                service_kind,
+                identity.service_id,
+                signing_key,
+            )
+            .map(Some)
+        }
+        Some(1 | 2) | None => RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate.clone()],
+            vec![authorization.clone()],
+            advertised_candidates.to_vec(),
+            issued_at_unix_seconds,
+            nonce,
+            signing_key,
+        )
+        .map(Some),
+        Some(_) => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 struct RelayRegistrationTransaction {
     network_id: NetworkId,
@@ -3740,15 +3801,41 @@ async fn run_relay_worker(
                                 (transaction.network_id, transaction.endpoint) != transaction_key
                             });
                             let nonce = new_root_nonce();
-                            let signed = RootRegistration::sign_authorized(
+                            let manifest_version = configuration
+                                .planet_manifest_version_for(certificate.claims.network_id);
+                            let relay_identity = configuration
+                                .relay_identity_for(
+                                    certificate.claims.network_id,
+                                    *relay_endpoint,
+                                )
+                                .cloned();
+                            let Some(signed) = sign_registration_for_planet_service(
+                                manifest_version,
+                                RootRegistrationServiceKind::Relay,
+                                relay_identity.as_ref(),
                                 root_device,
-                                vec![certificate.clone()],
-                                vec![membership.authorization.clone()],
-                                advertised_candidates.clone(),
+                                certificate,
+                                &membership.authorization,
+                                &advertised_candidates,
                                 now(),
                                 nonce,
                                 &identity,
-                            )?;
+                            )?
+                            else {
+                                trace_transport(match manifest_version {
+                                    Some(3) => format!(
+                                        "skipped V3 Relay registration without a pinned service identity for network {}",
+                                        certificate.claims.network_id.0
+                                    ),
+                                    Some(version) => format!(
+                                        "skipped Relay registration for unsupported Planet version {version}"
+                                    ),
+                                    None => unreachable!(
+                                        "legacy registration always has sufficient service metadata"
+                                    ),
+                                });
+                                continue;
+                            };
                             let mut registration = Vec::from(RELAY_MAGIC);
                             registration.push(RELAY_REGISTER_SIGNED);
                             registration.extend_from_slice(&serde_json::to_vec(&signed)?);
@@ -3760,16 +3847,8 @@ async fn run_relay_worker(
                                         network_id: certificate.claims.network_id,
                                         device_id: root_device,
                                         endpoint: *relay_endpoint,
-                                        planet_manifest_version: configuration
-                                            .planet_manifest_version_for(
-                                                certificate.claims.network_id,
-                                            ),
-                                        identity: configuration
-                                            .relay_identity_for(
-                                                certificate.claims.network_id,
-                                                *relay_endpoint,
-                                            )
-                                            .cloned(),
+                                        planet_manifest_version: manifest_version,
+                                        identity: relay_identity,
                                         issued_at: Instant::now(),
                                     },
                                 );
@@ -3806,15 +3885,36 @@ async fn run_relay_worker(
                                         || transaction.endpoint != root_endpoint
                                 });
                                 let nonce = new_root_nonce();
-                                let registration = RootRegistration::sign_authorized(
-                                    root_device,
-                                    vec![certificate.clone()],
-                                    vec![membership.authorization.clone()],
-                                    advertised_candidates.clone(),
-                                    now(),
-                                    nonce,
-                                    &identity,
-                                )?;
+                                let manifest_version = configuration
+                                    .planet_manifest_version_for(certificate.claims.network_id);
+                                let Some(registration) =
+                                    sign_registration_for_planet_service(
+                                        manifest_version,
+                                        RootRegistrationServiceKind::Root,
+                                        root.identity.as_ref(),
+                                        root_device,
+                                        certificate,
+                                        &membership.authorization,
+                                        &advertised_candidates,
+                                        now(),
+                                        nonce,
+                                        &identity,
+                                    )?
+                                else {
+                                    trace_transport(match manifest_version {
+                                        Some(3) => format!(
+                                            "skipped V3 Root registration without a pinned service identity for network {}",
+                                            certificate.claims.network_id.0
+                                        ),
+                                        Some(version) => format!(
+                                            "skipped Root registration for unsupported Planet version {version}"
+                                        ),
+                                        None => unreachable!(
+                                            "legacy registration always has sufficient service metadata"
+                                        ),
+                                    });
+                                    continue;
+                                };
                                 if sockets
                                     .send_to(&serde_json::to_vec(&registration)?, root_endpoint)
                                     .await
@@ -3957,7 +4057,6 @@ async fn receive_udp_packet(
     registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
-    let root_servers = configuration.root_servers.as_slice();
     if let Some((transaction_id, candidate)) = parse_stun_binding_success(packet) {
         if let Some(transaction) = stun_transactions.remove(&transaction_id) {
             if transaction.server == remote
@@ -3992,7 +4091,7 @@ async fn receive_udp_packet(
         peers,
         sessions,
         configuration_revision,
-        root_servers,
+        configuration,
         root_transactions,
         registration_schedules,
     )
@@ -4255,33 +4354,44 @@ async fn handle_root_response(
     peers: &mut HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     configuration_revision: u64,
-    root_servers: &[PlanetRoot],
+    configuration: &TransportConfiguration,
     root_transactions: &mut HashMap<[u8; 16], RootTransaction>,
     registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
 ) -> Result<bool> {
     let Ok(response) = serde_json::from_slice::<SignedRootResponse>(packet) else {
         return Ok(false);
     };
-    let Some(transaction) = root_transactions.remove(&response.request_nonce) else {
+    let Some(transaction) = root_transactions.get(&response.request_nonce) else {
         return Ok(true);
     };
-    if transaction.endpoint != remote || transaction.issued_at.elapsed() > Duration::from_secs(30) {
-        return Ok(true);
-    }
-    if !root_servers
-        .iter()
-        .any(|root| root.public_key == transaction.public_key && root.endpoints.contains(&remote))
+    if transaction.endpoint != remote
+        || Instant::now().saturating_duration_since(transaction.issued_at)
+            >= TRANSPORT_TRANSACTION_TTL
     {
         return Ok(true);
     }
-    let identity_verified = transaction
+    let Some(current_root) = configuration
+        .root_servers_for(transaction.network_id)
+        .iter()
+        .find(|root| {
+            root.public_key == transaction.public_key
+                && root.endpoints.contains(&remote)
+                && root.identity == transaction.identity
+        })
+    else {
+        return Ok(true);
+    };
+    let identity_verified = current_root
         .identity
         .as_ref()
         .map(|identity| response.verify_identity(identity, now()))
-        .unwrap_or_else(|| response.verify(&transaction.public_key));
+        .unwrap_or_else(|| response.verify(&current_root.public_key));
     if identity_verified.is_err() {
         return Ok(true);
     }
+    let transaction = root_transactions
+        .remove(&response.request_nonce)
+        .expect("verified Root transaction remains present");
     match response.response {
         RootResponse::Registered {
             observed_endpoint,
@@ -5307,6 +5417,46 @@ mod tests {
         (address, server)
     }
 
+    async fn spawn_blocked_json_server(
+        body: Vec<u8>,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_received_tx.send(());
+            release_rx.await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        (address, request_received_rx, release_tx, server)
+    }
+
     fn joined_network_with_authorization(
         controller: &SigningKey,
         identity: &SigningKey,
@@ -5397,6 +5547,168 @@ mod tests {
             controller,
         )
         .unwrap()
+    }
+
+    fn signed_planet_v2(
+        controller: &SigningKey,
+        controller_url: &str,
+        issued_at_unix_seconds: u64,
+        root_endpoint: SocketAddr,
+        relay_endpoint: SocketAddr,
+    ) -> PlanetManifest {
+        PlanetManifest::sign_v2(
+            controller_url.into(),
+            vec![PlanetRoot {
+                public_key: vec![12; 32],
+                endpoints: vec![root_endpoint],
+                priority: 0,
+                identity: None,
+            }],
+            vec![PlanetRelay {
+                endpoint: relay_endpoint,
+                priority: 0,
+                identity: None,
+            }],
+            vec!["stun.example:3478".into()],
+            issued_at_unix_seconds,
+            Some(issued_at_unix_seconds + 300),
+            controller,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn planet_version_selects_target_bound_or_legacy_registration_explicitly() {
+        let controller = SigningKey::from_bytes(&[94; 32]);
+        let device_identity = SigningKey::from_bytes(&[95; 32]);
+        let device_id = DeviceId(Uuid::from_u128(940));
+        let network_id = NetworkId(Uuid::from_u128(941));
+        let joined = joined_network_with_authorization(
+            &controller,
+            &device_identity,
+            device_id,
+            network_id,
+            Uuid::from_u128(942),
+            1,
+            1,
+            "http://controller.example".into(),
+        );
+        let certificate = joined.certificate.as_ref().unwrap();
+        let authorization = joined
+            .control_plane
+            .authorization_manifest
+            .as_ref()
+            .unwrap();
+        let root_identity = ServiceIdentityPolicy::stable(
+            Uuid::from_u128(943),
+            SigningKey::from_bytes(&[96; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+        );
+        let relay_identity = ServiceIdentityPolicy::stable(
+            Uuid::from_u128(944),
+            SigningKey::from_bytes(&[97; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+        );
+        let nonce = [98; 16];
+
+        let root = sign_registration_for_planet_service(
+            Some(3),
+            RootRegistrationServiceKind::Root,
+            Some(&root_identity),
+            device_id,
+            certificate,
+            authorization,
+            &[],
+            now(),
+            nonce,
+            &device_identity,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            root.payload.target,
+            Some(meshlake_core::RootRegistrationTarget {
+                service_kind: RootRegistrationServiceKind::Root,
+                service_id: root_identity.service_id,
+            })
+        );
+
+        let relay = sign_registration_for_planet_service(
+            Some(3),
+            RootRegistrationServiceKind::Relay,
+            Some(&relay_identity),
+            device_id,
+            certificate,
+            authorization,
+            &[],
+            now(),
+            nonce,
+            &device_identity,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            relay.payload.target,
+            Some(meshlake_core::RootRegistrationTarget {
+                service_kind: RootRegistrationServiceKind::Relay,
+                service_id: relay_identity.service_id,
+            })
+        );
+        assert_ne!(root.payload.target, relay.payload.target);
+
+        for version in [None, Some(1), Some(2)] {
+            let legacy = sign_registration_for_planet_service(
+                version,
+                RootRegistrationServiceKind::Root,
+                None,
+                device_id,
+                certificate,
+                authorization,
+                &[],
+                now(),
+                nonce,
+                &device_identity,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                legacy.payload.version,
+                meshlake_core::ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY
+            );
+            assert_eq!(legacy.payload.target, None);
+        }
+        assert!(sign_registration_for_planet_service(
+            Some(3),
+            RootRegistrationServiceKind::Relay,
+            None,
+            device_id,
+            certificate,
+            authorization,
+            &[],
+            now(),
+            nonce,
+            &device_identity,
+        )
+        .unwrap()
+        .is_none());
+        assert!(sign_registration_for_planet_service(
+            Some(4),
+            RootRegistrationServiceKind::Root,
+            Some(&root_identity),
+            device_id,
+            certificate,
+            authorization,
+            &[],
+            now(),
+            nonce,
+            &device_identity,
+        )
+        .unwrap()
+        .is_none());
     }
 
     fn refresh_target(network: &JoinedNetwork) -> AuthorizationRefreshTarget {
@@ -6419,6 +6731,16 @@ mod tests {
             priority: 0,
             identity: None,
         }];
+        let configuration = TransportConfiguration {
+            networks: HashMap::from([(
+                requested_network,
+                NetworkTransportConfiguration {
+                    root_servers: roots,
+                    ..NetworkTransportConfiguration::default()
+                },
+            )]),
+            ..TransportConfiguration::default()
+        };
         let sockets = TransportSockets::bind().await.unwrap();
         let mut peers = HashMap::<PeerKey, PeerRoute>::new();
         let mut sessions = HashMap::<PeerKey, PeerSessionState>::new();
@@ -6431,7 +6753,7 @@ mod tests {
             &mut peers,
             &mut sessions,
             1,
-            &roots,
+            &configuration,
             &mut root_transactions,
             &mut HashMap::new(),
         )
@@ -6447,6 +6769,333 @@ mod tests {
             .endpoints
             .root_is_responsive(foreign_network, root_endpoint, health_time));
         drop(health);
+        drop(sockets);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn root_response_transaction_survives_rejection_then_is_single_use() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-root-transaction-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let root = SigningKey::from_bytes(&[55; 32]);
+        let attacker = SigningKey::from_bytes(&[56; 32]);
+        let network_id = NetworkId(Uuid::from_u128(550));
+        let root_endpoint: SocketAddr = "127.0.0.1:51819".parse().unwrap();
+        let wrong_endpoint: SocketAddr = "127.0.0.1:51818".parse().unwrap();
+        let nonce = [57; 16];
+        let response = SignedRootResponse::sign(
+            nonce,
+            RootResponse::Registered {
+                observed_endpoint: "198.51.100.57:40000".parse().unwrap(),
+                peers: Vec::new(),
+                refresh_after_seconds: 20,
+                authorization_hints: Vec::new(),
+            },
+            &root,
+        )
+        .unwrap();
+        let mut invalid_signature = response.clone();
+        invalid_signature.signature[0] ^= 1;
+        let configured_root = PlanetRoot {
+            public_key: root.verifying_key().to_bytes().to_vec(),
+            endpoints: vec![root_endpoint],
+            priority: 0,
+            identity: None,
+        };
+        let wrong_pinned_root = PlanetRoot {
+            public_key: attacker.verifying_key().to_bytes().to_vec(),
+            endpoints: vec![root_endpoint],
+            priority: 0,
+            identity: None,
+        };
+        let configuration =
+            |configured_network: NetworkId, roots: Vec<PlanetRoot>| TransportConfiguration {
+                networks: HashMap::from([(
+                    configured_network,
+                    NetworkTransportConfiguration {
+                        root_servers: roots.clone(),
+                        ..NetworkTransportConfiguration::default()
+                    },
+                )]),
+                root_servers: roots,
+                ..TransportConfiguration::default()
+            };
+        let mut root_transactions = HashMap::from([(
+            nonce,
+            RootTransaction {
+                network_id,
+                endpoint: root_endpoint,
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                identity: None,
+                issued_at: Instant::now(),
+            },
+        )]);
+        let sockets = TransportSockets::bind().await.unwrap();
+        let mut peers = HashMap::<PeerKey, PeerRoute>::new();
+        let mut sessions = HashMap::<PeerKey, PeerSessionState>::new();
+        let mut schedules = HashMap::new();
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let invalid_encoded = serde_json::to_vec(&invalid_signature).unwrap();
+
+        for (remote, packet, configured_network, roots) in [
+            (
+                wrong_endpoint,
+                encoded.as_slice(),
+                network_id,
+                vec![configured_root.clone()],
+            ),
+            (
+                root_endpoint,
+                encoded.as_slice(),
+                NetworkId(Uuid::from_u128(551)),
+                vec![configured_root.clone()],
+            ),
+            (
+                root_endpoint,
+                encoded.as_slice(),
+                network_id,
+                vec![wrong_pinned_root],
+            ),
+            (
+                root_endpoint,
+                invalid_encoded.as_slice(),
+                network_id,
+                vec![configured_root.clone()],
+            ),
+        ] {
+            let current_configuration = configuration(configured_network, roots);
+            assert!(handle_root_response(
+                &agent,
+                &sockets,
+                remote,
+                packet,
+                &mut peers,
+                &mut sessions,
+                1,
+                &current_configuration,
+                &mut root_transactions,
+                &mut schedules,
+            )
+            .await
+            .unwrap());
+            assert!(root_transactions.contains_key(&nonce));
+            assert!(!agent
+                .transport_health
+                .read()
+                .await
+                .endpoints
+                .root_is_responsive(network_id, root_endpoint, Instant::now()));
+        }
+
+        root_transactions.get_mut(&nonce).unwrap().issued_at =
+            Instant::now() - TRANSPORT_TRANSACTION_TTL;
+        let active_configuration = configuration(network_id, vec![configured_root.clone()]);
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &encoded,
+            &mut peers,
+            &mut sessions,
+            1,
+            &active_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(root_transactions.contains_key(&nonce));
+        assert!(!agent
+            .transport_health
+            .read()
+            .await
+            .endpoints
+            .root_is_responsive(network_id, root_endpoint, Instant::now()));
+
+        root_transactions.get_mut(&nonce).unwrap().issued_at = Instant::now();
+        let active_configuration = configuration(network_id, vec![configured_root]);
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &encoded,
+            &mut peers,
+            &mut sessions,
+            1,
+            &active_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(!root_transactions.contains_key(&nonce));
+        {
+            let health = agent.transport_health.read().await;
+            assert!(health
+                .endpoints
+                .root_is_responsive(network_id, root_endpoint, Instant::now()));
+        }
+        *agent.transport_health.write().await = TransportHealth::default();
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &encoded,
+            &mut peers,
+            &mut sessions,
+            1,
+            &active_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(!agent
+            .transport_health
+            .read()
+            .await
+            .endpoints
+            .root_is_responsive(network_id, root_endpoint, Instant::now()));
+
+        drop(sockets);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn root_response_v3_rechecks_current_identity_policy_before_consuming_nonce() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-root-v3-transaction-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let current = SigningKey::from_bytes(&[58; 32]);
+        let next = SigningKey::from_bytes(&[59; 32]);
+        let network_id = NetworkId(Uuid::from_u128(580));
+        let root_id = Uuid::from_u128(581);
+        let root_endpoint: SocketAddr = "127.0.0.1:51819".parse().unwrap();
+        let nonce = [60; 16];
+        let stable_identity =
+            ServiceIdentityPolicy::stable(root_id, current.verifying_key().to_bytes().to_vec());
+        let response = SignedRootResponse::sign_with_identity(
+            nonce,
+            RootResponse::Registered {
+                observed_endpoint: "198.51.100.60:40000".parse().unwrap(),
+                peers: Vec::new(),
+                refresh_after_seconds: 20,
+                authorization_hints: Vec::new(),
+            },
+            root_id,
+            &[&current],
+        )
+        .unwrap();
+        let configured_root = |identity: ServiceIdentityPolicy| PlanetRoot {
+            public_key: current.verifying_key().to_bytes().to_vec(),
+            endpoints: vec![root_endpoint],
+            priority: 0,
+            identity: Some(identity),
+        };
+        let configuration = |identity: ServiceIdentityPolicy| TransportConfiguration {
+            networks: HashMap::from([(
+                network_id,
+                NetworkTransportConfiguration {
+                    root_servers: vec![configured_root(identity)],
+                    planet_manifest_version: Some(3),
+                    ..NetworkTransportConfiguration::default()
+                },
+            )]),
+            ..TransportConfiguration::default()
+        };
+        let mut root_transactions = HashMap::from([(
+            nonce,
+            RootTransaction {
+                network_id,
+                endpoint: root_endpoint,
+                public_key: current.verifying_key().to_bytes().to_vec(),
+                identity: Some(stable_identity.clone()),
+                issued_at: Instant::now(),
+            },
+        )]);
+        let sockets = TransportSockets::bind().await.unwrap();
+        let mut peers = HashMap::<PeerKey, PeerRoute>::new();
+        let mut sessions = HashMap::<PeerKey, PeerSessionState>::new();
+        let mut schedules = HashMap::new();
+
+        let mut tampered = response.clone();
+        tampered.identity_signatures[0].signature[0] ^= 1;
+        let stable_configuration = configuration(stable_identity.clone());
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &serde_json::to_vec(&tampered).unwrap(),
+            &mut peers,
+            &mut sessions,
+            1,
+            &stable_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(root_transactions.contains_key(&nonce));
+
+        let timestamp = now();
+        let changed_identity = ServiceIdentityPolicy {
+            service_id: root_id,
+            current_public_key: current.verifying_key().to_bytes().to_vec(),
+            next_public_key: Some(next.verifying_key().to_bytes().to_vec()),
+            transition_not_before_unix_seconds: Some(timestamp + 60),
+            transition_not_after_unix_seconds: Some(timestamp + 120),
+            revoked_public_keys: Vec::new(),
+        };
+        let changed_configuration = configuration(changed_identity);
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &serde_json::to_vec(&response).unwrap(),
+            &mut peers,
+            &mut sessions,
+            1,
+            &changed_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(root_transactions.contains_key(&nonce));
+        assert!(!agent
+            .transport_health
+            .read()
+            .await
+            .endpoints
+            .root_is_responsive(network_id, root_endpoint, Instant::now()));
+
+        assert!(handle_root_response(
+            &agent,
+            &sockets,
+            root_endpoint,
+            &serde_json::to_vec(&response).unwrap(),
+            &mut peers,
+            &mut sessions,
+            1,
+            &stable_configuration,
+            &mut root_transactions,
+            &mut schedules,
+        )
+        .await
+        .unwrap());
+        assert!(!root_transactions.contains_key(&nonce));
+        assert!(agent
+            .transport_health
+            .read()
+            .await
+            .endpoints
+            .root_is_responsive(network_id, root_endpoint, Instant::now()));
+
         drop(sockets);
         drop(agent);
         cleanup_test_state(&path, &directory);
@@ -6777,6 +7426,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_planet_ca_replaces_the_matching_network_refresh_target() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-planet-ca-target-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let controller = SigningKey::from_bytes(&[97; 32]);
+        let foreign_controller = SigningKey::from_bytes(&[98; 32]);
+        let timestamp = now();
+        let controller_url = "https://controller.example";
+        let manifest_url = "https://controller.example/v1/planet".to_owned();
+        let manifest = signed_planet_v2(
+            &controller,
+            controller_url,
+            timestamp,
+            "203.0.113.97:51819".parse().unwrap(),
+            "203.0.113.97:51820".parse().unwrap(),
+        );
+
+        let mut matching = test_joined_network();
+        let matching_id = matching.network.id;
+        matching.control_plane.controller_url = Some(controller_url.into());
+        matching.control_plane.pinned_controller_public_key =
+            controller.verifying_key().to_bytes().to_vec();
+        matching.control_plane.controller_tls_ca_pem = Some("old-private-ca".into());
+        let update = validate_planet_update(
+            &matching.control_plane,
+            &manifest,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_configured_planet_update(
+            &mut matching.control_plane,
+            manifest_url.clone(),
+            Some("normalized-new-private-ca".into()),
+            &update,
+        );
+
+        let mut foreign = test_joined_network();
+        foreign.network.id = NetworkId(Uuid::from_u128(980));
+        let foreign_id = foreign.network.id;
+        foreign.control_plane.controller_url = Some("https://foreign.example".into());
+        foreign.control_plane.planet_manifest_url =
+            Some("https://foreign.example/v1/planet".into());
+        foreign.control_plane.pinned_controller_public_key =
+            foreign_controller.verifying_key().to_bytes().to_vec();
+        foreign.control_plane.controller_tls_ca_pem = Some("foreign-private-ca".into());
+        agent.state.write().await.networks = vec![matching, foreign];
+
+        let targets = agent.planet_refresh_targets().await;
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.network_id == matching_id)
+                .unwrap()
+                .controller_tls_ca_pem
+                .as_deref(),
+            Some("normalized-new-private-ca")
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.network_id == foreign_id)
+                .unwrap()
+                .controller_tls_ca_pem
+                .as_deref(),
+            Some("foreign-private-ca")
+        );
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn configure_planet_clears_old_per_network_ca_atomically() {
+        let directory =
+            env::temp_dir().join(format!("meshlake-planet-ca-clear-{}", Uuid::new_v4()));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let controller = SigningKey::from_bytes(&[99; 32]);
+        let foreign_controller = SigningKey::from_bytes(&[101; 32]);
+        let timestamp = now();
+        let controller_url = "http://controller.example";
+        let manifest = signed_planet_v2(
+            &controller,
+            controller_url,
+            timestamp,
+            "203.0.113.99:51819".parse().unwrap(),
+            "203.0.113.99:51820".parse().unwrap(),
+        );
+        let (address, server) =
+            spawn_json_server(vec![serde_json::to_vec(&manifest).unwrap()]).await;
+        let mut network = test_joined_network();
+        let network_id = network.network.id;
+        network.control_plane.controller_url = Some(controller_url.into());
+        network.control_plane.pinned_controller_public_key =
+            controller.verifying_key().to_bytes().to_vec();
+        network.control_plane.controller_tls_ca_pem = Some("old-private-ca".into());
+        let mut foreign = test_joined_network();
+        foreign.network.id = NetworkId(Uuid::from_u128(990));
+        let foreign_id = foreign.network.id;
+        foreign.control_plane.controller_url = Some("https://foreign.example".into());
+        foreign.control_plane.planet_manifest_url =
+            Some("https://foreign.example/v1/planet".into());
+        foreign.control_plane.pinned_controller_public_key =
+            foreign_controller.verifying_key().to_bytes().to_vec();
+        foreign.control_plane.controller_tls_ca_pem = Some("foreign-private-ca".into());
+        agent.state.write().await.networks = vec![network, foreign];
+
+        agent
+            .configure_planet(PlanetConfig {
+                manifest_url: format!("http://{address}/v1/planet"),
+                controller_public_key_base64: STANDARD
+                    .encode(controller.verifying_key().to_bytes()),
+                tls_ca_certificate_pem: None,
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        let state = agent.state.read().await;
+        assert_eq!(state.networks[0].control_plane.controller_tls_ca_pem, None);
+        let foreign = state
+            .networks
+            .iter()
+            .find(|network| network.network.id == foreign_id)
+            .unwrap();
+        assert_eq!(
+            foreign.control_plane.controller_tls_ca_pem.as_deref(),
+            Some("foreign-private-ca")
+        );
+        assert_eq!(
+            foreign.control_plane.planet_manifest_url.as_deref(),
+            Some("https://foreign.example/v1/planet")
+        );
+        assert_eq!(state.planet.as_ref().unwrap().controller_tls_ca_pem, None);
+        drop(state);
+        assert_eq!(
+            agent
+                .planet_refresh_targets()
+                .await
+                .into_iter()
+                .find(|target| target.network_id == network_id)
+                .unwrap()
+                .controller_tls_ca_pem,
+            None
+        );
+        assert_eq!(
+            agent
+                .planet_refresh_targets()
+                .await
+                .into_iter()
+                .find(|target| target.network_id == foreign_id)
+                .unwrap()
+                .controller_tls_ca_pem
+                .as_deref(),
+            Some("foreign-private-ca")
+        );
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    async fn assert_in_flight_planet_refresh_is_discarded(
+        label: &str,
+        mutate_trust: impl FnOnce(&mut NetworkControlPlane),
+        assert_mutation: impl FnOnce(&NetworkControlPlane),
+    ) {
+        let directory = env::temp_dir().join(format!(
+            "meshlake-in-flight-planet-{label}-{}",
+            Uuid::new_v4()
+        ));
+        let path = directory.join("agent.json");
+        let agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let controller = SigningKey::from_bytes(&[100; 32]);
+        let timestamp = now();
+        let controller_url = "http://old-controller.example";
+        let initial_relay: SocketAddr = "203.0.113.100:51820".parse().unwrap();
+        let initial = signed_planet_v2(
+            &controller,
+            controller_url,
+            timestamp,
+            "203.0.113.100:51819".parse().unwrap(),
+            initial_relay,
+        );
+        let replacement = signed_planet_v2(
+            &controller,
+            controller_url,
+            timestamp + 1,
+            "203.0.113.101:51819".parse().unwrap(),
+            "203.0.113.101:51820".parse().unwrap(),
+        );
+        let (address, mut request_received, release_response, server) =
+            spawn_blocked_json_server(serde_json::to_vec(&replacement).unwrap()).await;
+        let manifest_url = format!("http://{address}/v1/planet");
+
+        let mut network = test_joined_network();
+        network.control_plane.controller_url = Some(controller_url.into());
+        network.control_plane.pinned_controller_public_key =
+            controller.verifying_key().to_bytes().to_vec();
+        let update = validate_planet_update(
+            &network.control_plane,
+            &initial,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        apply_planet_update(&mut network.control_plane, Some(manifest_url), &update);
+        {
+            let mut state = agent.state.write().await;
+            state.networks.push(network);
+            write_state_with_protection(&path, &state, &agent.state_protection).unwrap();
+        }
+        let target = agent.planet_refresh_targets().await.pop().unwrap();
+        let previous_revision = agent.transport_revision.load(Ordering::Acquire);
+        let client = reqwest::Client::new();
+        {
+            let refresh = agent.refresh_one_planet(&client, &target);
+            tokio::pin!(refresh);
+            tokio::select! {
+                result = &mut refresh => panic!("Planet refresh finished before the response was released: {result:?}"),
+                received = &mut request_received => received.unwrap(),
+            }
+            {
+                let mut state = agent.state.write().await;
+                mutate_trust(&mut state.networks[0].control_plane);
+                write_state_with_protection(&path, &state, &agent.state_protection).unwrap();
+            }
+            release_response.send(()).unwrap();
+            refresh.as_mut().await.unwrap();
+        }
+        server.await.unwrap();
+
+        let state = agent.state.read().await;
+        let control_plane = &state.networks[0].control_plane;
+        assert_mutation(control_plane);
+        assert_eq!(
+            control_plane.planet_last_issued_at_unix_seconds,
+            Some(timestamp)
+        );
+        assert_eq!(control_plane.verified_relays[0].endpoint, initial_relay);
+        drop(state);
+        assert_eq!(
+            agent.transport_revision.load(Ordering::Acquire),
+            previous_revision
+        );
+
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn in_flight_planet_response_cannot_overwrite_changed_controller_url() {
+        assert_in_flight_planet_refresh_is_discarded(
+            "controller-url",
+            |control_plane| {
+                control_plane.controller_url = Some("http://new-controller.example".into());
+            },
+            |control_plane| {
+                assert_eq!(
+                    control_plane.controller_url.as_deref(),
+                    Some("http://new-controller.example")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_planet_response_cannot_overwrite_changed_tls_ca() {
+        assert_in_flight_planet_refresh_is_discarded(
+            "tls-ca",
+            |control_plane| {
+                control_plane.controller_tls_ca_pem = Some("replacement-private-ca".into());
+            },
+            |control_plane| {
+                assert_eq!(
+                    control_plane.controller_tls_ca_pem.as_deref(),
+                    Some("replacement-private-ca")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn enrollment_control_plane_cannot_downgrade_an_accepted_v3_planet() {
         let controller = SigningKey::from_bytes(&[94; 32]);
         let root = SigningKey::from_bytes(&[95; 32]);
@@ -6960,7 +7897,7 @@ mod tests {
         {
             let mut state = agent.state.write().await;
             state.networks.push(network);
-            write_state(&path, &state).unwrap();
+            write_state_with_protection(&path, &state, &agent.state_protection).unwrap();
         }
 
         let previous_revision = agent.transport_revision.load(Ordering::Acquire);
@@ -7080,7 +8017,7 @@ mod tests {
         {
             let mut state = agent.state.write().await;
             state.networks.push(network);
-            write_state(&path, &state).unwrap();
+            write_state_with_protection(&path, &state, &agent.state_protection).unwrap();
         }
         let previous_revision = agent.transport_revision.load(Ordering::Acquire);
 
@@ -7851,11 +8788,12 @@ mod tests {
         let directory = env::temp_dir().join(format!("meshlake-state-test-{}", Uuid::new_v4()));
         let path = directory.join("agent.json");
         let state_lock = StateFileLock::acquire(&path).unwrap();
+        let protection = StateProtection::platform_default();
         let mut state = PersistedState::new();
         let original_device = state.device_id;
-        write_state(&path, &state).unwrap();
+        write_state_with_protection(&path, &state, &protection).unwrap();
         state.schema_version += 1;
-        write_state(&path, &state).unwrap();
+        write_state_with_protection(&path, &state, &protection).unwrap();
         assert!(!has_temporary_state_file(&path));
         assert!(!suffixed_state_path(&path, ".bak").exists());
 
@@ -7935,9 +8873,10 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("agent.json");
         let backup = suffixed_state_path(&path, ".bak");
+        let protection = StateProtection::platform_default();
         let state = PersistedState::new();
         let original_device = state.device_id;
-        write_state(&path, &state).unwrap();
+        write_state_with_protection(&path, &state, &protection).unwrap();
         fs::write(&backup, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
         assert!(String::from_utf8_lossy(&fs::read(&backup).unwrap())
             .contains(&original_device.0.to_string()));

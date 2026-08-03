@@ -232,36 +232,57 @@ pub fn read_protected_state_file<T: DeserializeOwned>(
     purpose: &[u8],
     maximum_bytes: usize,
 ) -> Result<DecodedState<T>, StateFileError> {
-    reject_symlink_path(path)?;
-    let file = secure_open_read(path)?;
+    read_protected_state_file_with_validation(path, purpose, maximum_bytes, |_| Ok(()))
+}
+
+/// Internal variant used by secret-bearing state owners that must validate
+/// permissions and ownership on the exact file handle before bytes are read
+/// or decoded.
+pub(crate) fn read_protected_state_file_with_validation<T, E>(
+    path: &Path,
+    purpose: &[u8],
+    maximum_bytes: usize,
+    validate_metadata: impl FnOnce(&fs::Metadata) -> Result<(), E>,
+) -> Result<DecodedState<T>, E>
+where
+    T: DeserializeOwned,
+    E: From<StateFileError>,
+{
+    reject_symlink_path(path).map_err(E::from)?;
+    let file = secure_open_read(path).map_err(E::from)?;
     let metadata = file
         .metadata()
-        .map_err(|source| state_io_error("inspect state", path, source))?;
+        .map_err(|source| state_io_error("inspect state", path, source))
+        .map_err(E::from)?;
     if !metadata.is_file() || metadata.len() > maximum_bytes as u64 {
-        return Err(state_io_error(
+        return Err(E::from(state_io_error(
             "read state within its size limit",
             path,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "state file is not a regular file or exceeds its size limit",
             ),
-        ));
+        )));
     }
+    validate_metadata(&metadata)?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
     file.take(maximum_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|source| state_io_error("read state", path, source))?;
+        .map_err(|source| state_io_error("read state", path, source))
+        .map_err(E::from)?;
     if bytes.len() > maximum_bytes {
-        return Err(state_io_error(
+        return Err(E::from(state_io_error(
             "read state within its size limit",
             path,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "state file exceeds its size limit",
             ),
-        ));
+        )));
     }
-    decode_protected_state(&bytes, purpose).map_err(Into::into)
+    decode_protected_state(&bytes, purpose)
+        .map_err(StateFileError::from)
+        .map_err(E::from)
 }
 
 impl Drop for StateFileLock {
@@ -533,12 +554,12 @@ fn reject_symlink_path(path: &Path) -> Result<(), StateFileError> {
                     ),
                 ));
             }
-            Ok(metadata) => {
+            Ok(_metadata) => {
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
                     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    if _metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         return Err(state_io_error(
                             "use a non-reparse state path",
                             &current,

@@ -9,12 +9,31 @@ use crate::{
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const ROOT_PROTOCOL_VERSION: u8 = 1;
+pub const ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY: u8 = 1;
+pub const ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND: u8 = 2;
 const ROOT_IDENTITY_RESPONSE_DOMAIN: &[u8] = b"MeshLake root identity response v2\0";
+const TARGET_BOUND_REGISTRATION_DOMAIN: &[u8] = b"MeshLake target-bound service registration v2\0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRegistrationServiceKind {
+    Root,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootRegistrationTarget {
+    pub service_kind: RootRegistrationServiceKind,
+    pub service_id: Uuid,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootRegistrationPayload {
@@ -26,6 +45,8 @@ pub struct RootRegistrationPayload {
     pub candidates: Vec<SocketAddr>,
     pub issued_at_unix_seconds: u64,
     pub nonce: [u8; 16],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RootRegistrationTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,8 +130,14 @@ pub enum RootProtocolError {
     UntrustedMembership,
     #[error("membership is missing a current controller authorization manifest")]
     MissingAuthorization,
+    #[error("registration authorization manifests are duplicate, unrelated, or untrusted")]
+    InvalidAuthorizationSet,
+    #[error("registration contains duplicate memberships for one network")]
+    DuplicateMembership,
     #[error("membership has been revoked or uses an old network key epoch")]
     RevokedMembership,
+    #[error("root registration target service does not match this service")]
+    TargetMismatch,
     #[error("root protocol message cannot be encoded")]
     EncodingFailed,
     #[error(transparent)]
@@ -148,7 +175,7 @@ impl RootRegistration {
         signing_key: &SigningKey,
     ) -> Result<Self, RootProtocolError> {
         let payload = RootRegistrationPayload {
-            version: ROOT_PROTOCOL_VERSION,
+            version: ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY,
             device_id,
             device_public_key: signing_key.verifying_key().to_bytes().to_vec(),
             certificates,
@@ -156,10 +183,47 @@ impl RootRegistration {
             candidates,
             issued_at_unix_seconds,
             nonce,
+            target: None,
         };
-        let bytes = serde_json::to_vec(&payload).map_err(|_| RootProtocolError::EncodingFailed)?;
+        Self::sign_payload(payload, signing_key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_authorized_for_service(
+        device_id: DeviceId,
+        certificates: Vec<MembershipCertificate>,
+        authorization_manifests: Vec<NetworkAuthorizationManifest>,
+        candidates: Vec<SocketAddr>,
+        issued_at_unix_seconds: u64,
+        nonce: [u8; 16],
+        service_kind: RootRegistrationServiceKind,
+        service_id: Uuid,
+        signing_key: &SigningKey,
+    ) -> Result<Self, RootProtocolError> {
+        let payload = RootRegistrationPayload {
+            version: ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND,
+            device_id,
+            device_public_key: signing_key.verifying_key().to_bytes().to_vec(),
+            certificates,
+            authorization_manifests,
+            candidates,
+            issued_at_unix_seconds,
+            nonce,
+            target: Some(RootRegistrationTarget {
+                service_kind,
+                service_id,
+            }),
+        };
+        Self::sign_payload(payload, signing_key)
+    }
+
+    fn sign_payload(
+        payload: RootRegistrationPayload,
+        signing_key: &SigningKey,
+    ) -> Result<Self, RootProtocolError> {
+        let message = registration_signature_message(&payload)?;
         Ok(Self {
-            signature: signing_key.sign(&bytes).to_bytes().to_vec(),
+            signature: signing_key.sign(&message).to_bytes().to_vec(),
             payload,
         })
     }
@@ -170,8 +234,31 @@ impl RootRegistration {
         now_unix_seconds: u64,
         maximum_clock_skew_seconds: u64,
     ) -> Result<(), RootProtocolError> {
-        if self.payload.version != ROOT_PROTOCOL_VERSION {
-            return Err(RootProtocolError::UnsupportedVersion);
+        self.verify_membership(
+            trusted_controller_keys,
+            now_unix_seconds,
+            maximum_clock_skew_seconds,
+            None,
+        )?;
+        self.verify_authorization_set(trusted_controller_keys, now_unix_seconds, false)
+    }
+
+    fn verify_membership(
+        &self,
+        trusted_controller_keys: &[Vec<u8>],
+        now_unix_seconds: u64,
+        maximum_clock_skew_seconds: u64,
+        expected_target: Option<RootRegistrationTarget>,
+    ) -> Result<(), RootProtocolError> {
+        match (self.payload.version, self.payload.target, expected_target) {
+            (ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY, None, None) => {}
+            (ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND, Some(actual), Some(expected))
+                if actual == expected => {}
+            (ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY, _, _)
+            | (ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND, _, _) => {
+                return Err(RootProtocolError::TargetMismatch);
+            }
+            _ => return Err(RootProtocolError::UnsupportedVersion),
         }
         let age = now_unix_seconds.abs_diff(self.payload.issued_at_unix_seconds);
         if age > maximum_clock_skew_seconds {
@@ -188,11 +275,10 @@ impl RootRegistration {
             .as_slice()
             .try_into()
             .map_err(|_| RootProtocolError::InvalidSignature)?;
-        let bytes =
-            serde_json::to_vec(&self.payload).map_err(|_| RootProtocolError::EncodingFailed)?;
+        let message = registration_signature_message(&self.payload)?;
         VerifyingKey::from_bytes(&public_key)
             .map_err(|_| RootProtocolError::InvalidIdentityKey)?
-            .verify(&bytes, &ed25519_dalek::Signature::from_bytes(&signature))
+            .verify(&message, &ed25519_dalek::Signature::from_bytes(&signature))
             .map_err(|_| RootProtocolError::InvalidSignature)?;
 
         if self.payload.certificates.is_empty() {
@@ -212,28 +298,46 @@ impl RootRegistration {
             if !trusted {
                 return Err(RootProtocolError::UntrustedMembership);
             }
-            let Some(manifest) = self
-                .payload
-                .authorization_manifests
-                .iter()
-                .find(|manifest| manifest.network_id == certificate.claims.network_id)
-            else {
-                // Compatibility path until all agents have persisted a signed
-                // authorization manifest. Services can require manifests once
-                // the P2 refresh rollout is complete.
-                continue;
+        }
+        Ok(())
+    }
+
+    fn verify_authorization_set(
+        &self,
+        trusted_controller_keys: &[Vec<u8>],
+        now_unix_seconds: u64,
+        require_every_membership: bool,
+    ) -> Result<(), RootProtocolError> {
+        let mut certificates = HashMap::new();
+        for certificate in &self.payload.certificates {
+            if certificates
+                .insert(certificate.claims.network_id, certificate)
+                .is_some()
+            {
+                return Err(RootProtocolError::DuplicateMembership);
+            }
+        }
+        let mut manifests = HashMap::new();
+        for manifest in &self.payload.authorization_manifests {
+            let Some(certificate) = certificates.get(&manifest.network_id).copied() else {
+                return Err(RootProtocolError::InvalidAuthorizationSet);
             };
-            let trusted_manifest = trusted_controller_keys.iter().any(|key| {
-                manifest
-                    .verify_from_controller(key, now_unix_seconds)
-                    .is_ok()
-            });
-            if !trusted_manifest {
-                return Err(RootProtocolError::MissingAuthorization);
+            if manifests.insert(manifest.network_id, manifest).is_some()
+                || manifest.controller_public_key != certificate.controller_public_key
+                || !trusted_controller_keys.iter().any(|key| {
+                    manifest
+                        .verify_from_controller(key, now_unix_seconds)
+                        .is_ok()
+                })
+            {
+                return Err(RootProtocolError::InvalidAuthorizationSet);
             }
             if !manifest.authorizes(certificate) {
                 return Err(RootProtocolError::RevokedMembership);
             }
+        }
+        if require_every_membership && manifests.len() != certificates.len() {
+            return Err(RootProtocolError::MissingAuthorization);
         }
         Ok(())
     }
@@ -249,22 +353,50 @@ impl RootRegistration {
         now_unix_seconds: u64,
         maximum_clock_skew_seconds: u64,
     ) -> Result<(), RootProtocolError> {
-        self.verify(
+        self.verify_membership(
             trusted_controller_keys,
             now_unix_seconds,
             maximum_clock_skew_seconds,
+            None,
         )?;
-        for certificate in &self.payload.certificates {
-            if !self
-                .payload
-                .authorization_manifests
-                .iter()
-                .any(|manifest| manifest.network_id == certificate.claims.network_id)
-            {
-                return Err(RootProtocolError::MissingAuthorization);
-            }
+        self.verify_authorization_set(trusted_controller_keys, now_unix_seconds, true)
+    }
+
+    pub fn verify_authorized_for_service(
+        &self,
+        trusted_controller_keys: &[Vec<u8>],
+        now_unix_seconds: u64,
+        maximum_clock_skew_seconds: u64,
+        service_kind: RootRegistrationServiceKind,
+        service_id: Uuid,
+    ) -> Result<(), RootProtocolError> {
+        self.verify_membership(
+            trusted_controller_keys,
+            now_unix_seconds,
+            maximum_clock_skew_seconds,
+            Some(RootRegistrationTarget {
+                service_kind,
+                service_id,
+            }),
+        )?;
+        self.verify_authorization_set(trusted_controller_keys, now_unix_seconds, true)
+    }
+}
+
+fn registration_signature_message(
+    payload: &RootRegistrationPayload,
+) -> Result<Vec<u8>, RootProtocolError> {
+    let encoded = serde_json::to_vec(payload).map_err(|_| RootProtocolError::EncodingFailed)?;
+    match payload.version {
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY if payload.target.is_none() => Ok(encoded),
+        ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND if payload.target.is_some() => {
+            let mut message =
+                Vec::with_capacity(TARGET_BOUND_REGISTRATION_DOMAIN.len() + encoded.len());
+            message.extend_from_slice(TARGET_BOUND_REGISTRATION_DOMAIN);
+            message.extend_from_slice(&encoded);
+            Ok(message)
         }
-        Ok(())
+        _ => Err(RootProtocolError::UnsupportedVersion),
     }
 }
 
@@ -547,6 +679,179 @@ mod tests {
         assert_eq!(
             old_epoch_registration.verify_authorized(&trusted, 100, 120),
             Err(RootProtocolError::RevokedMembership)
+        );
+    }
+
+    #[test]
+    fn target_bound_registration_rejects_cross_service_and_legacy_replay() {
+        let controller = SigningKey::from_bytes(&[31; 32]);
+        let node = SigningKey::from_bytes(&[32; 32]);
+        let device_id = DeviceId(Uuid::from_u128(33));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: NetworkId(Uuid::from_u128(34)),
+                device_id,
+                device_public_key: node.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.34.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.34.0/24".into()],
+                issued_at_unix_seconds: 100,
+                expires_at_unix_seconds: Some(1_000),
+            },
+            Uuid::from_u128(35),
+            1,
+            &controller,
+        )
+        .unwrap();
+        let authorization = test_authorization(&controller, &certificate, 100);
+        let trusted = [controller.verifying_key().to_bytes().to_vec()];
+        let relay_a = Uuid::from_u128(36);
+        let relay_b = Uuid::from_u128(37);
+        let root_a = Uuid::from_u128(38);
+        let root_b = Uuid::from_u128(39);
+        let relay_registration = RootRegistration::sign_authorized_for_service(
+            device_id,
+            vec![certificate.clone()],
+            vec![authorization.clone()],
+            vec![],
+            100,
+            [40; 16],
+            RootRegistrationServiceKind::Relay,
+            relay_a,
+            &node,
+        )
+        .unwrap();
+        assert_eq!(
+            relay_registration.verify_authorized_for_service(
+                &trusted,
+                100,
+                120,
+                RootRegistrationServiceKind::Relay,
+                relay_a,
+            ),
+            Ok(())
+        );
+        for (kind, service_id) in [
+            (RootRegistrationServiceKind::Relay, relay_b),
+            (RootRegistrationServiceKind::Root, root_a),
+        ] {
+            assert_eq!(
+                relay_registration
+                    .verify_authorized_for_service(&trusted, 100, 120, kind, service_id,),
+                Err(RootProtocolError::TargetMismatch)
+            );
+        }
+        assert_eq!(
+            relay_registration.verify_authorized(&trusted, 100, 120),
+            Err(RootProtocolError::TargetMismatch)
+        );
+
+        let root_registration = RootRegistration::sign_authorized_for_service(
+            device_id,
+            vec![certificate.clone()],
+            vec![authorization.clone()],
+            vec![],
+            100,
+            [41; 16],
+            RootRegistrationServiceKind::Root,
+            root_a,
+            &node,
+        )
+        .unwrap();
+        assert_eq!(
+            root_registration.verify_authorized_for_service(
+                &trusted,
+                100,
+                120,
+                RootRegistrationServiceKind::Root,
+                root_a,
+            ),
+            Ok(())
+        );
+        for (kind, service_id) in [
+            (RootRegistrationServiceKind::Root, root_b),
+            (RootRegistrationServiceKind::Relay, relay_a),
+        ] {
+            assert_eq!(
+                root_registration
+                    .verify_authorized_for_service(&trusted, 100, 120, kind, service_id,),
+                Err(RootProtocolError::TargetMismatch)
+            );
+        }
+
+        let legacy = RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate],
+            vec![authorization],
+            vec![],
+            100,
+            [42; 16],
+            &node,
+        )
+        .unwrap();
+        assert_eq!(legacy.verify_authorized(&trusted, 100, 120), Ok(()));
+        assert_eq!(
+            legacy.verify_authorized_for_service(
+                &trusted,
+                100,
+                120,
+                RootRegistrationServiceKind::Relay,
+                relay_a,
+            ),
+            Err(RootProtocolError::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn registration_rejects_a_valid_manifest_followed_by_a_forged_duplicate_hint() {
+        let controller = SigningKey::from_bytes(&[43; 32]);
+        let attacker = SigningKey::from_bytes(&[44; 32]);
+        let node = SigningKey::from_bytes(&[45; 32]);
+        let device_id = DeviceId(Uuid::from_u128(46));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: NetworkId(Uuid::from_u128(47)),
+                device_id,
+                device_public_key: node.verifying_key().to_bytes().to_vec(),
+                assigned_addresses: vec!["100.64.47.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.47.0/24".into()],
+                issued_at_unix_seconds: 100,
+                expires_at_unix_seconds: Some(1_000),
+            },
+            Uuid::from_u128(48),
+            1,
+            &controller,
+        )
+        .unwrap();
+        let valid = test_authorization(&controller, &certificate, 100);
+        let mut forged = valid.clone();
+        forged.epoch_hint = Some(
+            AuthorizationEpochHint::sign(
+                certificate.claims.network_id,
+                valid.authorization_epoch + 100,
+                valid.network_key_epoch,
+                100,
+                190,
+                &attacker,
+            )
+            .unwrap(),
+        );
+        let registration = RootRegistration::sign_authorized(
+            device_id,
+            vec![certificate],
+            vec![valid, forged],
+            vec![],
+            100,
+            [49; 16],
+            &node,
+        )
+        .unwrap();
+        assert_eq!(
+            registration.verify_authorized(
+                &[controller.verifying_key().to_bytes().to_vec()],
+                100,
+                120,
+            ),
+            Err(RootProtocolError::InvalidAuthorizationSet)
         );
     }
 

@@ -8,7 +8,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use meshlake_core::{
     load_or_create_root_identity, AuthorizationEpochHint, DeviceId, MembershipCertificate,
-    NetworkId, RootPeer, RootRegistration, RootResponse, SignedRootResponse,
+    NetworkId, RootPeer, RootRegistration, RootRegistrationServiceKind, RootResponse,
+    SignedRootResponse, ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY,
+    ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -201,6 +203,7 @@ async fn main() -> Result<()> {
         let response = match process_registration(
             registration,
             remote,
+            current_identity.service_id,
             &trusted_controller_keys,
             maximum_clock_skew_seconds,
             peer_ttl,
@@ -233,6 +236,7 @@ async fn main() -> Result<()> {
 fn process_registration(
     registration: RootRegistration,
     observed_endpoint: SocketAddr,
+    root_id: uuid::Uuid,
     trusted_controller_keys: &[Vec<u8>],
     maximum_clock_skew_seconds: u64,
     peer_ttl: Duration,
@@ -243,9 +247,23 @@ fn process_registration(
     if registration.payload.certificates.len() > MAX_CERTIFICATES_PER_REGISTRATION {
         bail!("registration contains too many memberships");
     }
-    registration
-        .verify_authorized(trusted_controller_keys, now(), maximum_clock_skew_seconds)
-        .context("registration authentication failed")?;
+    match registration.payload.version {
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => registration.verify_authorized(
+            trusted_controller_keys,
+            now(),
+            maximum_clock_skew_seconds,
+        ),
+        ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND => registration
+            .verify_authorized_for_service(
+                trusted_controller_keys,
+                now(),
+                maximum_clock_skew_seconds,
+                RootRegistrationServiceKind::Root,
+                root_id,
+            ),
+        _ => Err(meshlake_core::RootProtocolError::UnsupportedVersion),
+    }
+    .context("registration authentication failed")?;
     seen_nonces.retain(|_, seen| seen.elapsed() <= REGISTRATION_NONCE_TTL);
     if seen_nonces
         .insert(registration.payload.nonce, Instant::now())
@@ -590,6 +608,10 @@ mod tests {
     };
     use uuid::Uuid;
 
+    fn test_root_id() -> Uuid {
+        Uuid::from_u128(0xfeed)
+    }
+
     fn test_certificate(
         controller: &SigningKey,
         node: &SigningKey,
@@ -636,13 +658,15 @@ mod tests {
             controller,
         )
         .unwrap();
-        RootRegistration::sign_authorized(
+        RootRegistration::sign_authorized_for_service(
             certificate.claims.device_id,
             vec![certificate],
             vec![authorization],
             candidates,
             timestamp,
             nonce,
+            RootRegistrationServiceKind::Root,
+            test_root_id(),
             node,
         )
         .unwrap()
@@ -698,6 +722,7 @@ mod tests {
         let response = process_registration(
             registration,
             "203.0.113.2:41000".parse().unwrap(),
+            test_root_id(),
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -767,6 +792,7 @@ mod tests {
         assert!(process_registration(
             registration,
             "203.0.113.21:41000".parse().unwrap(),
+            test_root_id(),
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -805,6 +831,7 @@ mod tests {
         process_registration(
             registration.clone(),
             "203.0.113.30:41000".parse().unwrap(),
+            test_root_id(),
             &trusted_keys,
             120,
             Duration::from_secs(90),
@@ -816,6 +843,7 @@ mod tests {
         assert!(process_registration(
             registration,
             "203.0.113.31:42000".parse().unwrap(),
+            test_root_id(),
             &trusted_keys,
             120,
             Duration::from_secs(90),
@@ -843,6 +871,7 @@ mod tests {
         assert!(process_registration(
             registration,
             "203.0.113.34:41000".parse().unwrap(),
+            test_root_id(),
             &[controller.verifying_key().to_bytes().to_vec()],
             120,
             Duration::from_secs(90),
@@ -851,5 +880,127 @@ mod tests {
             &mut HashMap::new(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn v3_target_and_manifest_failures_do_not_mutate_root_state() {
+        let controller = SigningKey::from_bytes(&[41; 32]);
+        let attacker = SigningKey::from_bytes(&[42; 32]);
+        let node = SigningKey::from_bytes(&[43; 32]);
+        let network = NetworkId(Uuid::from_u128(44));
+        let device = DeviceId(Uuid::from_u128(45));
+        let certificate = test_certificate(&controller, &node, network, device, "100.64.44.2");
+        let timestamp = now();
+        let valid = NetworkAuthorizationManifest::sign(
+            network,
+            1,
+            certificate.network_key_epoch,
+            vec![AuthorizedMembership {
+                device_id: device,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: certificate.network_key_epoch,
+            }],
+            vec![],
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let mut forged = valid.clone();
+        forged.epoch_hint = Some(
+            AuthorizationEpochHint::sign(
+                network,
+                valid.authorization_epoch + 100,
+                valid.network_key_epoch,
+                timestamp,
+                timestamp + 90,
+                &attacker,
+            )
+            .unwrap(),
+        );
+        let registration = RootRegistration::sign_authorized_for_service(
+            device,
+            vec![certificate.clone()],
+            vec![valid.clone(), forged],
+            vec![],
+            timestamp,
+            [46; 16],
+            RootRegistrationServiceKind::Root,
+            test_root_id(),
+            &node,
+        )
+        .unwrap();
+        let trusted = [controller.verifying_key().to_bytes().to_vec()];
+        let sentinel_nonce = [99; 16];
+        let sentinel_hint = AuthorizationEpochHint::sign(
+            network,
+            99,
+            certificate.network_key_epoch,
+            timestamp,
+            timestamp + 90,
+            &controller,
+        )
+        .unwrap();
+        let mut peers = HashMap::from([(
+            (network, device),
+            PeerRecord {
+                candidates: vec!["198.51.100.44:40000".parse().unwrap()],
+                assigned_addresses: certificate.claims.assigned_addresses.clone(),
+                certificate: certificate.clone(),
+                authorization_expires_at_unix_seconds: timestamp + 90,
+                last_seen: Instant::now(),
+            },
+        )]);
+        let mut seen_nonces = HashMap::from([(sentinel_nonce, Instant::now())]);
+        let mut hints = HashMap::from([(network, sentinel_hint.clone())]);
+        assert!(process_registration(
+            registration,
+            "203.0.113.44:41000".parse().unwrap(),
+            test_root_id(),
+            &trusted,
+            120,
+            Duration::from_secs(90),
+            &mut peers,
+            &mut seen_nonces,
+            &mut hints,
+        )
+        .is_err());
+        assert!(peers.contains_key(&(network, device)));
+        assert!(seen_nonces.contains_key(&sentinel_nonce));
+        assert_eq!(hints.get(&network), Some(&sentinel_hint));
+
+        for (kind, service_id) in [
+            (RootRegistrationServiceKind::Relay, test_root_id()),
+            (RootRegistrationServiceKind::Root, Uuid::from_u128(47)),
+        ] {
+            let cross_target = RootRegistration::sign_authorized_for_service(
+                device,
+                vec![certificate.clone()],
+                vec![valid.clone()],
+                vec![],
+                timestamp,
+                *Uuid::new_v4().as_bytes(),
+                kind,
+                service_id,
+                &node,
+            )
+            .unwrap();
+            assert!(process_registration(
+                cross_target,
+                "203.0.113.44:41000".parse().unwrap(),
+                test_root_id(),
+                &trusted,
+                120,
+                Duration::from_secs(90),
+                &mut peers,
+                &mut seen_nonces,
+                &mut hints,
+            )
+            .is_err());
+            assert!(peers.contains_key(&(network, device)));
+            assert!(seen_nonces.contains_key(&sentinel_nonce));
+            assert_eq!(hints.get(&network), Some(&sentinel_hint));
+        }
     }
 }

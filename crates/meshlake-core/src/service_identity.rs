@@ -1,8 +1,9 @@
 //! Planet-pinned service identities and explicit dual-sign rotation windows.
 
+use crate::state_protection::read_protected_state_file_with_validation;
 use crate::{
-    cleanup_stale_state_backup, read_protected_state_file, recover_protected_state_file,
-    write_protected_state_file, StateFileError, StateFileLock, RELAY_IDENTITY_PROTECTION_PURPOSE,
+    cleanup_stale_state_backup, recover_protected_state_file, write_protected_state_file,
+    StateFileError, StateFileLock, RELAY_IDENTITY_PROTECTION_PURPOSE,
     ROOT_IDENTITY_PROTECTION_PURPOSE,
 };
 use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
@@ -60,6 +61,12 @@ pub enum ServiceIdentityFileError {
     ServiceIdMismatch,
     #[error("service identity ID must not be nil")]
     InvalidServiceId,
+    #[error("service identity state is not protected by the required platform provider")]
+    UnprotectedState,
+    #[error("service identity file permissions expose the private key to group or other users")]
+    InsecurePermissions,
+    #[error("service identity file is owned by a different Unix user")]
+    WrongOwner,
     #[error("operating-system randomness is unavailable")]
     RandomnessUnavailable,
 }
@@ -76,14 +83,6 @@ struct PersistedServiceIdentity {
     schema_version: u32,
     kind: ServiceIdentityKind,
     service_id: Uuid,
-    secret_key: SecretBytes,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyPersistedServiceIdentity {
-    schema_version: u32,
-    #[serde(default)]
-    service_id: Option<Uuid>,
     secret_key: SecretBytes,
 }
 
@@ -137,19 +136,16 @@ fn load_or_create_service_identity(
     recover_protected_state_file(path)?;
     let loaded = match read_current_identity(path, purpose) {
         Ok((persisted, needs_protection_upgrade)) => {
-            validate_persisted_identity(&persisted, kind, expected_service_id)?;
             if needs_protection_upgrade {
-                write_protected_state_file(path, &persisted, purpose)?;
+                return Err(ServiceIdentityFileError::UnprotectedState);
             }
+            validate_persisted_identity(&persisted, kind, expected_service_id)?;
             persisted
         }
         Err(ServiceIdentityFileError::State(StateFileError::Io { source, .. }))
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             create_identity(path, expected_service_id, kind, purpose)?
-        }
-        Err(ServiceIdentityFileError::State(StateFileError::Protection(_))) => {
-            migrate_legacy_identity(path, expected_service_id, kind, purpose)?
         }
         Err(error) => return Err(error),
     };
@@ -167,43 +163,37 @@ fn read_current_identity(
     path: &Path,
     purpose: &[u8],
 ) -> Result<(PersistedServiceIdentity, bool), ServiceIdentityFileError> {
-    let decoded = read_protected_state_file::<PersistedServiceIdentity>(
+    let decoded = read_protected_state_file_with_validation::<
+        PersistedServiceIdentity,
+        ServiceIdentityFileError,
+    >(
         path,
         purpose,
         SERVICE_IDENTITY_MAX_BYTES,
+        validate_identity_file_security,
     )?;
     Ok((decoded.value, decoded.needs_protection_upgrade))
 }
 
-fn migrate_legacy_identity(
-    path: &Path,
-    expected_service_id: Option<Uuid>,
-    kind: ServiceIdentityKind,
-    purpose: &[u8],
-) -> Result<PersistedServiceIdentity, ServiceIdentityFileError> {
-    let decoded = read_protected_state_file::<LegacyPersistedServiceIdentity>(
-        path,
-        purpose,
-        SERVICE_IDENTITY_MAX_BYTES,
-    )?;
-    if !matches!(decoded.value.schema_version, 1 | 2) {
-        return Err(ServiceIdentityFileError::UnsupportedSchema);
+#[cfg(unix)]
+fn validate_identity_file_security(
+    metadata: &std::fs::Metadata,
+) -> Result<(), ServiceIdentityFileError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.mode() & 0o077 != 0 {
+        return Err(ServiceIdentityFileError::InsecurePermissions);
     }
-    parse_secret_key(&decoded.value.secret_key)?;
-    let service_id = decoded
-        .value
-        .service_id
-        .or(expected_service_id)
-        .unwrap_or_else(Uuid::new_v4);
-    validate_service_id(service_id, expected_service_id)?;
-    let migrated = PersistedServiceIdentity {
-        schema_version: SERVICE_IDENTITY_SCHEMA_VERSION,
-        kind,
-        service_id,
-        secret_key: decoded.value.secret_key,
-    };
-    write_protected_state_file(path, &migrated, purpose)?;
-    Ok(migrated)
+    let effective_user = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_user {
+        return Err(ServiceIdentityFileError::WrongOwner);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_identity_file_security(_: &std::fs::Metadata) -> Result<(), ServiceIdentityFileError> {
+    Ok(())
 }
 
 fn create_identity(
@@ -371,6 +361,7 @@ fn validate_key(key: &[u8]) -> Result<(), ServiceIdentityError> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use serde::Serialize;
 
     fn signature(key: &SigningKey, message: &[u8]) -> ServiceSignature {
         ServiceSignature {
@@ -480,6 +471,174 @@ mod tests {
             );
         }
         drop(second);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[derive(Serialize)]
+    struct KindlessIdentityForTest {
+        schema_version: u32,
+        service_id: Uuid,
+        secret_key: Vec<u8>,
+    }
+
+    #[test]
+    fn kindless_identity_state_is_rejected_instead_of_migrated() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-kindless-identity-{}", Uuid::new_v4()));
+        let path = directory.join("relay.identity");
+        let lock = StateFileLock::acquire(&path).unwrap();
+        write_protected_state_file(
+            &path,
+            &KindlessIdentityForTest {
+                schema_version: SERVICE_IDENTITY_SCHEMA_VERSION,
+                service_id: Uuid::new_v4(),
+                secret_key: vec![8; 32],
+            },
+            RELAY_IDENTITY_PROTECTION_PURPOSE,
+        )
+        .unwrap();
+        drop(lock);
+
+        assert!(matches!(
+            load_or_create_relay_identity(&path, None),
+            Err(ServiceIdentityFileError::State(StateFileError::Protection(
+                _
+            )))
+        ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn protected_current_schema_loads_and_purpose_kind_isolation_fails_closed() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-purpose-identity-{}", Uuid::new_v4()));
+        let path = directory.join("root.identity");
+        let service_id = Uuid::new_v4();
+        let expected_key = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let lock = StateFileLock::acquire(&path).unwrap();
+        write_protected_state_file(
+            &path,
+            &PersistedServiceIdentity {
+                schema_version: SERVICE_IDENTITY_SCHEMA_VERSION,
+                kind: ServiceIdentityKind::Root,
+                service_id,
+                secret_key: SecretBytes(vec![9; 32]),
+            },
+            ROOT_IDENTITY_PROTECTION_PURPOSE,
+        )
+        .unwrap();
+        drop(lock);
+
+        let loaded = load_or_create_root_identity(&path, Some(service_id)).unwrap();
+        assert_eq!(loaded.signing_key.verifying_key(), expected_key);
+        drop(loaded);
+        assert!(load_or_create_relay_identity(&path, Some(service_id)).is_err());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_plaintext_current_schema_identity_is_rejected() {
+        let directory = std::env::temp_dir().join(format!(
+            "meshlake-plaintext-current-identity-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("relay.identity");
+        let service_id = Uuid::new_v4();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&PersistedServiceIdentity {
+                schema_version: SERVICE_IDENTITY_SCHEMA_VERSION,
+                kind: ServiceIdentityKind::Relay,
+                service_id,
+                secret_key: SecretBytes(vec![10; 32]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_or_create_relay_identity(&path, Some(service_id)),
+            Err(ServiceIdentityFileError::UnprotectedState)
+        ));
+        assert!(String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains("secret_key"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mode_0600_current_schema_identity_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-unix-current-identity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("relay.identity");
+        let service_id = Uuid::new_v4();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&PersistedServiceIdentity {
+                schema_version: SERVICE_IDENTITY_SCHEMA_VERSION,
+                kind: ServiceIdentityKind::Relay,
+                service_id,
+                secret_key: SecretBytes(vec![11; 32]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let identity = load_or_create_relay_identity(&path, Some(service_id)).unwrap();
+        assert_eq!(identity.service_id, service_id);
+        drop(identity);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_identity_rejects_group_or_other_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "meshlake-unix-permissions-identity-{}",
+            Uuid::new_v4()
+        ));
+        let path = directory.join("relay.identity");
+        let identity = load_or_create_relay_identity(&path, None).unwrap();
+        let service_id = identity.service_id;
+        drop(identity);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            load_or_create_relay_identity(&path, Some(service_id)),
+            Err(ServiceIdentityFileError::InsecurePermissions)
+        ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_identity_rejects_a_different_owner_when_chown_is_available() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-unix-owner-identity-{}", Uuid::new_v4()));
+        let path = directory.join("relay.identity");
+        let identity = load_or_create_relay_identity(&path, None).unwrap();
+        let service_id = identity.service_id;
+        drop(identity);
+        let effective_user = unsafe { libc::geteuid() };
+        let other_user = if effective_user == 0 { 1 } else { 0 };
+        let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let changed =
+            unsafe { libc::chown(path_bytes.as_ptr(), other_user, libc::gid_t::MAX) } == 0;
+        if changed {
+            assert!(matches!(
+                load_or_create_relay_identity(&path, Some(service_id)),
+                Err(ServiceIdentityFileError::WrongOwner)
+            ));
+        }
         let _ = std::fs::remove_dir_all(directory);
     }
 

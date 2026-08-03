@@ -40,8 +40,9 @@ pub use relay::{
     RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 pub use root::{
-    RootPeer, RootProtocolError, RootRegistration, RootRegistrationPayload, RootResponse,
-    SignedRootResponse,
+    RootPeer, RootProtocolError, RootRegistration, RootRegistrationPayload,
+    RootRegistrationServiceKind, RootRegistrationTarget, RootResponse, SignedRootResponse,
+    ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY, ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND,
 };
 pub use secret_file::{
     create_restricted_secret_file, read_restricted_secret_file, read_restricted_secret_string_file,

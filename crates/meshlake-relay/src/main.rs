@@ -9,10 +9,11 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use meshlake_core::{
     load_or_create_relay_identity, peer_identity_announcement, AuthorizationEpochHint, DeviceId,
-    MembershipCertificate, NetworkId, RootRegistration, ServiceSigningIdentity,
-    SignedRelayRegistrationAck, RELAY_CANDIDATE, RELAY_DATA, RELAY_DATA_HEADER_LEN, RELAY_MAGIC,
-    RELAY_PEER, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
-    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    MembershipCertificate, NetworkId, RootRegistration, RootRegistrationServiceKind,
+    ServiceSigningIdentity, SignedRelayRegistrationAck, RELAY_CANDIDATE, RELAY_DATA,
+    RELAY_DATA_HEADER_LEN, RELAY_MAGIC, RELAY_PEER, RELAY_REGISTER_ACK_SIGNED,
+    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY, ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND,
 };
 use std::{
     collections::HashMap,
@@ -151,7 +152,9 @@ async fn handle_packet(
 ) -> Result<()> {
     match packet[4] {
         RELAY_REGISTER_SIGNED => {
-            if let Some(registration) = parse_signed_registration(&packet[5..], trusted_key) {
+            if let Some(registration) =
+                parse_signed_registration(&packet[5..], trusted_key, identity.relay_id)
+            {
                 let AuthenticatedRegistration {
                     key,
                     certificate,
@@ -431,11 +434,24 @@ fn decode_controller_key(encoded: &str) -> Result<Vec<u8>> {
 fn parse_signed_registration(
     bytes: &[u8],
     trusted_controller_key: &Vec<u8>,
+    relay_id: Uuid,
 ) -> Option<AuthenticatedRegistration> {
     let registration: RootRegistration = serde_json::from_slice(bytes).ok()?;
-    registration
-        .verify_authorized(std::slice::from_ref(trusted_controller_key), now(), 120)
-        .ok()?;
+    match registration.payload.version {
+        ROOT_REGISTRATION_PROTOCOL_VERSION_LEGACY => {
+            registration.verify_authorized(std::slice::from_ref(trusted_controller_key), now(), 120)
+        }
+        ROOT_REGISTRATION_PROTOCOL_VERSION_TARGET_BOUND => registration
+            .verify_authorized_for_service(
+                std::slice::from_ref(trusted_controller_key),
+                now(),
+                120,
+                RootRegistrationServiceKind::Relay,
+                relay_id,
+            ),
+        _ => Err(meshlake_core::RootProtocolError::UnsupportedVersion),
+    }
+    .ok()?;
     if registration.payload.certificates.len() != 1 {
         return None;
     }
@@ -600,13 +616,15 @@ mod tests {
             controller,
         )
         .unwrap();
-        let registration = RootRegistration::sign_authorized(
+        let registration = RootRegistration::sign_authorized_for_service(
             certificate.claims.device_id,
             vec![certificate],
             vec![authorization],
             candidates,
             timestamp,
             *Uuid::new_v4().as_bytes(),
+            RootRegistrationServiceKind::Relay,
+            Uuid::from_u128(0xfeed),
             node,
         )
         .unwrap();
@@ -637,9 +655,12 @@ mod tests {
         let packet = signed_registration_packet(&controller, &node, certificate.clone());
         let registration: RootRegistration = serde_json::from_slice(&packet[5..]).unwrap();
         let raw = serde_json::to_vec(&registration).unwrap();
-        let decoded =
-            parse_signed_registration(&raw, &controller.verifying_key().to_bytes().to_vec())
-                .unwrap();
+        let decoded = parse_signed_registration(
+            &raw,
+            &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
+        )
+        .unwrap();
         assert_eq!(
             decoded.key,
             (certificate.claims.network_id, certificate.claims.device_id)
@@ -647,6 +668,48 @@ mod tests {
         assert_eq!(decoded.certificate, certificate);
         assert_eq!(decoded.nonce, registration.payload.nonce);
         assert!(decoded.authorization_expires_at_unix_seconds >= now());
+        assert!(parse_signed_registration(
+            &raw,
+            &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xbeef),
+        )
+        .is_none());
+
+        let root_target = RootRegistration::sign_authorized_for_service(
+            device,
+            vec![decoded.certificate.clone()],
+            registration.payload.authorization_manifests.clone(),
+            vec![],
+            now(),
+            [3_u8; 16],
+            RootRegistrationServiceKind::Root,
+            Uuid::from_u128(0xfeed),
+            &node,
+        )
+        .unwrap();
+        assert!(parse_signed_registration(
+            &serde_json::to_vec(&root_target).unwrap(),
+            &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
+        )
+        .is_none());
+
+        let legacy_authorized = RootRegistration::sign_authorized(
+            device,
+            vec![decoded.certificate.clone()],
+            registration.payload.authorization_manifests.clone(),
+            vec![],
+            now(),
+            [4_u8; 16],
+            &node,
+        )
+        .unwrap();
+        assert!(parse_signed_registration(
+            &serde_json::to_vec(&legacy_authorized).unwrap(),
+            &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
+        )
+        .is_some());
 
         let legacy = RootRegistration::sign(
             device,
@@ -660,6 +723,7 @@ mod tests {
         assert!(parse_signed_registration(
             &serde_json::to_vec(&legacy).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
         )
         .is_none());
 
@@ -677,6 +741,7 @@ mod tests {
         assert!(parse_signed_registration(
             &serde_json::to_vec(&replay).unwrap(),
             &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
         )
         .is_none());
     }
@@ -877,6 +942,7 @@ mod tests {
         let registration = parse_signed_registration(
             &packet[5..],
             &controller.verifying_key().to_bytes().to_vec(),
+            Uuid::from_u128(0xfeed),
         )
         .unwrap();
         let candidates = accepted_candidates(observed, registration.candidates);
