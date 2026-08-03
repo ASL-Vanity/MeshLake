@@ -796,38 +796,39 @@ impl Agent {
         let client = pinned_client.as_ref().unwrap_or(default_client);
         let manifest = fetch_planet_manifest(client, &target.manifest_url).await?;
         let mut state = self.state.write().await;
-        let Some(network) = state
+        let Some(index) = state
             .networks
-            .iter_mut()
-            .find(|network| network.network.id == target.network_id)
+            .iter()
+            .position(|network| network.network.id == target.network_id)
         else {
             return Ok(());
         };
-        if network.control_plane.planet_manifest_url.as_deref()
-            != Some(target.manifest_url.as_str())
-            || network.control_plane.controller_url.as_deref()
-                != Some(target.controller_url.as_str())
-            || network.control_plane.controller_tls_ca_pem != target.controller_tls_ca_pem
-            || network.control_plane.pinned_controller_public_key
-                != target.pinned_controller_public_key
+        let control_plane = &state.networks[index].control_plane;
+        if control_plane.planet_manifest_url.as_deref() != Some(target.manifest_url.as_str())
+            || control_plane.controller_url.as_deref() != Some(target.controller_url.as_str())
+            || control_plane.controller_tls_ca_pem != target.controller_tls_ca_pem
+            || control_plane.pinned_controller_public_key != target.pinned_controller_public_key
         {
             return Ok(());
         }
         let update = validate_planet_update(
-            &network.control_plane,
+            control_plane,
             &manifest,
             &target.pinned_controller_public_key,
             Some(&target.controller_url),
             now(),
         )
         .map_err(|error| anyhow::anyhow!(error.1))?;
+        let mut candidate = state.clone();
         let changed = apply_planet_update(
-            &mut network.control_plane,
+            &mut candidate.networks[index].control_plane,
             Some(target.manifest_url.clone()),
             &update,
         );
         if changed {
-            write_state_with_protection(&self.path, &state, &self.state_protection)?;
+            persist_state_candidate(&mut state, candidate, |candidate| {
+                write_state_with_protection(&self.path, candidate, &self.state_protection)
+            })?;
         }
         drop(state);
         if changed {
@@ -8074,6 +8075,80 @@ mod tests {
         );
         drop(state);
         assert!(agent.transport_revision.load(Ordering::Acquire) > previous_revision);
+        drop(agent);
+        cleanup_test_state(&path, &directory);
+    }
+
+    #[tokio::test]
+    async fn periodic_planet_refresh_keeps_live_state_when_persistence_fails() {
+        let directory = env::temp_dir().join(format!(
+            "meshlake-planet-refresh-write-failure-{}",
+            Uuid::new_v4()
+        ));
+        let path = directory.join("agent.json");
+        let mut agent = Agent::open(path.clone(), adapter::default_wintun_path()).unwrap();
+        let controller = SigningKey::from_bytes(&[107; 32]);
+        let controller_url = "http://controller.example";
+        let timestamp = now();
+        let old_root: SocketAddr = "203.0.113.107:51819".parse().unwrap();
+        let old_relay: SocketAddr = "203.0.113.107:51820".parse().unwrap();
+        let new_root: SocketAddr = "203.0.113.108:51819".parse().unwrap();
+        let new_relay: SocketAddr = "203.0.113.108:51820".parse().unwrap();
+        let current = signed_planet_v2(&controller, controller_url, timestamp, old_root, old_relay);
+        let refreshed = signed_planet_v2(
+            &controller,
+            controller_url,
+            timestamp + 1,
+            new_root,
+            new_relay,
+        );
+        let (address, server) =
+            spawn_json_server(vec![serde_json::to_vec(&refreshed).unwrap()]).await;
+        let manifest_url = format!("http://{address}/v1/planet");
+        let mut network = test_joined_network();
+        network.control_plane.controller_url = Some(controller_url.into());
+        network.control_plane.pinned_controller_public_key =
+            controller.verifying_key().to_bytes().to_vec();
+        let update = validate_planet_update(
+            &network.control_plane,
+            &current,
+            &controller.verifying_key().to_bytes(),
+            Some(controller_url),
+            timestamp,
+        )
+        .unwrap();
+        assert!(apply_planet_update(
+            &mut network.control_plane,
+            Some(manifest_url),
+            &update,
+        ));
+        {
+            let mut state = agent.state.write().await;
+            state.networks.push(network);
+            write_state_with_protection(&path, &state, &agent.state_protection).unwrap();
+        }
+
+        let previous_revision = agent.transport_revision.load(Ordering::Acquire);
+        let persisted_path = agent.path.clone();
+        agent.path = directory.clone();
+        agent
+            .refresh_planets_once(&reqwest::Client::new())
+            .await
+            .unwrap();
+        agent.path = persisted_path;
+        server.await.unwrap();
+
+        let state = agent.state.read().await;
+        let retained = &state.networks[0].control_plane;
+        assert_eq!(retained.planet_manifest_version, Some(2));
+        assert_eq!(retained.planet_last_issued_at_unix_seconds, Some(timestamp));
+        assert_eq!(retained.verified_roots[0].endpoints, vec![old_root]);
+        assert_eq!(retained.verified_relays[0].endpoint, old_relay);
+        drop(state);
+        assert_eq!(
+            agent.transport_revision.load(Ordering::Acquire),
+            previous_revision
+        );
         drop(agent);
         cleanup_test_state(&path, &directory);
     }
