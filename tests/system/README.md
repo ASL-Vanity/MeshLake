@@ -37,12 +37,16 @@ Example simulated execution:
   -Json
 ```
 
-The `lab_id` must be a version 4 UUID and is confirmed for one invocation. A
-wildcard allowlist is forbidden. Scenarios must explicitly allow execution and
-declare backend capabilities. Destructive actions have bounded timeouts and
-must include complete, idempotent cleanup actions. Cleanup runs in reverse
-registration order after success, primary failure, or assertion failure; its
-failures are reported separately from the primary failure.
+The `lab_id` must be a version 4 UUID and must exactly match
+`--confirm-lab-id`. This is an exact lab confirmation, not a one-time or
+replay-resistant authorization. A wildcard allowlist is forbidden. Future real
+transports must atomically consume a persistent run nonce/receipt and expose the
+`single-use-run-receipt` capability before execution. Scenarios must explicitly
+allow execution and declare backend capabilities. Destructive actions have
+bounded timeouts and must include complete, target-matched, idempotent cleanup
+actions. Cleanup runs in reverse registration order after success, primary
+failure, or assertion failure; its failures are reported separately from the
+primary failure.
 
 Execution output contains only commit and platform metadata, sanitized event
 records, scenario/action/assertion results, cleanup status, session counters,
@@ -52,6 +56,10 @@ packet data, connection references, host addresses, credentials, or keys.
 The executor defines a narrow transport request/interface for later local,
 SSH, or WinRM adapters. This branch provides no transport implementation and
 fails closed when a scenario requests a capability other than `simulation`.
+Session presence, absence, per-network counts, and empty session lists are
+modeled by the simulator. Other assertions are orchestration placeholders and
+are reported with `modeled=false` and `code=simulated_not_modeled`; they do not
+claim that real platform or protocol semantics were verified.
 
 Run the framework tests with:
 

@@ -16,12 +16,16 @@
       "name": "healthy_baseline",
       "actions": [
         {
-          "type": "configure_ordered_roots", "roles": ["root_primary", "root_secondary"],
-          "cleanup": { "type": "restore_root_configuration", "roles": ["node_a", "node_b"], "idempotent": true }
+          "type": "configure_ordered_roots",
+          "target_roles": ["node_a", "node_b"],
+          "root_roles": ["root_primary", "root_secondary"],
+          "cleanup": { "type": "restore_root_configuration", "target_roles": ["node_a", "node_b"], "idempotent": true }
         },
         {
-          "type": "configure_ordered_relays", "roles": ["relay_primary", "relay_secondary"],
-          "cleanup": { "type": "restore_relay_configuration", "roles": ["node_a", "node_b"], "idempotent": true }
+          "type": "configure_ordered_relays",
+          "target_roles": ["node_a", "node_b"],
+          "relay_roles": ["relay_primary", "relay_secondary"],
+          "cleanup": { "type": "restore_relay_configuration", "target_roles": ["node_a", "node_b"], "idempotent": true }
         },
         {
           "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b",

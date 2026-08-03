@@ -46,6 +46,10 @@ def scenario_files() -> list[pathlib.Path]:
 
 
 def validate_scenario(path: pathlib.Path, scenario: dict[str, Any]) -> None:
+    try:
+        reject_sensitive_inventory(scenario, str(path))
+    except ExecutionValidationError as error:
+        raise ValidationError(str(error)) from error
     required = {"schema_version", "id", "description", "hosts", "phases"}
     missing = sorted(required - scenario.keys())
     if missing:
@@ -221,7 +225,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--confirm-lab-id",
-        help="confirm the version 4 UUID lab_id for this invocation",
+        help="exactly confirm the version 4 UUID lab_id",
     )
     parser.add_argument(
         "--validate-all", action="store_true", help="validate every scenario and exit"
@@ -260,8 +264,9 @@ def main() -> int:
                         "execution requires inventory schema_version 2"
                     )
                 try:
-                    validate_execution_gate(
+                    authorization = validate_execution_gate(
                         str(args.inventory),
+                        scenario,
                         inventory,
                         {
                             requirement["role"]: inventory_hosts[requirement["role"]]
@@ -271,7 +276,9 @@ def main() -> int:
                         args.confirm_lab_id,
                         args.backend,
                     )
-                    result = execute_scenario(scenario, SimulatedBackend())
+                    result = execute_scenario(
+                        scenario, authorization, SimulatedBackend()
+                    )
                 except ExecutionValidationError as error:
                     raise ValidationError(str(error)) from error
             else:
@@ -307,6 +314,11 @@ def main() -> int:
         print("Mode: executed (backend=simulated; no real host actions)")
         print(f"Status: {scenario_result['status']}")
         print(f"Sessions: {result['session_counts']['total']}")
+        print(
+            "Assertions: "
+            f"modeled={scenario_result['modeled_assertions']}, "
+            f"unmodeled={scenario_result['unmodeled_assertions']}"
+        )
         print(
             "Safety: network_access_performed=false, processes_started=0"
         )

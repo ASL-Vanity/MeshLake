@@ -25,7 +25,7 @@
       "actions": [
         {
           "type": "replace_state_from_backup", "role": "node_a", "name": "protected_backup",
-          "cleanup": { "type": "restore_original_state", "role": "node_a", "idempotent": true }
+          "cleanup": { "type": "restore_original_state", "role": "node_a", "name": "protected_backup", "idempotent": true }
         }
       ],
       "assertions": [
