@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -489,6 +489,7 @@ where
         return Ok(());
     }
     let backup = backup_path(path);
+    reject_symlink_path(&backup).map_err(E::from)?;
     let mut backup_file = match secure_open_read(&backup) {
         Ok(file) => file,
         Err(StateFileError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -523,12 +524,14 @@ where
 /// this function until the primary state has passed decoding, schema migration
 /// and any required rewrite.
 pub fn cleanup_stale_state_backup(path: &Path) -> Result<(), StateFileError> {
+    reject_symlink_path(path)?;
     cleanup_platform_stale_state_backup(path)
 }
 
 #[cfg(windows)]
 fn cleanup_platform_stale_state_backup(path: &Path) -> Result<(), StateFileError> {
     let backup = backup_path(path);
+    reject_symlink_path(&backup)?;
     match fs::remove_file(&backup) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -568,6 +571,7 @@ pub fn write_protected_state_file_with<T: Serialize>(
     fs::create_dir_all(parent)
         .map_err(|source| state_io_error("create state directory", parent, source))?;
     let temporary = temporary_path(path);
+    reject_symlink_path(&temporary)?;
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -593,9 +597,27 @@ pub fn write_protected_state_file_with<T: Serialize>(
 }
 
 fn reject_symlink_path(path: &Path) -> Result<(), StateFileError> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(state_io_error(
+            "use a state path without parent-directory components",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state paths must not contain parent-directory components",
+            ),
+        ));
+    }
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
+            Component::Normal(_) => {}
+            Component::ParentDir => unreachable!("parent-directory components were rejected"),
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(state_io_error(
@@ -750,12 +772,14 @@ fn secure_open_lock(path: &Path) -> Result<File, StateFileError> {
 #[cfg(unix)]
 pub fn restrict_state_file_permissions(path: &Path) -> Result<(), StateFileError> {
     use std::os::unix::fs::PermissionsExt;
+    reject_symlink_path(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|source| state_io_error("restrict state permissions to mode 0600", path, source))
 }
 
 #[cfg(windows)]
-pub fn restrict_state_file_permissions(_: &Path) -> Result<(), StateFileError> {
+pub fn restrict_state_file_permissions(path: &Path) -> Result<(), StateFileError> {
+    reject_symlink_path(path)?;
     Ok(())
 }
 
@@ -789,6 +813,8 @@ fn state_io_error(action: &'static str, path: &Path, source: std::io::Error) -> 
 
 #[cfg(unix)]
 fn replace_state_file(temporary: &Path, path: &Path) -> Result<(), StateFileError> {
+    reject_symlink_path(temporary)?;
+    reject_symlink_path(path)?;
     fs::rename(temporary, path)
         .map_err(|source| state_io_error("atomically replace state", path, source))
 }
@@ -800,6 +826,8 @@ fn replace_state_file(temporary: &Path, path: &Path) -> Result<(), StateFileErro
         MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
     };
 
+    reject_symlink_path(temporary)?;
+    reject_symlink_path(path)?;
     let wide = |value: &Path| {
         value
             .as_os_str()
@@ -871,6 +899,7 @@ fn install_recovered_backup_bytes(
     fs::create_dir_all(parent)
         .map_err(|source| state_io_error("create recovery state directory", parent, source))?;
     let temporary = temporary_path(path);
+    reject_symlink_path(&temporary)?;
     let result = (|| {
         let mut file = create_recovery_temporary_file(&temporary)?;
         restrict_state_file_permissions(&temporary)?;
@@ -1511,6 +1540,71 @@ mod tests {
         assert!(StateFileLock::acquire(&path).is_err());
         drop(first);
         assert!(StateFileLock::acquire(&path).is_ok());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn state_paths_reject_parent_directory_components_before_any_side_effect() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-state-parent-dir-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("missing").join("..").join("state.json");
+        let state = ExampleState {
+            secret: "test".into(),
+        };
+
+        assert!(reject_symlink_path(&path).is_err());
+        assert!(StateFileLock::acquire(&path).is_err());
+        assert!(write_protected_state_file(&path, &state, b"parent-dir-test").is_err());
+        assert!(recover_protected_state_file(&path).is_err());
+        assert!(restrict_state_file_permissions(&path).is_err());
+        assert!(!directory.join("missing").exists());
+        assert!(!directory.join("state.json").exists());
+        assert!(!directory.join("state.json.lock").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_parent_dir_then_junction_cannot_create_state_or_lock_in_target() {
+        let directory =
+            std::env::temp_dir().join(format!("meshlake-state-parent-junction-{}", Uuid::new_v4()));
+        let base = directory.join("base");
+        let target = directory.join("junction-target");
+        let junction = base.join("junction");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            eprintln!(
+                "junction fixture unavailable: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+        let path = base
+            .join("missing")
+            .join("..")
+            .join("junction")
+            .join("root.identity");
+        let state = ExampleState {
+            secret: "test".into(),
+        };
+
+        assert!(StateFileLock::acquire(&path).is_err());
+        assert!(write_protected_state_file(&path, &state, b"junction-test").is_err());
+        assert!(recover_protected_state_file(&path).is_err());
+        assert!(!target.join("root.identity").exists());
+        assert!(!target.join("root.identity.lock").exists());
+
+        fs::remove_dir(&junction).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
