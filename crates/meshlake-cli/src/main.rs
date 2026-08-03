@@ -2,13 +2,18 @@ mod secret_input;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use meshlake_core::{
-    AgentStatus, EnrollmentResponse, JoinedNetwork, RelayPolicy, SessionList, SessionObservation,
-    SessionPath, SessionState, UpsertNetworkRequest, VirtualNetwork,
+    create_restricted_secret_file, AgentStatus, EnrollmentResponse, JoinedNetwork, RelayPolicy,
+    SessionList, SessionObservation, SessionPath, SessionState, UpsertNetworkRequest,
+    VirtualNetwork,
 };
 use reqwest::{Certificate, Client, StatusCode};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -121,10 +126,40 @@ enum ControllerCommand {
         network: Uuid,
         #[command(flatten)]
         admin_token: AdminTokenInputArgs,
+        #[command(flatten)]
+        output: InviteLinkOutputArgs,
         /// Invitation lifetime in seconds (60 through 86400).
         #[arg(long, default_value_t = 900)]
         expires_in_seconds: u64,
     },
+}
+
+#[derive(Args)]
+#[group(id = "invite_link_output", required = true, multiple = false)]
+struct InviteLinkOutputArgs {
+    /// Show the complete one-time join link only on an attached terminal.
+    #[arg(long, group = "invite_link_output")]
+    claim_invite_link: bool,
+    /// Write the complete one-time join link to a new restricted file.
+    #[arg(long, group = "invite_link_output", value_name = "SECRET_FILE")]
+    invite_link_file: Option<PathBuf>,
+}
+
+enum InviteLinkOutput {
+    AttachedTerminal,
+    RestrictedFile(PathBuf),
+}
+
+impl From<InviteLinkOutputArgs> for InviteLinkOutput {
+    fn from(args: InviteLinkOutputArgs) -> Self {
+        if args.claim_invite_link {
+            Self::AttachedTerminal
+        } else if let Some(path) = args.invite_link_file {
+            Self::RestrictedFile(path)
+        } else {
+            unreachable!("clap requires exactly one invitation output")
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -384,6 +419,7 @@ async fn main() -> Result<()> {
                     controller,
                     network,
                     admin_token,
+                    output,
                     expires_in_seconds,
                 },
         } => {
@@ -412,7 +448,14 @@ async fn main() -> Result<()> {
                 .context(
                     "this controller does not publish a Planet URL; start it with --planet-controller-url and --planet-relay-endpoint to enable one-link joins",
                 )?;
-            println!("{link}");
+            let stdout = io::stdout();
+            let attached_terminal = stdout.is_terminal();
+            deliver_invite_link(
+                link,
+                InviteLinkOutput::from(output),
+                attached_terminal,
+                &mut stdout.lock(),
+            )?;
         }
         Command::Adapter {
             command: AdapterCommand::Stop,
@@ -726,6 +769,32 @@ async fn ensure_sensitive_success(
     bail!(
         "{operation} failed ({status}); response body omitted because the request contained secret material"
     )
+}
+
+fn deliver_invite_link(
+    link: &str,
+    output: InviteLinkOutput,
+    attached_terminal: bool,
+    terminal: &mut dyn Write,
+) -> Result<()> {
+    match output {
+        InviteLinkOutput::AttachedTerminal => {
+            if !attached_terminal {
+                bail!("--claim-invite-link requires stdout to be an attached terminal");
+            }
+            writeln!(terminal, "{link}")
+                .context("cannot write invitation link to the attached terminal")?;
+            terminal
+                .flush()
+                .context("cannot flush invitation link terminal output")?;
+        }
+        InviteLinkOutput::RestrictedFile(path) => {
+            create_restricted_secret_file(&path, link.as_bytes())
+                .context("cannot create restricted invitation-link file")?;
+            println!("Invitation link written to {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn load_tls_ca_file(path: Option<&std::path::Path>) -> Result<Option<NormalizedTlsCa>> {
@@ -1316,6 +1385,58 @@ mod tests {
             "admin.secret",
         ])
         .is_ok());
+
+        let invite_base = [
+            "meshlake",
+            "controller",
+            "invite",
+            "--controller",
+            "http://127.0.0.1:51822",
+            "--network",
+            "2a2d7ed1-5a22-4f60-b6c5-573ac589c514",
+            "--admin-token-stdin",
+        ];
+        assert!(Cli::try_parse_from(invite_base).is_err());
+        assert!(
+            Cli::try_parse_from(invite_base.into_iter().chain(["--claim-invite-link"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn invite_output_requires_tty_or_a_new_restricted_file() {
+        let secret = "meshlake://join?token=invite-output-secret";
+        let mut terminal = Vec::new();
+        let error = deliver_invite_link(
+            secret,
+            InviteLinkOutput::AttachedTerminal,
+            false,
+            &mut terminal,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("attached terminal"));
+        assert!(terminal.is_empty());
+
+        let path = std::env::temp_dir().join(format!("meshlake-invite-output-{}", Uuid::new_v4()));
+        deliver_invite_link(
+            secret,
+            InviteLinkOutput::RestrictedFile(path.clone()),
+            false,
+            &mut terminal,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), secret);
+        let error = deliver_invite_link(
+            "replacement-secret",
+            InviteLinkOutput::RestrictedFile(path.clone()),
+            false,
+            &mut terminal,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot create restricted invitation-link file"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), secret);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

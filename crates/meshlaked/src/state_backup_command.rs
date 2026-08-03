@@ -116,11 +116,15 @@ fn backup_with_password_with_protection(
     restrict_state_file_permissions(state_path)?;
     let bytes = fs::read(state_path)
         .with_context(|| format!("cannot read agent state {}", state_path.display()))?;
-    let mut state: PersistedState =
-        decode_protected_state_with(&bytes, AGENT_STATE_PROTECTION_PURPOSE, protection)
-            .with_context(|| format!("invalid or unreadable agent state {}", state_path.display()))?
-            .value;
-    migrate_and_validate_agent_state(&mut state)?;
+    let decoded = decode_protected_state_with(&bytes, AGENT_STATE_PROTECTION_PURPOSE, protection)
+        .with_context(|| {
+        format!("invalid or unreadable agent state {}", state_path.display())
+    })?;
+    let mut state: PersistedState = decoded.value;
+    let migrated = migrate_and_validate_agent_state(&mut state)?;
+    if decoded.needs_protection_upgrade || migrated {
+        write_state_with_protection(state_path, &state, protection)?;
+    }
     cleanup_stale_state_backup(state_path)?;
     let encrypted = Zeroizing::new(encode_state_backup(
         &state,
@@ -307,5 +311,96 @@ mod tests {
             .contains("backup path conflicts with a reserved state path"));
         assert_eq!(fs::read(&source).unwrap(), before);
         assert!(!directory.file("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_backup_requires_explicit_plaintext_migration_and_rewrites_once() {
+        use meshlake_core::{
+            create_restricted_secret_file, decode_protected_state_with, StateKeyProvider,
+        };
+
+        let directory = TestDirectory::new("provider-migration");
+        let state_directory = directory.file("state");
+        let key_directory = directory.file("keys");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::create_dir_all(&key_directory).unwrap();
+        let source = state_directory.join("agent.json");
+        let backup = directory.file("agent.mlb");
+        let second_backup = directory.file("agent-second.mlb");
+        let restored = state_directory.join("restored-agent.json");
+        let key_path = key_directory.join("state.key");
+        let original = PersistedState::new();
+        fs::write(&source, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        create_restricted_secret_file(&key_path, &[31; 32]).unwrap();
+
+        let protection = StateProtection::from_provider(
+            &source,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        let error = backup_with_password_with_protection(
+            &source,
+            &backup,
+            b"portable password",
+            false,
+            &protection,
+        )
+        .expect_err("provider mode must reject plaintext without one-run authorization");
+        assert!(format!("{error:#}").contains("allow-plaintext-state-migration"));
+        assert!(!backup.exists());
+
+        let migration = StateProtection::from_provider_with_plaintext_migration(
+            &source,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+            true,
+        )
+        .unwrap();
+        backup_with_password_with_protection(
+            &source,
+            &backup,
+            b"portable password",
+            false,
+            &migration,
+        )
+        .unwrap();
+
+        let protection = StateProtection::from_provider(
+            &source,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        backup_with_password_with_protection(
+            &source,
+            &second_backup,
+            b"portable password",
+            false,
+            &protection,
+        )
+        .expect("rewritten state must not need migration authorization again");
+
+        let restore_protection =
+            StateProtection::from_provider(&restored, StateKeyProvider::RestrictedFile(key_path))
+                .unwrap();
+        restore_with_password_with_protection(
+            &restored,
+            &backup,
+            b"portable password",
+            false,
+            &restore_protection,
+        )
+        .unwrap();
+        let decoded: meshlake_core::DecodedState<PersistedState> = decode_protected_state_with(
+            &fs::read(&restored).unwrap(),
+            AGENT_STATE_PROTECTION_PURPOSE,
+            &restore_protection,
+        )
+        .unwrap();
+        assert_eq!(decoded.value.device_id, original.device_id);
+        assert_eq!(
+            decoded.value.identity_secret_key,
+            original.identity_secret_key
+        );
+        assert!(!decoded.needs_protection_upgrade);
     }
 }

@@ -18,14 +18,17 @@ Planet V2 还会发布多个带固定公钥的根节点和按优先级排列的�
 meshlake-cli.exe controller invite `
   --controller https://planet.example.com `
   --network <网络ID> `
-  --admin-token <管理员令牌>
+  --admin-token-file C:\MeshLake\secrets\administrator.token `
+  --invite-link-file C:\MeshLake\secrets\member.invite
 ```
 
-命令只输出一条 `meshlake://join?...` 链接。它是一次性入网凭据，必须通过可信渠道发送。新设备只需：
+邀请文件会以受限权限原子创建，默认拒绝覆盖；标准输出只确认非秘密路径。若管理员需要直接领取，可改用 `--claim-invite-link`，但 stdout 必须是附着终端，重定向、管道和非交互 CI 会失败关闭。完整 `meshlake://join?...` 链接是一次性入网凭据，必须通过可信渠道发送。新设备可从受限文件读取：
 
 ```powershell
-meshlake-cli.exe network join-link --link '<管理员发来的完整链接>'
+meshlake-cli.exe network join-link --link-file C:\MeshLake\secrets\member.invite
 ```
+
+管理员令牌、入网令牌和完整 join link 均优先使用隐藏终端提示、标准输入或受限文件。旧 `--admin-token`、`--token` 和 `--link` 参数仅为兼容保留，会输出弃用警告，并可能暴露到进程参数和 shell 历史。
 
 客户端向控制器兑换成员资格后，会把邀请链接中的 Planet 地址和钉扎公钥与入网响应一起交给 `meshlaked`。后台代理亲自下载并验签清单，再把控制器、根节点、UDP 中继、STUN 和授权清单原子保存到该网络的记录中。传输线程会自动热重载，不需要重启 `meshlaked.exe`。
 

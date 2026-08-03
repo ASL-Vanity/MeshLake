@@ -59,6 +59,8 @@ impl std::fmt::Display for StateProtectionLevel {
 pub struct StateProtection {
     kind: StateProtectionKind,
     level: StateProtectionLevel,
+    #[cfg_attr(windows, allow(dead_code))]
+    allow_plaintext_migration: bool,
 }
 
 enum StateProtectionKind {
@@ -86,6 +88,7 @@ impl StateProtection {
             } else {
                 StateProtectionLevel::LinuxFilePermissionsOnly
             },
+            allow_plaintext_migration: false,
         }
     }
 
@@ -93,10 +96,19 @@ impl StateProtection {
         state_path: &Path,
         provider: StateKeyProvider,
     ) -> Result<Self, StateProtectionError> {
+        Self::from_provider_with_plaintext_migration(state_path, provider, false)
+    }
+
+    pub fn from_provider_with_plaintext_migration(
+        state_path: &Path,
+        provider: StateKeyProvider,
+        allow_plaintext_migration: bool,
+    ) -> Result<Self, StateProtectionError> {
         #[cfg(windows)]
         {
             let _ = state_path;
             let _ = provider;
+            let _ = allow_plaintext_migration;
             return Err(StateProtectionError::Provider(
                 "Linux state-key providers cannot be used on Windows".into(),
             ));
@@ -106,9 +118,10 @@ impl StateProtection {
             match provider {
                 StateKeyProvider::SystemdCredential(name) => {
                     let key = load_systemd_credential(&name)?;
-                    Ok(Self::linux_master_key(
+                    Ok(Self::linux_master_key_with_migration(
                         key,
                         StateProtectionLevel::LinuxSystemdCredential,
+                        allow_plaintext_migration,
                     ))
                 }
                 StateKeyProvider::RestrictedFile(path) => {
@@ -119,9 +132,10 @@ impl StateProtection {
                         ))
                     })?;
                     let key = exact_master_key(&bytes)?;
-                    Ok(Self::linux_master_key(
+                    Ok(Self::linux_master_key_with_migration(
                         key,
                         StateProtectionLevel::LinuxRestrictedExternalKeyFile,
+                        allow_plaintext_migration,
                     ))
                 }
             }
@@ -132,17 +146,36 @@ impl StateProtection {
         self.level
     }
 
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(test)]
     fn linux_master_key(key: [u8; LINUX_MASTER_KEY_LEN], level: StateProtectionLevel) -> Self {
+        Self::linux_master_key_with_migration(key, level, false)
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    fn linux_master_key_with_migration(
+        key: [u8; LINUX_MASTER_KEY_LEN],
+        level: StateProtectionLevel,
+        allow_plaintext_migration: bool,
+    ) -> Self {
         Self {
             kind: StateProtectionKind::LinuxMasterKey(Zeroizing::new(key)),
             level,
+            allow_plaintext_migration,
         }
     }
 
     #[cfg(test)]
     fn test_linux_master_key(key: [u8; LINUX_MASTER_KEY_LEN]) -> Self {
         Self::linux_master_key(key, StateProtectionLevel::LinuxSystemdCredential)
+    }
+
+    #[cfg(all(test, unix))]
+    fn test_linux_master_key_with_migration(key: [u8; LINUX_MASTER_KEY_LEN]) -> Self {
+        Self::linux_master_key_with_migration(
+            key,
+            StateProtectionLevel::LinuxSystemdCredential,
+            true,
+        )
     }
 }
 
@@ -219,6 +252,10 @@ pub enum StateProtectionError {
     Provider(String),
     #[error("protected Linux state requires the configured master-key provider")]
     MissingMasterKey,
+    #[error(
+        "plaintext state is rejected while a Linux master-key provider is configured; pass --allow-plaintext-state-migration for one explicitly authorized migration run"
+    )]
+    PlaintextMigrationNotAllowed,
     #[error("protected state authentication failed")]
     Authentication,
     #[error("protected state nonce is missing or invalid")]
@@ -606,13 +643,21 @@ fn decode_platform_state<T: DeserializeOwned>(
             envelope.protection,
         ));
     }
-    Ok(DecodedState {
-        value: serde_json::from_slice(bytes)?,
-        needs_protection_upgrade: matches!(
-            &protection.kind,
-            StateProtectionKind::LinuxMasterKey(_)
-        ),
-    })
+    match &protection.kind {
+        StateProtectionKind::PlatformDefault => Ok(DecodedState {
+            value: serde_json::from_slice(bytes)?,
+            needs_protection_upgrade: false,
+        }),
+        StateProtectionKind::LinuxMasterKey(_) if protection.allow_plaintext_migration => {
+            Ok(DecodedState {
+                value: serde_json::from_slice(bytes)?,
+                needs_protection_upgrade: true,
+            })
+        }
+        StateProtectionKind::LinuxMasterKey(_) => {
+            Err(StateProtectionError::PlaintextMigrationNotAllowed)
+        }
+    }
 }
 
 fn validate_envelope_version(
@@ -740,29 +785,9 @@ fn load_systemd_credential_from_directory(
 
 #[cfg(unix)]
 fn read_provider_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, StateProtectionError> {
-    use std::io::Read;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        StateProtectionError::Provider(format!("cannot inspect state master-key source: {error}"))
+    let bytes = crate::secret_file::read_secret_file_no_follow(path, false).map_err(|error| {
+        StateProtectionError::Provider(format!("cannot read state master-key source: {error}"))
     })?;
-    if !metadata.file_type().is_file() {
-        return Err(StateProtectionError::Provider(
-            "state master-key source is not a regular file".into(),
-        ));
-    }
-    if metadata.len() > MAX_PROVIDER_KEY_FILE_BYTES {
-        return Err(StateProtectionError::Provider(
-            "state master-key source exceeds 64 KiB".into(),
-        ));
-    }
-    let file = File::open(path).map_err(|error| {
-        StateProtectionError::Provider(format!("cannot open state master-key source: {error}"))
-    })?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
-    file.take(MAX_PROVIDER_KEY_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            StateProtectionError::Provider(format!("cannot read state master-key source: {error}"))
-        })?;
     if bytes.len() as u64 > MAX_PROVIDER_KEY_FILE_BYTES {
         return Err(StateProtectionError::Provider(
             "state master-key source exceeds 64 KiB".into(),
@@ -965,19 +990,26 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn linux_master_key_envelope_migrates_plaintext_and_fails_closed() {
+    fn linux_master_key_envelope_requires_explicit_plaintext_migration() {
         let state = ExampleState {
             secret: "linux-provider-secret".into(),
         };
         let protection = StateProtection::test_linux_master_key([7; 32]);
         let plaintext = serde_json::to_vec_pretty(&state).unwrap();
+        assert!(matches!(
+            decode_protected_state_with::<ExampleState>(&plaintext, b"purpose", &protection),
+            Err(StateProtectionError::PlaintextMigrationNotAllowed)
+        ));
+
+        let migration = StateProtection::test_linux_master_key_with_migration([7; 32]);
         let legacy: DecodedState<ExampleState> =
-            decode_protected_state_with(&plaintext, b"purpose", &protection).unwrap();
+            decode_protected_state_with(&plaintext, b"purpose", &migration).unwrap();
         assert_eq!(legacy.value, state);
         assert!(legacy.needs_protection_upgrade);
 
-        let encoded = encode_protected_state_with(&state, b"purpose", &protection).unwrap();
+        let encoded = encode_protected_state_with(&state, b"purpose", &migration).unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains(&state.secret));
         let decoded: DecodedState<ExampleState> =
             decode_protected_state_with(&encoded, b"purpose", &protection).unwrap();

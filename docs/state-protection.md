@@ -30,7 +30,7 @@ LoadCredential=meshlake-state-key:/etc/meshlake-secrets/state.key
 ExecStart=/usr/local/bin/meshlaked --state-file /var/lib/meshlake/agent.json --state-key-systemd-credential meshlake-state-key run
 ```
 
-配置 provider 后，既有阶段 2 明文 JSON 会在完整解码和 schema 校验后原子迁移为加密信封。缺少 credential、文件权限过宽、key 长度错误、key 文件与状态同目录、错误 key、密文篡改或未知信封版本都会失败关闭；不会静默退回明文。
+配置 provider 后，默认拒绝任何明文状态，即使该 JSON 本身结构合法也不会接受，避免没有主密钥的攻击者用替换状态文件绕过 AEAD。迁移既有阶段 2 明文 JSON 时，管理员必须只在一次启动或一次 `state backup` 命令中显式增加 `--allow-plaintext-state-migration`；程序会在完整解码和 schema 校验后先原子重写正式状态为加密信封，再继续启动或输出备份。成功后应删除该参数，后续运行在未授权明文迁移的 provider 模式下重新打开信封；该参数不得写入 systemd unit 或 `meshlaked autostart install`。缺少 credential、文件权限过宽、key 长度错误、key 文件与状态同目录、错误 key、密文篡改、未授权明文或未知信封版本都会失败关闭；不会静默退回明文。
 
 未配置 provider 时保留 `0600` 明文兼容模式，以便现有部署显式迁移。程序启动会输出当前等级：
 
@@ -73,6 +73,7 @@ meshlake-controller.exe --state-file C:\MeshLake\controller.json state restore D
 - 备份使用固定版本的 Argon2id 参数派生 32 字节密钥，再用 XChaCha20-Poly1305 加密完整状态。格式版本、agent/controller 类型、KDF 参数、随机 salt、nonce 均受 AEAD 认证。
 - 错误口令、密文篡改、截断、未知版本、agent/controller 类型混用或解密后状态结构无效都会在覆盖正式状态前失败。
 - 导出和恢复都使用现有 `StateFileLock`。默认拒绝覆盖现有备份或正式状态；只有显式 `--force` 才允许在完整验证后替换。
+- Linux provider 模式下，`state backup` 遇到旧明文状态也默认失败；仅本次命令显式使用 `--allow-plaintext-state-migration` 时，才会先把正式状态重写为 provider 信封再导出。`state restore` 使用当前 provider 直接写入信封，不会生成中间明文状态。
 - 备份路径不能解析为正式状态、`.lock` 或 `.bak` 的任何 `.`、`..`、符号链接别名；实际读写使用安全解析后的绝对路径。
 - Windows 恢复通过正式状态写入路径重新应用 DPAPI；Linux 恢复文件及备份文件保持 `0600`。
 

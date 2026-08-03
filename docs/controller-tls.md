@@ -58,10 +58,13 @@ meshlake-cli.exe `
   controller invite `
   --controller https://planet.example.internal `
   --network <网络ID> `
-  --admin-token <管理员令牌>
+  --admin-token-file C:\MeshLake\secrets\administrator.token `
+  --invite-link-file C:\MeshLake\secrets\member.invite
 ```
 
-当前 `--admin-token` 只能作为命令行参数传入，可能出现在进程参数、shell 历史或终端日志中；CLI 尚未提供标准输入或令牌文件接口。请只在受控管理终端中使用真实令牌，不要把完整命令写入脚本、Issue、聊天或 CI 日志。控制器首次创建状态时还会把初始管理员令牌写入标准错误，应在未接入公开日志采集的受控终端完成初始化。
+管理员令牌可通过隐藏提示、`--admin-token-stdin` 或 Linux mode/Windows ACL 均受限的 `--admin-token-file` 提供；这些来源互斥。邀请链接必须显式写入默认拒绝覆盖的 `--invite-link-file`，或使用只允许附着 stdout 终端的 `--claim-invite-link`。旧 `--admin-token` 仅为兼容保留并输出弃用警告，不要把真实令牌或完整 join link 放入 argv、脚本、Issue、聊天或 CI 日志。
+
+控制器首次创建状态时也必须显式选择 `--claim-initial-admin-token` 或 `--initial-admin-token-file <SECRET_FILE>`；非 TTY 不会把令牌写到 stderr。文件目的地会受限创建且默认拒绝覆盖；如果随后状态写入失败，本次刚创建的令牌文件会被清理。
 
 ## HTTPS 反向代理
 

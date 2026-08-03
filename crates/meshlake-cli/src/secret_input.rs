@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use meshlake_core::read_restricted_secret_file;
+use meshlake_core::read_restricted_secret_string_file;
 use std::{
     fmt,
     io::{self, BufRead},
@@ -59,14 +59,8 @@ impl SecretInput {
                     .with_context(|| format!("cannot read {description} from standard input"))?;
                 Zeroizing::new(line)
             }
-            Self::File(path) => {
-                let bytes = read_restricted_secret_file(&path)
-                    .with_context(|| format!("cannot read {description} from restricted file"))?;
-                Zeroizing::new(
-                    String::from_utf8(bytes.to_vec())
-                        .with_context(|| format!("{description} file is not valid UTF-8"))?,
-                )
-            }
+            Self::File(path) => read_restricted_secret_string_file(&path)
+                .with_context(|| format!("cannot read {description} from restricted file"))?,
             Self::HiddenPrompt => Zeroizing::new(
                 prompt(&format!("{description}: "))
                     .with_context(|| format!("cannot read {description} from terminal"))?,

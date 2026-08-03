@@ -100,6 +100,9 @@ struct Cli {
         conflicts_with = "state_key_file"
     )]
     state_key_systemd_credential: Option<String>,
+    /// Linux: allow one explicit startup to migrate legacy plaintext state into the configured encrypted envelope.
+    #[arg(long)]
+    allow_plaintext_state_migration: bool,
     /// Path to the signed Wintun DLL. Defaults to wintun.dll beside meshlaked.exe.
     #[arg(long)]
     wintun_dll: Option<PathBuf>,
@@ -1988,12 +1991,26 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Autostart { command }) => {
-            return manage_autostart(command, &path, &wintun_dll, state_key_provider.as_ref())
+            if cli.allow_plaintext_state_migration {
+                anyhow::bail!(
+                    "--allow-plaintext-state-migration is a one-run authorization and cannot be installed in an autostart unit"
+                );
+            }
+            return manage_autostart(command, &path, &wintun_dll, state_key_provider.as_ref());
         }
         command => command,
     };
+    if cli.allow_plaintext_state_migration && state_key_provider.is_none() {
+        anyhow::bail!(
+            "--allow-plaintext-state-migration requires --state-key-file or --state-key-systemd-credential"
+        );
+    }
     let state_protection = match state_key_provider {
-        Some(provider) => StateProtection::from_provider(&path, provider)?,
+        Some(provider) => StateProtection::from_provider_with_plaintext_migration(
+            &path,
+            provider,
+            cli.allow_plaintext_state_migration,
+        )?,
         None => StateProtection::platform_default(),
     };
     eprintln!("State protection: {}", state_protection.level());
@@ -6691,9 +6708,35 @@ mod tests {
             StateKeyProvider::RestrictedFile(key_path.clone()),
         )
         .unwrap();
+        let error = match Agent::open_with_protection(
+            path.clone(),
+            adapter::default_wintun_path(),
+            protection,
+        ) {
+            Ok(_) => panic!("provider mode unexpectedly accepted plaintext"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("allow-plaintext-state-migration"));
+
+        let protection = StateProtection::from_provider_with_plaintext_migration(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+            true,
+        )
+        .unwrap();
         let agent =
             Agent::open_with_protection(path.clone(), adapter::default_wintun_path(), protection)
                 .unwrap();
+        drop(agent);
+
+        let protection = StateProtection::from_provider(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        let agent =
+            Agent::open_with_protection(path.clone(), adapter::default_wintun_path(), protection)
+                .expect("encrypted state must reopen without migration authorization");
         drop(agent);
 
         let bytes = fs::read(&path).unwrap();

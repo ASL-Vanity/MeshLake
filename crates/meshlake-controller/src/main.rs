@@ -92,6 +92,9 @@ struct Cli {
         conflicts_with = "state_key_file"
     )]
     state_key_systemd_credential: Option<String>,
+    /// Linux: allow one explicit startup to migrate legacy plaintext state into the configured encrypted envelope.
+    #[arg(long)]
+    allow_plaintext_state_migration: bool,
     /// Public controller URL published through the signed Planet manifest.
     #[arg(long)]
     planet_controller_url: Option<String>,
@@ -315,25 +318,12 @@ impl Controller {
                 }
                 InitialAdminTokenOutput::Interactive => InitialAdminTokenOutput::Interactive,
             };
-            let mut signing_key = [0_u8; 32];
-            getrandom::fill(&mut signing_key).map_err(|error| {
-                anyhow::anyhow!("cannot generate controller signing key: {error:?}")
-            })?;
-            let admin_token = Uuid::new_v4().to_string();
-            let state = ControllerState {
-                schema_version: CONTROLLER_STATE_SCHEMA_VERSION,
-                signing_key: signing_key.to_vec(),
-                admin_token: admin_token.clone(),
-                networks: HashMap::new(),
-                enrollment_tokens: HashMap::new(),
-            };
-            deliver_initial_admin_token(
-                &admin_token,
+            let state = initialize_new_controller_state(
                 &initial_token_output,
                 interactive_terminal,
                 output,
+                |state| write_state_with_protection(&path, state, &state_protection),
             )?;
-            write_state_with_protection(&path, &state, &state_protection)?;
             (state, false)
         };
         migrated |= migrate_and_validate_controller_state(&mut state)?;
@@ -814,6 +804,49 @@ fn deliver_initial_admin_token(
         }
     }
     Ok(())
+}
+
+fn initialize_new_controller_state<F>(
+    destination: &InitialAdminTokenOutput,
+    interactive_terminal: bool,
+    output: &mut dyn Write,
+    write_state: F,
+) -> Result<ControllerState>
+where
+    F: FnOnce(&ControllerState) -> Result<()>,
+{
+    let mut signing_key = [0_u8; 32];
+    getrandom::fill(&mut signing_key)
+        .map_err(|error| anyhow::anyhow!("cannot generate controller signing key: {error:?}"))?;
+    let admin_token = Uuid::new_v4().to_string();
+    let state = ControllerState {
+        schema_version: CONTROLLER_STATE_SCHEMA_VERSION,
+        signing_key: signing_key.to_vec(),
+        admin_token: admin_token.clone(),
+        networks: HashMap::new(),
+        enrollment_tokens: HashMap::new(),
+    };
+    deliver_initial_admin_token(&admin_token, destination, interactive_terminal, output)?;
+    if let Err(state_error) = write_state(&state) {
+        if let InitialAdminTokenOutput::RestrictedFile(path) = destination {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    return Err(state_error.context(
+                        "controller state creation failed; the newly created initial administrator-token file was removed",
+                    ));
+                }
+                Err(cleanup_error) => {
+                    return Err(state_error.context(format!(
+                        "controller state creation failed and the newly created initial administrator-token file could not be removed: {cleanup_error}"
+                    )));
+                }
+            }
+        }
+        return Err(
+            state_error.context("controller state creation failed after interactive token claim")
+        );
+    }
+    Ok(state)
 }
 
 fn signing_key(state: &ControllerState) -> Result<SigningKey> {
@@ -1323,8 +1356,17 @@ async fn main() -> Result<()> {
                 .clone()
                 .map(StateKeyProvider::SystemdCredential)
         });
+    if cli.allow_plaintext_state_migration && state_key_provider.is_none() {
+        anyhow::bail!(
+            "--allow-plaintext-state-migration requires --state-key-file or --state-key-systemd-credential"
+        );
+    }
     let state_protection = match state_key_provider {
-        Some(provider) => StateProtection::from_provider(&path, provider)?,
+        Some(provider) => StateProtection::from_provider_with_plaintext_migration(
+            &path,
+            provider,
+            cli.allow_plaintext_state_migration,
+        )?,
         None => StateProtection::platform_default(),
     };
     eprintln!("State protection: {}", state_protection.level());
@@ -1653,6 +1695,7 @@ mod tests {
             claim_initial_admin_token: false,
             state_key_file: None,
             state_key_systemd_credential: None,
+            allow_plaintext_state_migration: false,
             planet_controller_url: None,
             planet_relay_endpoints: Vec::new(),
             planet_roots: Vec::new(),
@@ -1762,6 +1805,27 @@ mod tests {
             .contains("cannot create restricted initial administrator-token file"));
         assert!(!error.to_string().contains(token.trim_end()));
         assert!(!second_state.exists());
+    }
+
+    #[test]
+    fn state_write_failure_removes_the_new_initial_token_file_without_disclosure() {
+        let directory = TestDirectory::new("initial-token-state-write-failure");
+        let token_path = directory.file("administrator.token");
+        let destination = InitialAdminTokenOutput::RestrictedFile(token_path.clone());
+        let mut generated_token = None;
+        let error =
+            initialize_new_controller_state(&destination, false, &mut io::sink(), |state| {
+                generated_token = Some(state.admin_token.clone());
+                anyhow::bail!("injected state write failure")
+            })
+            .expect_err("injected state write failure must abort initialization");
+
+        let generated_token = generated_token.expect("the test must observe the generated token");
+        assert!(!token_path.exists());
+        assert!(error
+            .to_string()
+            .contains("newly created initial administrator-token file was removed"));
+        assert!(!error.to_string().contains(&generated_token));
     }
 
     #[test]
@@ -2413,6 +2477,26 @@ mod tests {
             StateKeyProvider::RestrictedFile(key_path.clone()),
         )
         .unwrap();
+        let error = match Controller::open_with_protection(
+            path.clone(),
+            None,
+            protection,
+            None,
+            false,
+            &mut io::sink(),
+        ) {
+            Ok(_) => panic!("provider mode unexpectedly accepted plaintext"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("allow-plaintext-state-migration"));
+        assert!(String::from_utf8_lossy(&fs::read(&path).unwrap()).contains(&original.admin_token));
+
+        let protection = StateProtection::from_provider_with_plaintext_migration(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+            true,
+        )
+        .unwrap();
         let controller = Controller::open_with_protection(
             path.clone(),
             None,
@@ -2422,6 +2506,22 @@ mod tests {
             &mut io::sink(),
         )
         .unwrap();
+        drop(controller);
+
+        let protection = StateProtection::from_provider(
+            &path,
+            StateKeyProvider::RestrictedFile(key_path.clone()),
+        )
+        .unwrap();
+        let controller = Controller::open_with_protection(
+            path.clone(),
+            None,
+            protection,
+            None,
+            false,
+            &mut io::sink(),
+        )
+        .expect("encrypted state must reopen without migration authorization");
         drop(controller);
 
         let bytes = fs::read(&path).unwrap();
