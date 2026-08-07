@@ -105,6 +105,8 @@ sudo meshlake-root --config /etc/meshlake/root.json autostart uninstall
 
 systemd 单元会限制文件系统写入范围，所以 `identity_file` 必须位于配置文件所在目录内。运行服务的帐户必须拥有身份文件，且该文件保持 `0600`。
 
+安装器只接受不含空白、控制字符、引号、反斜杠、`$`、`%`、`#` 或 `;` 的普通绝对二进制与配置路径；遇到这些字符会失败关闭，而不是生成可能被 systemd 重新解释的 unit 文件。
+
 ## 注册协议与失败关闭
 
 客户端以当前 UDP 映射向 Planet 中每个 Root 发送设备签名注册。Root 对每个注册验证：成员证书、设备公钥与设备 ID、控制器签名授权清单、网络密钥 epoch、到期时间、候选地址、nonce 防重放与时钟偏差。

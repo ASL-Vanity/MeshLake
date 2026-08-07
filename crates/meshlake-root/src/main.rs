@@ -6,6 +6,8 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use meshlake_core::systemd_unit_path;
 use meshlake_core::{
     load_or_create_root_identity, AuthorizationEpochHint, DeviceId, MembershipCertificate,
     NetworkId, RootPeer, RootRegistration, RootRegistrationServiceKind, RootResponse,
@@ -543,14 +545,18 @@ fn manage_autostart(command: AutostartCommand, config_path: Option<&Path>) -> Re
                 .with_context(|| format!("cannot resolve {}", config_path.display()))?;
             let executable =
                 env::current_exe().context("cannot locate meshlake-root executable")?;
+            let config_directory = config_path
+                .parent()
+                .context("root config path has no parent directory")?;
+            let executable = systemd_unit_path(&executable, "root executable path")?;
+            let config_value = systemd_unit_path(&config_path, "root configuration path")?;
+            let config_directory =
+                systemd_unit_path(config_directory, "root configuration directory")?;
             let unit = format!(
                 "[Unit]\nDescription=MeshLake root discovery service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=\"{}\" --config \"{}\" run\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths={}\n\n[Install]\nWantedBy=multi-user.target\n",
-                executable.display(),
-                config_path.display(),
-                config_path
-                    .parent()
-                    .context("root config path has no parent directory")?
-                    .display()
+                executable,
+                config_value,
+                config_directory,
             );
             fs::write(UNIT_PATH, unit)
                 .context("cannot install systemd unit; run this command as root")?;

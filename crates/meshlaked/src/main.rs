@@ -45,6 +45,8 @@ use meshlake_core::{
     RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
     RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
+#[cfg(unix)]
+use meshlake_core::{systemd_credential_name, systemd_unit_path};
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -3596,21 +3598,29 @@ fn manage_autostart(
     match command {
         AutostartCommand::Install => {
             let executable = env::current_exe().context("cannot locate meshlaked executable")?;
+            let executable = systemd_unit_path(&executable, "meshlaked executable path")?;
+            let state_path = systemd_unit_path(state_path, "agent state path")?;
             let (credential_directive, provider_argument) = match state_key_provider {
-                Some(StateKeyProvider::SystemdCredential(name)) => (
-                    format!("LoadCredential={name}\n"),
-                    format!(" --state-key-systemd-credential \"{name}\""),
-                ),
+                Some(StateKeyProvider::SystemdCredential(name)) => {
+                    let name = systemd_credential_name(name, "systemd state credential name")?;
+                    (
+                        format!("LoadCredential={name}\n"),
+                        format!(" --state-key-systemd-credential \"{name}\""),
+                    )
+                }
                 Some(StateKeyProvider::RestrictedFile(path)) => (
                     String::new(),
-                    format!(" --state-key-file \"{}\"", path.display()),
+                    format!(
+                        " --state-key-file \"{}\"",
+                        systemd_unit_path(path, "agent state key path")?
+                    ),
                 ),
                 None => (String::new(), String::new()),
             };
             let unit = format!(
                 "[Unit]\nDescription=MeshLake virtual LAN agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\n{credential_directive}ExecStart=\"{}\" --state-file \"{}\"{provider_argument} run\nRestart=on-failure\nRestartSec=3\nStateDirectory=meshlake\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
-                executable.display(),
-                state_path.display(),
+                executable,
+                state_path,
             );
             fs::write(UNIT_PATH, unit)
                 .context("cannot install systemd unit; run this command as root")?;

@@ -13,6 +13,7 @@ mod session;
 mod session_observation;
 mod state_backup;
 mod state_protection;
+mod systemd_unit;
 
 pub use authorization::{
     AuthorizationEpochHint, AuthorizedMembership, MembershipRefreshRequest,
@@ -77,3 +78,4 @@ pub use state_protection::{
     CONTROLLER_STATE_PROTECTION_PURPOSE, RELAY_IDENTITY_PROTECTION_PURPOSE,
     ROOT_IDENTITY_PROTECTION_PURPOSE,
 };
+pub use systemd_unit::{systemd_credential_name, systemd_unit_path, SystemdUnitArgumentError};

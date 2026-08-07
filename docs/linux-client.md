@@ -55,6 +55,8 @@ sudo ./meshlaked autostart install
 
 未显式传入 `--state-file` 时，安装器创建 `/etc/systemd/system/meshlaked.service`，并将状态固定在 `/var/lib/meshlake/agent.json`（由 `StateDirectory=meshlake` 创建）；显式传入 `--state-file` 时则保留该绝对路径。服务异常退出后等待 3 秒重启。状态文件包含设备私钥和网络密钥，代理会在 Linux 上强制设置为 `0600`。
 
+自动安装器会拒绝包含空白、控制字符、引号、反斜杠、`$`、`%`、`#` 或 `;` 的二进制、状态和密钥文件路径，避免这些内容被 systemd unit 重新解释。请把服务二进制、状态与密钥放在普通的绝对路径中，例如 `/opt/meshlake`、`/var/lib/meshlake` 与 `/etc/meshlake`。
+
 卸载服务：
 
 ```bash
