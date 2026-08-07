@@ -38,6 +38,36 @@ meshlake-relay.exe `
 
 TLS Relay 公网端口、证书公钥和指纹属于可公开分发的 Planet 信息；私钥、控制器管理员令牌、成员入网令牌和状态文件不得写入命令行历史、日志或仓库。
 
+## Linux systemd 部署
+
+Relay 可以使用独立的 `meshlake` 服务账户运行。请显式指定 `--identity-file`，使长期 Relay 身份位于 systemd 管理的状态目录；该文件会被 Unix 身份校验要求为服务账户拥有的普通 `0600` 文件。
+
+```ini
+# /etc/systemd/system/meshlake-relay.service
+[Unit]
+Description=MeshLake encrypted relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshlake
+Group=meshlake
+StateDirectory=meshlake
+ExecStart=/opt/meshlake/meshlake-relay --bind 0.0.0.0:51820 --identity-file /var/lib/meshlake/relay-identity.json --controller-public-key-base64 <CONTROLLER_PUBLIC_KEY_BASE64>
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meshlake
+
+[Install]
+WantedBy=multi-user.target
+```
+
+若使用 TLS Relay，可在同一 `ExecStart` 追加 `--tcp-tls-bind`、`--tcp-tls-certificate` 和 `--tcp-tls-private-key`。监听特权端口（例如 TCP 443）时，优先使用反向代理或由管理员审查后最小化授予 `CAP_NET_BIND_SERVICE`；不要为了绑定端口而把 Relay 长期作为完整 root 服务运行。修改 unit 后执行 `sudo systemctl daemon-reload && sudo systemctl enable --now meshlake-relay.service`。
+
 ## 可观测性与运维
 
 `meshlake-cli status` 与本机状态 API 只显示已配置/已连接 TLS Relay 数、连接失败数、已写入/接收帧数和队列丢弃数，不显示 TLS 端点、证书、SNI、凭据或业务数据。会话路径会显示为 `tls_relay`。

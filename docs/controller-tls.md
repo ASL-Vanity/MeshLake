@@ -79,6 +79,37 @@ meshlake-controller.exe `
 
 反向代理把 `https://planet.example.com` 转发到 `http://127.0.0.1:51822`。不要把 `51822/TCP` 对公网开放，只开放反向代理的 HTTPS 端口。
 
+## Linux systemd 部署
+
+控制器可以使用低权限专用服务账户运行；只有首次初始化、受限状态文件和 TLS 私钥目录需要由该账户或 systemd 凭据机制读取。下面模板把状态主密钥作为 systemd credential 注入，模板本身不包含管理员令牌、网络密钥、私钥或 TURN 静态认证密钥：
+
+```ini
+# /etc/systemd/system/meshlake-controller.service
+[Unit]
+Description=MeshLake membership controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshlake
+Group=meshlake
+StateDirectory=meshlake
+LoadCredential=meshlake-controller-state-key:/etc/meshlake/credentials/controller-state.key
+ExecStart=/opt/meshlake/meshlake-controller --bind 127.0.0.1:51822 --state-file /var/lib/meshlake/controller.json --state-key-systemd-credential meshlake-controller-state-key
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meshlake
+
+[Install]
+WantedBy=multi-user.target
+```
+
+首次创建控制器状态时，先在受控终端使用 `--claim-initial-admin-token` 或 `--initial-admin-token-file` 初始化；不要让 systemd 服务首次启动时把管理员令牌打印到日志。发布 Planet、TLS、私有 CA、Root、Relay 或 TURN 参数时，只能在 `ExecStart` 追加公开端点、公开证书路径和受限秘密文件**路径**；令牌、私钥、网络 PSK 和 `static-auth-secret` 内容均不得写入 unit、环境变量、命令行历史或仓库。修改后执行 `sudo systemctl daemon-reload && sudo systemctl enable --now meshlake-controller.service`。
+
 ## 明文开发模式
 
 未配置 TLS 时，控制器只允许绑定回环地址。确实需要在隔离测试网中监听非回环地址时，必须显式确认风险：
