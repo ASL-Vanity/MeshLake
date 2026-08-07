@@ -4299,7 +4299,7 @@ async fn send_peer_routed_packet(
                 "sent {description} for member {} through authenticated UDP TURN",
                 target_device.0
             ));
-            return Some(SessionPath::Relay);
+            return Some(SessionPath::Turn);
         }
     }
     let relay_endpoint = select_relay_endpoint(
@@ -4337,9 +4337,12 @@ fn session_path_for(
     remote: SocketAddr,
     relay_endpoints: &[SocketAddr],
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> SessionPath {
     if via_tls_relay && relay_endpoints.contains(&remote) {
         SessionPath::TlsRelay
+    } else if via_turn && relay_endpoints.contains(&remote) {
+        SessionPath::Turn
     } else if relay_endpoints.contains(&remote) {
         SessionPath::Relay
     } else {
@@ -4352,6 +4355,7 @@ fn session_path_description(path: SessionPath) -> &'static str {
         SessionPath::Unknown => "unknown path",
         SessionPath::Direct => "direct path",
         SessionPath::Relay => "relay",
+        SessionPath::Turn => "authenticated UDP TURN",
         SessionPath::TlsRelay => "controller-pinned TLS relay",
     }
 }
@@ -4363,11 +4367,12 @@ async fn send_to_inbound_path(
     remote: SocketAddr,
     packet: &[u8],
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> bool {
     if via_tls_relay {
         tls_relay_transport.try_send(remote, packet)
-    } else if turn_transport.try_send_any(remote, packet) {
-        true
+    } else if via_turn {
+        turn_transport.try_send_any(remote, packet)
     } else {
         sockets.send_to(packet, remote).await
     }
@@ -4626,6 +4631,7 @@ async fn run_relay_worker(
                     &tls_relay_transport,
                     &turn_transport,
                     false,
+                    false,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -4649,6 +4655,7 @@ async fn run_relay_worker(
                     &mut registration_schedules,
                     &tls_relay_transport,
                     &turn_transport,
+                    false,
                     false,
                 ).await?;
             }
@@ -4674,6 +4681,7 @@ async fn run_relay_worker(
                     &tls_relay_transport,
                     &turn_transport,
                     true,
+                    false,
                 ).await?;
             }
             received = turn_transport.receive() => {
@@ -4698,6 +4706,7 @@ async fn run_relay_worker(
                     &tls_relay_transport,
                     &turn_transport,
                     false,
+                    true,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -5179,6 +5188,7 @@ async fn receive_udp_packet(
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     if let Some((transaction_id, candidate)) = parse_stun_binding_success(packet) {
@@ -5435,6 +5445,7 @@ async fn receive_udp_packet(
                 tls_relay_transport,
                 turn_transport,
                 via_tls_relay,
+                via_turn,
             )
             .await?;
         }
@@ -5451,6 +5462,7 @@ async fn receive_udp_packet(
                 tls_relay_transport,
                 turn_transport,
                 via_tls_relay,
+                via_turn,
             )
             .await?;
         }
@@ -5464,6 +5476,7 @@ async fn receive_udp_packet(
                 sessions,
                 configuration_revision,
                 via_tls_relay,
+                via_turn,
             )
             .await?;
         }
@@ -5645,6 +5658,7 @@ async fn receive_session_init(
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_INIT)
@@ -5689,7 +5703,12 @@ async fn receive_session_init(
     });
     if let Some(response) = cached_response {
         if let Some(session) = sessions.get_mut(&peer_key) {
-            session.set_path(session_path_for(remote, relay_endpoints, via_tls_relay));
+            session.set_path(session_path_for(
+                remote,
+                relay_endpoints,
+                via_tls_relay,
+                via_turn,
+            ));
             publish_session(agent, configuration_revision, peer_key, session);
         }
         send_to_inbound_path(
@@ -5699,6 +5718,7 @@ async fn receive_session_init(
             remote,
             &response,
             via_tls_relay,
+            via_turn,
         )
         .await;
         return Ok(());
@@ -5773,7 +5793,7 @@ async fn receive_session_init(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: Some(response.clone()),
-            path: session_path_for(remote, relay_endpoints, via_tls_relay),
+            path: session_path_for(remote, relay_endpoints, via_tls_relay, via_turn),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5789,6 +5809,7 @@ async fn receive_session_init(
         remote,
         &response,
         via_tls_relay,
+        via_turn,
     )
     .await;
     let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
@@ -5801,6 +5822,7 @@ async fn receive_session_init(
                 remote,
                 &encrypted,
                 via_tls_relay,
+                via_turn,
             )
             .await,
         );
@@ -5813,7 +5835,12 @@ async fn receive_session_init(
         "accepted pairwise session {} from member {} via {}",
         Uuid::from_bytes(session_id),
         source.0,
-        session_path_description(session_path_for(remote, relay_endpoints, via_tls_relay))
+        session_path_description(session_path_for(
+            remote,
+            relay_endpoints,
+            via_tls_relay,
+            via_turn,
+        ))
     ));
     Ok(())
 }
@@ -5830,6 +5857,7 @@ async fn receive_session_response(
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_RESPONSE)
@@ -5912,7 +5940,7 @@ async fn receive_session_response(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: None,
-            path: session_path_for(remote, relay_endpoints, via_tls_relay),
+            path: session_path_for(remote, relay_endpoints, via_tls_relay, via_turn),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5931,6 +5959,7 @@ async fn receive_session_response(
                 remote,
                 &encrypted,
                 via_tls_relay,
+                via_turn,
             )
             .await,
         );
@@ -5956,6 +5985,7 @@ async fn receive_session_data(
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     configuration_revision: u64,
     via_tls_relay: bool,
+    via_turn: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_DATA)
@@ -5988,7 +6018,12 @@ async fn receive_session_data(
     };
     if let Some(session) = sessions.get_mut(&peer_key) {
         session.record_authenticated_packet();
-        session.set_path(session_path_for(remote, relay_endpoints, via_tls_relay));
+        session.set_path(session_path_for(
+            remote,
+            relay_endpoints,
+            via_tls_relay,
+            via_turn,
+        ));
         publish_session(agent, configuration_revision, peer_key, session);
     }
     if opened.network_id != network_id
@@ -6399,6 +6434,19 @@ mod tests {
         assert_eq!(
             select_state_path(None, true),
             PathBuf::from("/var/lib/meshlake/agent.json"),
+        );
+    }
+
+    #[test]
+    fn turn_inbound_path_is_observed_distinctly_from_plain_udp_relay() {
+        let relay: SocketAddr = "203.0.113.77:51820".parse().unwrap();
+        assert_eq!(
+            session_path_for(relay, &[relay], false, false),
+            SessionPath::Relay
+        );
+        assert_eq!(
+            session_path_for(relay, &[relay], false, true),
+            SessionPath::Turn
         );
     }
 

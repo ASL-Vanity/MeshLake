@@ -8,6 +8,7 @@ MeshLake 的 Planet V5 可发布控制器签名的标准 TURN 端点。TURN 只�
 - 认证使用 coturn REST 静态密钥模式。控制器在 HTTPS 入网和成员刷新响应中签发短期凭据，格式为 `过期Unix秒:设备ID` 与 `Base64(HMAC-SHA1(static-auth-secret, username))`。
 - 凭据仅保存在运行中的 `meshlaked` 内存；不会写入 agent 状态、Planet、CLI 输出、GUI、本地状态 API 或日志。过期前会随成员刷新重新获取。
 - Planet 可以同时发布 UDP、TCP 与 TLS TURN 端点；当前数据面只启用 UDP 项。TCP/TLS 项不会被降级为 UDP，也不会在未实现时被伪装为可用。
+- 本机 `/v1/sessions` 与 `meshlake-cli sessions` 会将实际经由该通道建立的会话标记为 `turn`；只显示路径类别和计数，不显示 TURN 地址、用户名、密码或数据内容。
 
 路径优先级为：
 

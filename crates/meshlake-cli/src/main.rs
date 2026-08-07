@@ -1445,6 +1445,7 @@ fn render_session(session: &SessionObservation) -> String {
         SessionPath::Unknown => "unknown",
         SessionPath::Direct => "direct",
         SessionPath::Relay => "relay",
+        SessionPath::Turn => "turn",
         SessionPath::TlsRelay => "tls_relay",
     };
     format!(

@@ -14,7 +14,7 @@ contains:
 
 - `network_id` and `peer_device_id` (the complete isolation key)
 - `state`: `pending`, `established`, or a short-lived `expired` tombstone
-- `path`: `unknown`, `direct`, or `relay`
+- `path`: `unknown`, `direct`, `relay`, `turn`, or `tls_relay`
 - `age_ms`
 - bounded queue depth/capacity/drop counters
 - handshake, successful encrypted-send, authenticated-receive and

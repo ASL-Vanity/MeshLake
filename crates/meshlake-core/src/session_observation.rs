@@ -43,6 +43,9 @@ pub enum SessionPath {
     Unknown,
     Direct,
     Relay,
+    /// UDP TURN transport carrying an end-to-end encrypted MeshLake Relay
+    /// frame. TURN credentials, endpoints and payloads remain private.
+    Turn,
     /// TLS-framed transport through a controller-pinned MeshLake Relay.
     /// The overlay packet remains pairwise encrypted end to end.
     TlsRelay,
