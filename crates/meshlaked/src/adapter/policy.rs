@@ -167,6 +167,11 @@ impl PolicyPlan {
         if !search_domains.is_empty() && dns_servers.is_empty() {
             bail!("search domains require at least one policy DNS server");
         }
+        if !exit_routes.is_empty() && dns_servers.is_empty() {
+            bail!(
+                "an exit selection requires at least one controller-signed DNS server to prevent physical-network DNS leakage"
+            );
+        }
         Ok(Self {
             routes: routes.into_values().collect(),
             exit_routes: exit_routes.into_values().collect(),
@@ -438,7 +443,10 @@ mod tests {
                 supports_ipv4: true,
                 supports_ipv6: true,
             }],
-            DnsPolicy::default(),
+            DnsPolicy {
+                servers: vec!["100.64.71.53".parse().unwrap()],
+                search_domains: vec![],
+            },
             1,
             100,
             &signing,

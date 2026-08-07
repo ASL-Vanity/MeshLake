@@ -346,18 +346,32 @@ fn linux_policy_commands(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<L
                     .chain(plan.dns_servers.iter().map(ToString::to_string))
                     .collect(),
             });
-            if !plan.search_domains.is_empty() {
+            let mut domains = plan.search_domains.clone();
+            if !plan.exit_routes.is_empty() {
+                // `~.` gives the MeshLake link ownership of all DNS domains
+                // while the signed exit default route is active.
+                domains.push("~.".into());
+            }
+            if !domains.is_empty() {
                 commands.push(LinuxPolicyCommand {
                     program: "resolvectl",
                     arguments: std::iter::once("domain".into())
                         .chain(std::iter::once(INTERFACE_NAME.into()))
-                        .chain(plan.search_domains.iter().cloned())
+                        .chain(domains)
                         .collect(),
                 });
             }
             commands.push(LinuxPolicyCommand {
                 program: "resolvectl",
-                arguments: vec!["default-route".into(), INTERFACE_NAME.into(), "no".into()],
+                arguments: vec![
+                    "default-route".into(),
+                    INTERFACE_NAME.into(),
+                    if plan.exit_routes.is_empty() {
+                        "no".into()
+                    } else {
+                        "yes".into()
+                    },
+                ],
             });
         }
         PolicyOperation::Remove if !plan.dns_servers.is_empty() => {
