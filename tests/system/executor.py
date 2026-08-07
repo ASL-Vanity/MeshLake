@@ -27,6 +27,8 @@ SINGLE_USE_RUN_RECEIPT_CAPABILITY = "single-use-run-receipt"
 SUPPORTED_ACTION_TYPES = {
     "apply_network_policy",
     "block_direct_path",
+    "block_tls_turn",
+    "block_udp_turn",
     "block_udp_relay",
     "capture_session_snapshot",
     "close_sessions",
@@ -49,6 +51,8 @@ SUPPORTED_ACTION_TYPES = {
     "restart_daemon",
     "restore_controller_tls",
     "restore_direct_path",
+    "restore_tls_turn",
+    "restore_udp_turn",
     "restore_udp_relay",
     "restore_member_authorization",
     "restore_network_policy",
@@ -109,6 +113,8 @@ IDEMPOTENT_CLEANUP_TYPES = {
     "remove_test_ca",
     "restore_controller_tls",
     "restore_direct_path",
+    "restore_tls_turn",
+    "restore_udp_turn",
     "restore_udp_relay",
     "restore_member_authorization",
     "restore_network_policy",
@@ -123,6 +129,8 @@ IDEMPOTENT_CLEANUP_TYPES = {
 _CLEANUP_TARGET_BINDINGS = {
     "apply_network_policy": {"restore_network_policy": (("role", "role"),)},
     "block_direct_path": {"restore_direct_path": (("roles", "roles"),)},
+    "block_tls_turn": {"restore_tls_turn": (("roles", "roles"),)},
+    "block_udp_turn": {"restore_udp_turn": (("roles", "roles"),)},
     "block_udp_relay": {"restore_udp_relay": (("roles", "roles"),)},
     "configure_controller_tls": {
         "restore_controller_tls": (("roles", "roles"),),
@@ -628,6 +636,8 @@ class SimulatedBackend(ExecutionBackend):
     session_paths: dict[str, str] = field(default_factory=dict)
     snapshot_paths: dict[str, dict[str, str]] = field(default_factory=dict)
     direct_path_blocked: bool = False
+    udp_turn_blocked: bool = False
+    tls_turn_blocked: bool = False
     udp_relay_blocked: bool = False
 
     name = "simulated"
@@ -669,6 +679,14 @@ class SimulatedBackend(ExecutionBackend):
             self.direct_path_blocked = True
         elif action_type == "restore_direct_path":
             self.direct_path_blocked = False
+        elif action_type == "block_udp_turn":
+            self.udp_turn_blocked = True
+        elif action_type == "restore_udp_turn":
+            self.udp_turn_blocked = False
+        elif action_type == "block_tls_turn":
+            self.tls_turn_blocked = True
+        elif action_type == "restore_tls_turn":
+            self.tls_turn_blocked = False
         elif action_type == "block_udp_relay":
             self.udp_relay_blocked = True
         elif action_type == "restore_udp_relay":
@@ -677,11 +695,15 @@ class SimulatedBackend(ExecutionBackend):
             network = str(action.get("network", "default"))
             self.sessions[network] = max(1, self.sessions.get(network, 0))
             self.session_paths[network] = (
-                "tls_relay"
-                if self.direct_path_blocked and self.udp_relay_blocked
+                self.session_paths.get(network, "direct")
+                if not self.direct_path_blocked
+                else "turn"
+                if not self.udp_turn_blocked
+                else "turn"
+                if not self.tls_turn_blocked
                 else "relay"
-                if self.direct_path_blocked
-                else self.session_paths.get(network, "direct")
+                if not self.udp_relay_blocked
+                else "tls_relay"
             )
         elif action_type == "capture_session_snapshot":
             name = str(action.get("name", "snapshot"))

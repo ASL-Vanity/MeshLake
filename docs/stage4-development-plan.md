@@ -64,7 +64,7 @@
 ### 4D：TURN/TCP/TLS 回退与观测
 
 - 定义独立版本化 TURN 配置与凭据分发接口；短期凭据不写入命令行或持久日志。
-- 优先 UDP 直连，再使用现有加密 Relay；策略允许且 UDP 不可用时才尝试 TURN/TCP/TLS。
+- 按 UDP 直连、UDP TURN、TLS TURN、现有加密 UDP Relay、MeshLake TLS Relay 的固定顺序回退。明文 TCP TURN 不得进入数据面，因为会暴露短期 REST 凭据。
 - 在会话观测中仅暴露路径类别、失败原因类别和计数器，不暴露 TURN 凭据、端点或业务包。
 
 ### 4E：统一验收
@@ -80,3 +80,9 @@ DNS/killswitch、NAT 清理、TURN/TCP/TLS 与异常恢复。真实验收的 inv
 - Controller、Agent、数据面和平台投影均验证出口授权，任一层不满足即失败关闭。
 - 所有平台命令均具有对应撤销路径，并对部分失败、撤销失败和服务重启有测试覆盖。
 - 真实测试报告仅包含版本、提交、场景结果、时长、脱敏日志和计数器。
+
+## 当前实现状态
+
+4A 至 4D 的核心代码、离线单元测试、release 构建和受门禁的系统场景校验已完成。系统场景包含显式的 `turn-fallback` 编排，用于固定 UDP TURN、TLS TURN、UDP Relay 与 TLS Relay 的回退顺序；它不连接任何外部主机，也不能替代真实 coturn、Windows、Linux 或公网验收。
+
+4E 仍须在用户明确授权的可丢弃实验环境中集中执行。真实 inventory 只能保存角色、可丢弃标记和非秘密连接引用；远程凭据、令牌、私钥、邀请码、Planet 内容和网络密钥不得写入仓库、命令行、日志或测试产物。

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "id": "turn-fallback",
+  "description": "Verify the disposable-lab fallback order is direct UDP, UDP TURN, pinned TLS TURN, MeshLake UDP Relay, then pinned TLS Relay.",
+  "execution": { "allowed": true, "required_capabilities": ["simulation"] },
+  "hosts": [
+    { "role": "node_a", "platforms": ["windows", "linux"] },
+    { "role": "node_b", "platforms": ["windows", "linux"] },
+    { "role": "relay_primary", "platforms": ["linux", "windows"] }
+  ],
+  "phases": [
+    {
+      "name": "direct_baseline",
+      "actions": [
+        {
+          "type": "establish_pairwise_session", "source": "node_a", "destination": "node_b",
+          "cleanup": { "type": "close_sessions", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "direct" }
+      ],
+      "assertions": [
+        { "type": "session", "snapshot": "direct", "state": "established", "path": "direct" }
+      ]
+    },
+    {
+      "name": "udp_turn_then_tls_turn",
+      "actions": [
+        {
+          "type": "block_direct_path", "roles": ["node_a", "node_b"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_direct_path", "roles": ["node_a", "node_b"], "idempotent": true }
+        },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "udp_turn" },
+        {
+          "type": "block_udp_turn", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_udp_turn", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
+        },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "tls_turn" }
+      ],
+      "assertions": [
+        { "type": "overlay_probe_succeeds", "families": ["ipv4"] },
+        { "type": "session", "snapshot": "udp_turn", "state": "established", "path": "turn" },
+        { "type": "session", "snapshot": "tls_turn", "state": "established", "path": "turn" },
+        { "type": "same_network_and_peer", "snapshots": ["direct", "udp_turn", "tls_turn"] }
+      ]
+    },
+    {
+      "name": "relay_then_tls_relay",
+      "actions": [
+        {
+          "type": "block_tls_turn", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_tls_turn", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
+        },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "relay" },
+        {
+          "type": "block_udp_relay", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_udp_relay", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
+        },
+        { "type": "send_overlay_probe", "source": "node_a", "destination": "node_b", "family": "ipv4" },
+        { "type": "capture_session_snapshot", "role": "node_a", "name": "tls_relay" }
+      ],
+      "assertions": [
+        { "type": "overlay_probe_succeeds", "families": ["ipv4"] },
+        { "type": "session", "snapshot": "relay", "state": "established", "path": "relay" },
+        { "type": "session", "snapshot": "tls_relay", "state": "established", "path": "tls_relay" },
+        { "type": "same_network_and_peer", "snapshots": ["direct", "relay", "tls_relay"] }
+      ]
+    },
+    {
+      "name": "cleanup",
+      "actions": [
+        { "type": "restore_udp_relay", "roles": ["node_a", "node_b", "relay_primary"] },
+        { "type": "restore_tls_turn", "roles": ["node_a", "node_b", "relay_primary"] },
+        { "type": "restore_udp_turn", "roles": ["node_a", "node_b", "relay_primary"] },
+        { "type": "restore_direct_path", "roles": ["node_a", "node_b"] }
+      ],
+      "assertions": [
+        { "type": "fault_injection_removed", "roles": ["node_a", "node_b", "relay_primary"] }
+      ]
+    }
+  ]
+}

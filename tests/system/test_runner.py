@@ -358,6 +358,40 @@ class RunnerSafetyTests(unittest.TestCase):
             ).ok
         )
 
+    def test_simulated_fallback_order_reaches_turn_before_relays(self) -> None:
+        backend = SimulatedBackend()
+        backend.run_action(
+            {"type": "block_direct_path", "roles": ["node_a", "node_b"]}, 30
+        )
+        backend.run_action(
+            {"type": "send_overlay_probe", "network": "network-a"}, 30
+        )
+        self.assertEqual(backend.session_paths["network-a"], "turn")
+
+        backend.run_action(
+            {"type": "block_udp_turn", "roles": ["node_a", "node_b"]}, 30
+        )
+        backend.run_action(
+            {"type": "send_overlay_probe", "network": "network-a"}, 30
+        )
+        self.assertEqual(backend.session_paths["network-a"], "turn")
+
+        backend.run_action(
+            {"type": "block_tls_turn", "roles": ["node_a", "node_b"]}, 30
+        )
+        backend.run_action(
+            {"type": "send_overlay_probe", "network": "network-a"}, 30
+        )
+        self.assertEqual(backend.session_paths["network-a"], "relay")
+
+        backend.run_action(
+            {"type": "block_udp_relay", "roles": ["node_a", "node_b"]}, 30
+        )
+        backend.run_action(
+            {"type": "send_overlay_probe", "network": "network-a"}, 30
+        )
+        self.assertEqual(backend.session_paths["network-a"], "tls_relay")
+
     def test_unmodeled_assertion_is_explicit_in_result(self) -> None:
         scenario = executable_scenario(
             {"type": "wait_transport_ready", "roles": ["node_a"]}

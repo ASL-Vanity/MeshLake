@@ -78,4 +78,5 @@ The declarative scenarios preserve these invariants:
 - revocation, identity changes, transport revision changes, and daemon restarts
   invalidate observations from the old security context.
 - destructive and fault actions target only assigned disposable lab hosts.
-- `tls-relay-fallback` covers direct UDP, authenticated UDP Relay and then Planet V4 pinned TLS Relay. The simulator verifies orchestration only; real validation must still verify certificate pin rejection, TCP/TLS framing, IPv4/IPv6 and cleanup.
+- `turn-fallback` expresses the complete intended order: direct UDP, UDP TURN, pinned TLS TURN, authenticated MeshLake UDP Relay, then Planet V4 pinned TLS Relay. The public session path intentionally reports both TURN transports as `turn`, so the scenario records the selected tier through its ordered fault phases rather than exposing endpoints or credentials.
+- `tls-relay-fallback` remains a focused direct/UDP Relay/TLS Relay scenario. The simulator verifies orchestration only; real validation must still verify certificate pin rejection, TURN allocation and refresh, TCP/TLS framing, IPv4/IPv6 and cleanup.
