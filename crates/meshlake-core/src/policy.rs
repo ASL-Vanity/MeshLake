@@ -7,8 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::IpAddr};
 use thiserror::Error;
 
-pub const NETWORK_POLICY_MANIFEST_VERSION: u8 = 1;
+/// The current policy manifest version. Version 1 remains valid for split
+/// routing-only policies so an Agent can safely read persisted pre-exit-node
+/// state during a rolling upgrade.
+pub const NETWORK_POLICY_MANIFEST_VERSION: u8 = 2;
+const NETWORK_POLICY_MANIFEST_VERSION_V1: u8 = 1;
 const MAX_ROUTES: usize = 256;
+const MAX_EXIT_NODES: usize = 16;
 const MAX_DNS_SERVERS: usize = 8;
 const MAX_SEARCH_DOMAINS: usize = 16;
 
@@ -20,6 +25,21 @@ pub struct PolicyRoute {
     /// Controller-signed certificate for the member that may forward this
     /// prefix. Its `allowed_routes` claim must cover `prefix`.
     pub gateway_certificate: MembershipCertificate,
+}
+
+/// A controller-authorized member that may be selected locally as an Internet
+/// exit gateway. This is deliberately separate from `PolicyRoute`: publishing
+/// an exit candidate never installs a default route on other members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitNode {
+    /// Controller-signed membership certificate for the gateway member.
+    pub gateway_certificate: MembershipCertificate,
+    /// The gateway is authorized to carry an IPv4 default route when a member
+    /// explicitly selects it locally.
+    pub supports_ipv4: bool,
+    /// The gateway is authorized to carry an IPv6 default route when a member
+    /// explicitly selects it locally.
+    pub supports_ipv6: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +56,10 @@ pub struct NetworkPolicyManifest {
     pub network_id: NetworkId,
     pub policy_epoch: u64,
     pub routes: Vec<PolicyRoute>,
+    /// Exit candidates are present only in version 2 manifests. A candidate is
+    /// not active until a member makes a separate local selection.
+    #[serde(default)]
+    pub exit_nodes: Vec<ExitNode>,
     #[serde(default)]
     pub dns: DnsPolicy,
     pub issued_at_unix_seconds: u64,
@@ -45,11 +69,24 @@ pub struct NetworkPolicyManifest {
 }
 
 #[derive(Serialize)]
-struct PolicyPayload<'a> {
+struct PolicyPayloadV1<'a> {
     version: u8,
     network_id: NetworkId,
     policy_epoch: u64,
     routes: &'a [PolicyRoute],
+    dns: &'a DnsPolicy,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    controller_public_key: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct PolicyPayloadV2<'a> {
+    version: u8,
+    network_id: NetworkId,
+    policy_epoch: u64,
+    routes: &'a [PolicyRoute],
+    exit_nodes: &'a [ExitNode],
     dns: &'a DnsPolicy,
     issued_at_unix_seconds: u64,
     expires_at_unix_seconds: u64,
@@ -72,10 +109,14 @@ pub enum PolicyError {
     InvalidRoute,
     #[error("default routes are not supported in this stage")]
     DefaultRoute,
+    #[error("network policy uses an unsupported version")]
+    UnsupportedVersion,
     #[error("network policy assigns the same prefix more than once")]
     AmbiguousRoute,
     #[error("route gateway certificate is invalid, inactive, or unauthorized for the prefix")]
     UnauthorizedGateway,
+    #[error("exit node certificate is invalid, inactive, cross-network, or ambiguous")]
+    InvalidExitNode,
     #[error("network policy DNS settings are invalid")]
     InvalidDns,
     #[error("network policy cannot be encoded")]
@@ -87,7 +128,33 @@ impl NetworkPolicyManifest {
     pub fn sign(
         network_id: NetworkId,
         policy_epoch: u64,
+        routes: Vec<PolicyRoute>,
+        dns: DnsPolicy,
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+        signing_key: &SigningKey,
+    ) -> Result<Self, PolicyError> {
+        Self::sign_with_exit_nodes(
+            network_id,
+            policy_epoch,
+            routes,
+            Vec::new(),
+            dns,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            signing_key,
+        )
+    }
+
+    /// Signs a version 2 manifest containing controller-authorized exit
+    /// candidates. Callers must still make a local selection before a default
+    /// route can be projected onto the host.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_with_exit_nodes(
+        network_id: NetworkId,
+        policy_epoch: u64,
         mut routes: Vec<PolicyRoute>,
+        mut exit_nodes: Vec<ExitNode>,
         mut dns: DnsPolicy,
         issued_at_unix_seconds: u64,
         expires_at_unix_seconds: u64,
@@ -97,28 +164,35 @@ impl NetworkPolicyManifest {
             return Err(PolicyError::Rollback);
         }
         normalize_policy(&mut routes, &mut dns)?;
+        normalize_exit_nodes(&mut exit_nodes)?;
         let controller_public_key = signing_key.verifying_key().to_bytes().to_vec();
-        let payload = PolicyPayload {
-            version: NETWORK_POLICY_MANIFEST_VERSION,
+        let version = if exit_nodes.is_empty() {
+            NETWORK_POLICY_MANIFEST_VERSION_V1
+        } else {
+            NETWORK_POLICY_MANIFEST_VERSION
+        };
+        let payload = encoded_policy_payload(
+            version,
             network_id,
             policy_epoch,
-            routes: &routes,
-            dns: &dns,
+            &routes,
+            &exit_nodes,
+            &dns,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
-            controller_public_key: &controller_public_key,
-        };
-        let encoded = serde_json::to_vec(&payload).map_err(|_| PolicyError::EncodingFailed)?;
+            &controller_public_key,
+        )?;
         Ok(Self {
-            version: NETWORK_POLICY_MANIFEST_VERSION,
+            version,
             network_id,
             policy_epoch,
             routes,
+            exit_nodes,
             dns,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
             controller_public_key,
-            signature: signing_key.sign(&encoded).to_bytes().to_vec(),
+            signature: signing_key.sign(&payload).to_bytes().to_vec(),
         })
     }
 
@@ -132,9 +206,13 @@ impl NetworkPolicyManifest {
         now_unix_seconds: u64,
         previous_policy_epoch: Option<u64>,
     ) -> Result<(), PolicyError> {
-        if self.version != NETWORK_POLICY_MANIFEST_VERSION
-            || self.controller_public_key != trusted_controller_public_key
-        {
+        if !matches!(
+            self.version,
+            NETWORK_POLICY_MANIFEST_VERSION_V1 | NETWORK_POLICY_MANIFEST_VERSION
+        ) {
+            return Err(PolicyError::UnsupportedVersion);
+        }
+        if self.controller_public_key != trusted_controller_public_key {
             return Err(PolicyError::UntrustedController);
         }
         if self.network_id != expected_network_id || authorization.network_id != expected_network_id
@@ -157,6 +235,10 @@ impl NetworkPolicyManifest {
             return Err(PolicyError::Expired);
         }
         validate_normalized_policy(&self.routes, &self.dns)?;
+        validate_exit_nodes(&self.exit_nodes)?;
+        if self.version == NETWORK_POLICY_MANIFEST_VERSION_V1 && !self.exit_nodes.is_empty() {
+            return Err(PolicyError::UnsupportedVersion);
+        }
 
         let public_key: [u8; 32] = self
             .controller_public_key
@@ -168,17 +250,17 @@ impl NetworkPolicyManifest {
             .as_slice()
             .try_into()
             .map_err(|_| PolicyError::InvalidSignature)?;
-        let encoded = serde_json::to_vec(&PolicyPayload {
-            version: self.version,
-            network_id: self.network_id,
-            policy_epoch: self.policy_epoch,
-            routes: &self.routes,
-            dns: &self.dns,
-            issued_at_unix_seconds: self.issued_at_unix_seconds,
-            expires_at_unix_seconds: self.expires_at_unix_seconds,
-            controller_public_key: &self.controller_public_key,
-        })
-        .map_err(|_| PolicyError::EncodingFailed)?;
+        let encoded = encoded_policy_payload(
+            self.version,
+            self.network_id,
+            self.policy_epoch,
+            &self.routes,
+            &self.exit_nodes,
+            &self.dns,
+            self.issued_at_unix_seconds,
+            self.expires_at_unix_seconds,
+            &self.controller_public_key,
+        )?;
         VerifyingKey::from_bytes(&public_key)
             .map_err(|_| PolicyError::InvalidSignature)?
             .verify(&encoded, &ed25519_dalek::Signature::from_bytes(&signature))
@@ -200,6 +282,17 @@ impl NetworkPolicyManifest {
                 return Err(PolicyError::UnauthorizedGateway);
             }
         }
+        for exit_node in &self.exit_nodes {
+            let certificate = &exit_node.gateway_certificate;
+            certificate
+                .verify_from_controller(trusted_controller_public_key, now_unix_seconds)
+                .map_err(|_| PolicyError::InvalidExitNode)?;
+            if certificate.claims.network_id != expected_network_id
+                || !authorization.authorizes(certificate)
+            {
+                return Err(PolicyError::InvalidExitNode);
+            }
+        }
         Ok(())
     }
 
@@ -215,6 +308,19 @@ impl NetworkPolicyManifest {
             })
             .max_by_key(|(prefix_len, _)| *prefix_len)
             .map(|(_, gateway)| gateway)
+    }
+
+    /// Returns whether one controller-authorized exit candidate can carry the
+    /// requested address family. This deliberately says nothing about local
+    /// selection; the Agent owns that separate, user-controlled preference.
+    pub fn exit_node_supports(&self, device_id: crate::DeviceId, destination: IpAddr) -> bool {
+        self.exit_nodes.iter().any(|exit_node| {
+            exit_node.gateway_certificate.claims.device_id == device_id
+                && match destination {
+                    IpAddr::V4(_) => exit_node.supports_ipv4,
+                    IpAddr::V6(_) => exit_node.supports_ipv6,
+                }
+        })
     }
 }
 
@@ -232,6 +338,67 @@ fn normalize_policy(routes: &mut Vec<PolicyRoute>, dns: &mut DnsPolicy) -> Resul
     dns.search_domains.sort();
     dns.search_domains.dedup();
     validate_normalized_policy(routes, dns)
+}
+
+fn normalize_exit_nodes(exit_nodes: &mut Vec<ExitNode>) -> Result<(), PolicyError> {
+    exit_nodes.sort_by_key(|exit_node| exit_node.gateway_certificate.claims.device_id.0);
+    validate_exit_nodes(exit_nodes)
+}
+
+fn validate_exit_nodes(exit_nodes: &[ExitNode]) -> Result<(), PolicyError> {
+    if exit_nodes.len() > MAX_EXIT_NODES {
+        return Err(PolicyError::InvalidExitNode);
+    }
+    let mut devices = BTreeSet::new();
+    for exit_node in exit_nodes {
+        let device_id = exit_node.gateway_certificate.claims.device_id.0;
+        if (!exit_node.supports_ipv4 && !exit_node.supports_ipv6) || !devices.insert(device_id) {
+            return Err(PolicyError::InvalidExitNode);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_policy_payload(
+    version: u8,
+    network_id: NetworkId,
+    policy_epoch: u64,
+    routes: &[PolicyRoute],
+    exit_nodes: &[ExitNode],
+    dns: &DnsPolicy,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    controller_public_key: &[u8],
+) -> Result<Vec<u8>, PolicyError> {
+    match version {
+        NETWORK_POLICY_MANIFEST_VERSION_V1 if exit_nodes.is_empty() => {
+            serde_json::to_vec(&PolicyPayloadV1 {
+                version,
+                network_id,
+                policy_epoch,
+                routes,
+                dns,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+                controller_public_key,
+            })
+            .map_err(|_| PolicyError::EncodingFailed)
+        }
+        NETWORK_POLICY_MANIFEST_VERSION => serde_json::to_vec(&PolicyPayloadV2 {
+            version,
+            network_id,
+            policy_epoch,
+            routes,
+            exit_nodes,
+            dns,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            controller_public_key,
+        })
+        .map_err(|_| PolicyError::EncodingFailed),
+        _ => Err(PolicyError::UnsupportedVersion),
+    }
 }
 
 fn validate_normalized_policy(routes: &[PolicyRoute], dns: &DnsPolicy) -> Result<(), PolicyError> {
@@ -504,6 +671,96 @@ mod tests {
                 &signing
             ),
             Err(PolicyError::InvalidDns)
+        );
+    }
+
+    #[test]
+    fn signed_exit_candidates_are_versioned_authorized_and_not_default_routes() {
+        let (signing, network_id, certificate, authorization) = fixture(vec![]);
+        let legacy = NetworkPolicyManifest::sign(
+            network_id,
+            1,
+            vec![],
+            DnsPolicy::default(),
+            10,
+            100,
+            &signing,
+        )
+        .unwrap();
+        assert_eq!(legacy.version, NETWORK_POLICY_MANIFEST_VERSION_V1);
+        assert!(legacy.exit_nodes.is_empty());
+
+        let policy = NetworkPolicyManifest::sign_with_exit_nodes(
+            network_id,
+            2,
+            vec![],
+            vec![ExitNode {
+                gateway_certificate: certificate.clone(),
+                supports_ipv4: true,
+                supports_ipv6: false,
+            }],
+            DnsPolicy::default(),
+            10,
+            100,
+            &signing,
+        )
+        .unwrap();
+        assert_eq!(policy.version, NETWORK_POLICY_MANIFEST_VERSION);
+        assert_eq!(
+            policy.verify_for_network(
+                network_id,
+                &signing.verifying_key().to_bytes(),
+                &authorization,
+                20,
+                Some(1),
+            ),
+            Ok(())
+        );
+        assert!(
+            policy.exit_node_supports(certificate.claims.device_id, "203.0.113.9".parse().unwrap())
+        );
+        assert!(!policy
+            .exit_node_supports(certificate.claims.device_id, "2001:db8::9".parse().unwrap()));
+        assert_eq!(
+            NetworkPolicyManifest::sign_with_exit_nodes(
+                network_id,
+                2,
+                vec![],
+                vec![ExitNode {
+                    gateway_certificate: certificate.clone(),
+                    supports_ipv4: false,
+                    supports_ipv6: false,
+                }],
+                DnsPolicy::default(),
+                10,
+                100,
+                &signing,
+            ),
+            Err(PolicyError::InvalidExitNode)
+        );
+        assert_eq!(
+            NetworkPolicyManifest::sign_with_exit_nodes(
+                network_id,
+                2,
+                vec![],
+                vec![
+                    ExitNode {
+                        gateway_certificate: certificate.clone(),
+                        supports_ipv4: true,
+                        supports_ipv6: false,
+                    },
+                    ExitNode {
+                        gateway_certificate: certificate,
+                        supports_ipv4: false,
+                        supports_ipv6: true,
+                    },
+                ],
+                DnsPolicy::default(),
+                10,
+                100,
+                &signing,
+            ),
+            Err(PolicyError::InvalidExitNode)
         );
     }
 }
