@@ -22,7 +22,10 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::net::UdpSocket;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -31,6 +34,11 @@ struct Cli {
     /// Public listener. Keep the loopback default for development.
     #[arg(long, default_value = "127.0.0.1:51820")]
     bind: SocketAddr,
+    /// Optional framed TCP transport that proxies into this Relay's local UDP
+    /// listener. The encrypted overlay frame format and signed membership
+    /// registration remain unchanged; TLS is configured separately.
+    #[arg(long)]
+    tcp_bind: Option<SocketAddr>,
     /// Base64 Ed25519 controller public key distributed through a trusted channel.
     #[arg(long)]
     controller_public_key_base64: String,
@@ -52,6 +60,7 @@ type PeerKey = (NetworkId, DeviceId);
 const PEER_TTL: Duration = Duration::from_secs(90);
 const REGISTRATION_NONCE_TTL: Duration = Duration::from_secs(300);
 const MAX_CANDIDATES_PER_PEER: usize = 16;
+const MAX_TCP_FRAME_BYTES: usize = u16::MAX as usize;
 
 #[derive(Debug, Clone)]
 struct PeerRecord {
@@ -112,6 +121,18 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind(cli.bind).await?;
     println!("MeshLake relay listening on udp://{}", cli.bind);
     println!("The relay forwards encrypted payloads only.");
+    if let Some(tcp_bind) = cli.tcp_bind {
+        let udp_target = local_udp_proxy_target(cli.bind, socket.local_addr()?);
+        let listener = TcpListener::bind(tcp_bind)
+            .await
+            .with_context(|| format!("cannot bind MeshLake TCP relay proxy at {tcp_bind}"))?;
+        println!("MeshLake TCP relay proxy listening on tcp://{tcp_bind}");
+        tokio::spawn(async move {
+            if let Err(error) = run_tcp_proxy_listener(listener, udp_target).await {
+                eprintln!("MeshLake TCP relay proxy stopped: {error:#}");
+            }
+        });
+    }
 
     let mut peers: HashMap<PeerKey, PeerRecord> = HashMap::new();
     let mut seen_nonces = HashMap::<(NetworkId, DeviceId, [u8; 16]), Instant>::new();
@@ -142,6 +163,97 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
+}
+
+/// TCP is only a transport envelope. Every frame is handed to the existing
+/// local UDP relay, which remains the sole verifier of signed registrations
+/// and the sole router for opaque overlay ciphertext.
+async fn run_tcp_proxy_listener(listener: TcpListener, udp_target: SocketAddr) -> Result<()> {
+    loop {
+        let (stream, remote) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(error) = proxy_tcp_connection(stream, udp_target).await {
+                trace_transport(format!("TCP relay proxy client {remote} closed: {error:#}"));
+            }
+        });
+    }
+}
+
+async fn proxy_tcp_connection(stream: TcpStream, udp_target: SocketAddr) -> Result<()> {
+    let bind = if udp_target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind)
+        .await
+        .context("cannot create a local UDP socket for TCP relay proxy")?;
+    let (mut reader, mut writer) = stream.into_split();
+    let mut tcp_incoming = vec![0_u8; MAX_TCP_FRAME_BYTES];
+    let mut udp_incoming = vec![0_u8; MAX_TCP_FRAME_BYTES];
+    loop {
+        tokio::select! {
+            frame = read_tcp_frame(&mut reader, &mut tcp_incoming) => {
+                let Some(frame) = frame? else { return Ok(()); };
+                socket.send_to(frame, udp_target).await?;
+            }
+            received = socket.recv_from(&mut udp_incoming) => {
+                let (size, source) = received?;
+                if source != udp_target {
+                    continue;
+                }
+                write_tcp_frame(&mut writer, &udp_incoming[..size]).await?;
+            }
+        }
+    }
+}
+
+async fn read_tcp_frame<'a>(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    buffer: &'a mut Vec<u8>,
+) -> Result<Option<&'a [u8]>> {
+    let mut length = [0_u8; 4];
+    match reader.read_exact(&mut length).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_TCP_FRAME_BYTES {
+        bail!("TCP relay frame length {length} is outside the accepted range");
+    }
+    buffer.resize(length, 0);
+    reader.read_exact(buffer).await?;
+    Ok(Some(buffer.as_slice()))
+}
+
+async fn write_tcp_frame(writer: &mut tokio::net::tcp::OwnedWriteHalf, frame: &[u8]) -> Result<()> {
+    if frame.is_empty() || frame.len() > MAX_TCP_FRAME_BYTES {
+        bail!(
+            "TCP relay frame length {} is outside the accepted range",
+            frame.len()
+        );
+    }
+    writer
+        .write_all(&(frame.len() as u32).to_be_bytes())
+        .await?;
+    writer.write_all(frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn local_udp_proxy_target(configured: SocketAddr, actual: SocketAddr) -> SocketAddr {
+    if !configured.ip().is_unspecified() {
+        return configured;
+    }
+    SocketAddr::new(
+        if actual.is_ipv4() {
+            "127.0.0.1".parse().expect("literal IPv4 loopback")
+        } else {
+            "::1".parse().expect("literal IPv6 loopback")
+        },
+        actual.port(),
+    )
 }
 
 async fn handle_packet(
@@ -552,6 +664,48 @@ mod tests {
             next: None,
             _identity_guards: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_proxy_forwards_only_length_framed_relay_payloads() {
+        let udp_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_address = tcp_listener.local_addr().unwrap();
+        let relay_address = udp_relay.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let _ = run_tcp_proxy_listener(tcp_listener, relay_address).await;
+        });
+
+        let stream = TcpStream::connect(tcp_address).await.unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+        let outbound = vec![0x4d, 0x4c, 0x4b, 0x45, RELAY_DATA, 7, 8, 9];
+        write_tcp_frame(&mut writer, &outbound).await.unwrap();
+
+        let mut relay_buffer = vec![0_u8; MAX_TCP_FRAME_BYTES];
+        let (received, proxy_udp_address) = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_relay.recv_from(&mut relay_buffer),
+        )
+        .await
+        .expect("TCP proxy did not forward the frame")
+        .unwrap();
+        assert_eq!(&relay_buffer[..received], outbound.as_slice());
+        udp_relay
+            .send_to(&relay_buffer[..received], proxy_udp_address)
+            .await
+            .unwrap();
+
+        let mut client_buffer = vec![0_u8; MAX_TCP_FRAME_BYTES];
+        let returned = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_tcp_frame(&mut reader, &mut client_buffer),
+        )
+        .await
+        .expect("TCP proxy did not return the relay response")
+        .unwrap()
+        .unwrap();
+        assert_eq!(returned, outbound.as_slice());
+        proxy.abort();
     }
 
     async fn handle_packet(
