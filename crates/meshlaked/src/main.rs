@@ -1107,6 +1107,7 @@ impl Agent {
         authorization
             .verify_from_controller(&joined.control_plane.pinned_controller_public_key, now())?;
         let previous = joined.control_plane.policy_manifest.clone();
+        let previous_exit_selection = joined.control_plane.exit_node_selection.clone();
         if let Some(previous) = &previous {
             if policy.policy_epoch < previous.policy_epoch
                 || (policy.policy_epoch == previous.policy_epoch
@@ -1130,10 +1131,21 @@ impl Agent {
             return Ok(());
         }
         state.networks[index].control_plane.policy_manifest = Some(policy);
+        let exit_selection_cleared = clear_unusable_exit_selection(&mut state.networks[index]);
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
         if let Err(error) = self.adapter.configure_policy(&networks) {
+            if exit_selection_cleared {
+                // A verified controller policy just withdrew a selected exit.
+                // Never restore the old default route while trying to recover
+                // from a platform failure; keep the new policy and disable the
+                // adapter so traffic cannot continue through a revoked exit.
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "policy withdrew a selected exit gateway but platform policy application failed: {error:#}; adapter was disabled fail closed"
+                );
+            }
             let mut state = self.state.write().await;
             if let Some(joined) = state
                 .networks
@@ -1141,6 +1153,7 @@ impl Agent {
                 .find(|joined| joined.network.id == network_id)
             {
                 joined.control_plane.policy_manifest = previous;
+                joined.control_plane.exit_node_selection = previous_exit_selection;
             }
             write_state_with_protection(&self.path, &state, &self.state_protection)?;
             let rollback_networks = state.networks.clone();
@@ -1584,6 +1597,45 @@ fn validate_exit_selection(
         }
     }
     Ok(())
+}
+
+/// Removes only the local portions of an exit preference that a newly verified
+/// policy no longer authorizes. Controller policy is authoritative for
+/// candidates; retaining a revoked local choice would otherwise make a later
+/// adapter retry restore an obsolete default route.
+fn clear_unusable_exit_selection(joined: &mut JoinedNetwork) -> bool {
+    let policy = joined.control_plane.policy_manifest.clone();
+    let selection = &mut joined.control_plane.exit_node_selection;
+    let Some(policy) = policy.as_ref() else {
+        let changed = !selection.is_empty();
+        *selection = ExitNodeSelection::default();
+        return changed;
+    };
+    let mut changed = false;
+    if selection.ipv4_gateway.is_some_and(|gateway| {
+        !policy.exit_node_supports(
+            gateway,
+            "192.0.2.1".parse().expect("literal IPv4 exit probe"),
+        )
+    }) {
+        selection.ipv4_gateway = None;
+        changed = true;
+    }
+    if selection.ipv6_gateway.is_some_and(|gateway| {
+        !policy.exit_node_supports(
+            gateway,
+            "2001:db8::1".parse().expect("literal IPv6 exit probe"),
+        )
+    }) {
+        selection.ipv6_gateway = None;
+        changed = true;
+    }
+    if selection.ipv4_gateway.is_none() && selection.ipv6_gateway.is_none() && selection.kill_switch
+    {
+        selection.kill_switch = false;
+        changed = true;
+    }
+    changed
 }
 
 fn activate_adapter_transaction<E>(
@@ -6043,6 +6095,18 @@ mod tests {
         )
         .is_err());
         assert!(validate_exit_selection(&network, &ExitNodeSelection::default()).is_ok());
+    }
+
+    #[test]
+    fn unusable_exit_selection_is_cleared_with_its_kill_switch() {
+        let mut network = test_joined_network();
+        network.control_plane.exit_node_selection = ExitNodeSelection {
+            ipv4_gateway: Some(DeviceId(Uuid::from_u128(901))),
+            ipv6_gateway: None,
+            kill_switch: true,
+        };
+        assert!(clear_unusable_exit_selection(&mut network));
+        assert!(network.control_plane.exit_node_selection.is_empty());
     }
 
     #[test]
