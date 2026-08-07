@@ -1,5 +1,6 @@
 mod adapter;
 mod data_plane;
+mod exit_gateway;
 mod port_mapping;
 mod session_observability;
 mod state_backup_command;
