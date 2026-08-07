@@ -588,7 +588,9 @@ impl Agent {
     }
 
     async fn configure_relay(&self, config: RelayConfig) -> Result<(), ApiError> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
+        let previous = state.clone();
         state.relay_endpoint = Some(config.endpoint);
         state.relay_endpoints = vec![config.endpoint];
         state.upnp_enabled = config.enable_upnp;
@@ -599,9 +601,24 @@ impl Agent {
             .filter(|server| !server.is_empty())
             .take(8)
             .collect();
+        let kill_switch_plan =
+            kill_switch_plan_from_state(&state).map_err(ApiError::bad_request)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
         drop(state);
+        if self.adapter.is_active() {
+            if let Err(error) = self.adapter.configure_kill_switch(kill_switch_plan) {
+                let mut state = self.state.write().await;
+                *state = previous;
+                write_state_with_protection(&self.path, &state, &self.state_protection)
+                    .map_err(ApiError::internal)?;
+                drop(state);
+                self.adapter.deactivate();
+                return Err(ApiError::internal(format!(
+                    "relay bootstrap update could not reconcile the exit kill switch: {error:#}; configuration was restored and the adapter was disabled fail closed"
+                )));
+            }
+        }
         self.request_transport_reload();
         Ok(())
     }
