@@ -1036,6 +1036,7 @@ impl Agent {
 
         let reload_transport;
         let mut removed_network = None;
+        let previous_exit_gateways = state.exit_gateways.clone();
         match action {
             AuthorizationRefreshAction::UpdateManifest(authorization) => {
                 let previous = state.networks[index]
@@ -1090,7 +1091,16 @@ impl Agent {
                 }
             }
         }
+        let exit_selection_cleared =
+            removed_network.is_none() && clear_unusable_exit_selection(&mut state.networks[index]);
+        let gateway_networks = state.networks.clone();
+        let local_device = state.device_id;
+        let exit_gateways_cleared =
+            clear_unusable_exit_gateways(&mut state.exit_gateways, &gateway_networks, local_device);
+        let exit_gateway_plan =
+            ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
+        let networks = state.networks.clone();
         drop(state);
 
         if reload_transport {
@@ -1099,16 +1109,48 @@ impl Agent {
             self.request_transport_reload();
         }
         if let Some(removed_network) = removed_network {
-            self.adapter.remove_network(&removed_network)?;
-            let networks = self.state.read().await.networks.clone();
-            self.adapter.configure_policy(&networks)?;
+            if let Err(error) = self.adapter.remove_network(&removed_network) {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "controller revoked network {} but adapter address cleanup failed: {error:#}; adapter was disabled fail closed",
+                    removed_network.network.id.0
+                );
+            }
+            if let Err(error) = self.adapter.configure_policy(&networks) {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "controller revoked network {} but policy cleanup failed: {error:#}; adapter was disabled fail closed",
+                    removed_network.network.id.0
+                );
+            }
             eprintln!(
                 "MeshLake network {} was revoked by its controller and has been disabled",
                 removed_network.network.id.0
             );
         } else if reload_transport && self.adapter.is_active() {
-            let networks = self.state.read().await.networks.clone();
-            self.adapter.configure_networks(&networks)?;
+            if let Err(error) = self.adapter.configure_networks(&networks) {
+                if exit_selection_cleared || exit_gateways_cleared {
+                    self.adapter.deactivate();
+                    anyhow::bail!(
+                        "authorization update withdrew exit privileges but platform policy cleanup failed: {error:#}; adapter was disabled fail closed"
+                    );
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+            if exit_gateways_cleared {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "authorization update withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                );
+            }
+            let mut state = self.state.write().await;
+            state.exit_gateways = previous_exit_gateways;
+            write_state_with_protection(&self.path, &state, &self.state_protection)?;
+            return Err(anyhow::anyhow!(
+                "could not apply local exit-gateway rules after authorization update: {error:#}; persisted local gateway configuration was restored"
+            ));
         }
         Ok(())
     }
@@ -2834,6 +2876,17 @@ fn migrate_and_validate_agent_state(state: &mut PersistedState) -> Result<bool> 
     if discard_invalid_persisted_policies(state, now()) {
         changed = true;
     }
+    for joined in &mut state.networks {
+        if clear_unusable_exit_selection(joined) {
+            changed = true;
+        }
+    }
+    if clear_unusable_exit_gateways(&mut state.exit_gateways, &state.networks, state.device_id) {
+        changed = true;
+    }
+    ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks).context(
+        "agent state contains an invalid local exit-gateway configuration; refusing to restore platform forwarding",
+    )?;
     if state.schema_version < AGENT_STATE_SCHEMA_VERSION {
         state.schema_version = AGENT_STATE_SCHEMA_VERSION;
         changed = true;
