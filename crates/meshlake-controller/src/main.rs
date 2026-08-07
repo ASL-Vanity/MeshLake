@@ -20,7 +20,7 @@ use meshlake_core::{
     write_protected_state_file_with, AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse,
     ExitNode, MembershipCertificate, MembershipClaims, MembershipRefreshRequest,
     MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId, NetworkKey,
-    NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PolicyRoute,
+    NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PlanetTlsRelay, PolicyRoute,
     ServiceIdentityPolicy, StateFileLock, StateKeyProvider, StateProtection, UpsertNetworkRequest,
     VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
@@ -106,6 +106,9 @@ struct Cli {
     /// RELAY_UUID@CURRENT_KEY_BASE64@NEXT_KEY_BASE64@NOT_BEFORE@NOT_AFTER@IP:PORT.
     #[arg(long = "planet-relay-identity", value_parser = parse_planet_relay_identity)]
     planet_relay_identities: Vec<PlanetRelay>,
+    /// Planet V4 TLS relay: RELAY_UUID@IP:PORT@SERVER_NAME@BASE64_SHA256_CERT_PIN.
+    #[arg(long = "planet-tls-relay", value_parser = parse_planet_tls_relay)]
+    planet_tls_relays: Vec<PlanetTlsRelay>,
     /// Root descriptor in BASE64_PUBLIC_KEY@IP:PORT form. Repeat for multiple roots.
     #[arg(long = "planet-root", value_parser = parse_planet_root)]
     planet_roots: Vec<PlanetRoot>,
@@ -259,6 +262,7 @@ struct PlanetSettings {
     tls_client_ca_pem: Option<String>,
     roots: Vec<PlanetRoot>,
     relays: Vec<PlanetRelay>,
+    tls_relays: Vec<PlanetTlsRelay>,
     stun_servers: Vec<String>,
 }
 
@@ -802,7 +806,18 @@ impl Controller {
         };
         let state = self.state.read().await;
         let signing_key = signing_key(&state)?;
-        let manifest = if planet.version == 3 {
+        let manifest = if planet.version == 4 {
+            PlanetManifest::sign_v4(
+                planet.controller_url.clone(),
+                planet.roots.clone(),
+                planet.relays.clone(),
+                planet.tls_relays.clone(),
+                planet.stun_servers.clone(),
+                now(),
+                None,
+                &signing_key,
+            )?
+        } else if planet.version == 3 {
             PlanetManifest::sign_v3(
                 planet.controller_url.clone(),
                 planet.roots.clone(),
@@ -1476,6 +1491,9 @@ async fn main() -> Result<()> {
         anyhow::bail!("legacy --planet-root cannot be mixed with Planet V3 Root identities");
     }
     let uses_planet_v3 = !cli.planet_relay_identities.is_empty();
+    if !cli.planet_tls_relays.is_empty() && !uses_planet_v3 {
+        anyhow::bail!("--planet-tls-relay requires Planet V3 Relay identities");
+    }
     if uses_planet_v3 && !cli.planet_roots.is_empty()
         || !uses_planet_v3 && !cli.planet_root_identities.is_empty()
     {
@@ -1487,7 +1505,7 @@ async fn main() -> Result<()> {
         !cli.planet_relay_endpoints.is_empty() || !cli.planet_relay_identities.is_empty();
     let planet = match (cli.planet_controller_url, has_relays) {
         (Some(controller_url), true) => Some(PlanetSettings {
-            version: if uses_planet_v3 { 3 } else { 2 },
+            version: if !cli.planet_tls_relays.is_empty() { 4 } else if uses_planet_v3 { 3 } else { 2 },
             controller_url: validate_controller_url(
                 &controller_url,
                 cli.allow_insecure_public_http,
@@ -1524,6 +1542,7 @@ async fn main() -> Result<()> {
                 relay
             })
             .collect(),
+            tls_relays: cli.planet_tls_relays,
             stun_servers: cli
                 .planet_stun_servers
                 .into_iter()
@@ -1773,6 +1792,34 @@ fn parse_planet_relay_identity(value: &str) -> Result<PlanetRelay, String> {
     })
 }
 
+fn parse_planet_tls_relay(value: &str) -> Result<PlanetTlsRelay, String> {
+    let parts = value.split('@').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err(
+            "TLS relay must use RELAY_UUID@IP:PORT@SERVER_NAME@BASE64_SHA256_CERT_PIN".into(),
+        );
+    }
+    let relay_id = parts[0]
+        .parse::<Uuid>()
+        .map_err(|_| "TLS relay UUID is invalid".to_string())?;
+    let endpoint = parts[1]
+        .parse::<SocketAddr>()
+        .map_err(|_| "TLS relay endpoint must be a numeric IP:PORT socket address".to_string())?;
+    let certificate_sha256 = STANDARD
+        .decode(parts[3])
+        .map_err(|_| "TLS relay certificate pin is not valid Base64".to_string())?;
+    if certificate_sha256.len() != 32 {
+        return Err("TLS relay certificate pin must contain exactly 32 bytes".into());
+    }
+    Ok(PlanetTlsRelay {
+        relay_id,
+        endpoint,
+        server_name: parts[2].into(),
+        certificate_sha256,
+        priority: 0,
+    })
+}
+
 fn parse_planet_root_identity(value: &str) -> Result<PlanetRoot, String> {
     let (identity, endpoint) = parse_service_identity_descriptor(value)?;
     Ok(PlanetRoot {
@@ -1894,6 +1941,7 @@ mod tests {
             planet_controller_url: None,
             planet_relay_endpoints: Vec::new(),
             planet_relay_identities: Vec::new(),
+            planet_tls_relays: Vec::new(),
             planet_roots: Vec::new(),
             planet_root_identities: Vec::new(),
             planet_stun_servers: Vec::new(),
