@@ -33,7 +33,7 @@ use meshlake_core::{
     InitiatorHandshake, JoinedNetwork, MembershipCertificate, MembershipRefreshRequest,
     MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkControlPlane, NetworkId,
     NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest,
-    PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration,
+    PlanetRelay, PlanetRoot, PlanetTlsRelay, RelayPolicy, ReplayWindow, RootRegistration,
     RootRegistrationServiceKind, RootResponse, ServiceIdentityPolicy, SessionList, SessionPath,
     SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRelayRegistrationAck,
     SignedRootResponse, StateFileLock, StateKeyProvider, StateProtection, TransportStatus,
@@ -340,6 +340,7 @@ struct VerifiedPlanetUpdate {
     controller_url: String,
     roots: Vec<PlanetRoot>,
     relays: Vec<PlanetRelay>,
+    tls_relays: Vec<PlanetTlsRelay>,
     stun_servers: Vec<String>,
 }
 
@@ -2181,6 +2182,8 @@ fn validate_planet_update(
             identity: None,
         });
     }
+    let mut tls_relays = manifest.tls_relays.clone();
+    tls_relays.sort_by_key(|relay| relay.priority);
     let mut stun_servers = manifest
         .stun_servers
         .iter()
@@ -2198,6 +2201,7 @@ fn validate_planet_update(
         controller_url,
         roots,
         relays,
+        tls_relays,
         stun_servers,
     })
 }
@@ -2268,6 +2272,7 @@ fn apply_planet_update(
         || control_plane.controller_url.as_deref() != Some(update.controller_url.as_str())
         || control_plane.verified_roots != update.roots
         || control_plane.verified_relays != update.relays
+        || control_plane.verified_tls_relays != update.tls_relays
         || control_plane.verified_stun_servers != update.stun_servers;
     control_plane.planet_manifest_url = manifest_url;
     control_plane.planet_manifest_version = Some(update.version);
@@ -2277,6 +2282,7 @@ fn apply_planet_update(
     control_plane.controller_url = Some(update.controller_url.clone());
     control_plane.verified_roots = update.roots.clone();
     control_plane.verified_relays = update.relays.clone();
+    control_plane.verified_tls_relays = update.tls_relays.clone();
     control_plane.verified_stun_servers = update.stun_servers.clone();
     changed
 }

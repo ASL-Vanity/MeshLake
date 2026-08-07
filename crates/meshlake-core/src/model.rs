@@ -103,6 +103,9 @@ pub struct NetworkControlPlane {
     /// Relays copied from a verified Planet manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_relays: Vec<crate::crypto::PlanetRelay>,
+    /// TLS relay endpoints copied from a verified Planet V4 manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_tls_relays: Vec<crate::crypto::PlanetTlsRelay>,
     /// STUN server names copied from a verified Planet manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_stun_servers: Vec<String>,
@@ -132,6 +135,7 @@ impl NetworkControlPlane {
             && self.planet_semantic_digest.is_empty()
             && self.verified_roots.is_empty()
             && self.verified_relays.is_empty()
+            && self.verified_tls_relays.is_empty()
             && self.verified_stun_servers.is_empty()
             && self.authorization_manifest.is_none()
             && self.policy_manifest.is_none()
@@ -381,6 +385,7 @@ mod tests {
                     priority: 20,
                     identity: None,
                 }],
+                verified_tls_relays: Vec::new(),
                 verified_stun_servers: vec!["stun.example:3478".into()],
                 authorization_manifest: Some(NetworkAuthorizationManifest {
                     version: 1,
