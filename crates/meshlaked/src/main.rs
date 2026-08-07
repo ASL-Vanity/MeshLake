@@ -3372,7 +3372,13 @@ async fn shutdown_agent(State(agent): State<Arc<Agent>>) -> StatusCode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = cli.state_file.clone().unwrap_or_else(default_state_path);
+    let autostart_install = matches!(
+        cli.command.as_ref(),
+        Some(Command::Autostart {
+            command: AutostartCommand::Install
+        })
+    );
+    let path = select_state_path(cli.state_file.clone(), autostart_install);
     let wintun_dll = cli
         .wintun_dll
         .clone()
@@ -3671,6 +3677,27 @@ fn default_state_path() -> PathBuf {
         .join("state")
         .join("meshlake")
         .join("agent.json")
+}
+
+fn default_autostart_state_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/var/lib/meshlake/agent.json")
+    }
+    #[cfg(windows)]
+    {
+        default_state_path()
+    }
+}
+
+fn select_state_path(explicit_path: Option<PathBuf>, autostart_install: bool) -> PathBuf {
+    explicit_path.unwrap_or_else(|| {
+        if autostart_install {
+            default_autostart_state_path()
+        } else {
+            default_state_path()
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -6359,6 +6386,21 @@ mod tests {
         NetworkPolicyManifest, PolicyRoute, RelayPolicy, RootPeer,
     };
     use std::cell::Cell;
+
+    #[test]
+    fn explicit_state_path_wins_over_autostart_default() {
+        let explicit = PathBuf::from("/opt/meshlake/custom-agent.json");
+        assert_eq!(select_state_path(Some(explicit.clone()), true), explicit,);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_autostart_defaults_to_system_state_directory() {
+        assert_eq!(
+            select_state_path(None, true),
+            PathBuf::from("/var/lib/meshlake/agent.json"),
+        );
+    }
 
     #[test]
     fn adapter_activation_failure_skips_configuration_and_rollback() {

@@ -53,7 +53,7 @@ sudo ./meshlaked autostart install
 ./meshlaked autostart status
 ```
 
-安装器创建 `/etc/systemd/system/meshlaked.service`，状态文件位于 `/var/lib/meshlake/agent.json`，服务异常退出后等待 3 秒重启。状态文件包含设备私钥和网络密钥，代理会在 Linux 上强制设置为 `0600`。
+未显式传入 `--state-file` 时，安装器创建 `/etc/systemd/system/meshlaked.service`，并将状态固定在 `/var/lib/meshlake/agent.json`（由 `StateDirectory=meshlake` 创建）；显式传入 `--state-file` 时则保留该绝对路径。服务异常退出后等待 3 秒重启。状态文件包含设备私钥和网络密钥，代理会在 Linux 上强制设置为 `0600`。
 
 卸载服务：
 
