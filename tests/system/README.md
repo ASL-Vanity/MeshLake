@@ -78,3 +78,4 @@ The declarative scenarios preserve these invariants:
 - revocation, identity changes, transport revision changes, and daemon restarts
   invalidate observations from the old security context.
 - destructive and fault actions target only assigned disposable lab hosts.
+- `tls-relay-fallback` covers direct UDP, authenticated UDP Relay and then Planet V4 pinned TLS Relay. The simulator verifies orchestration only; real validation must still verify certificate pin rejection, TCP/TLS framing, IPv4/IPv6 and cleanup.

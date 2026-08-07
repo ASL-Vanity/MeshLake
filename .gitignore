@@ -39,6 +39,10 @@ relay-config.json
 *.log
 *.tmp
 
+# Python test artifacts
+__pycache__/
+*.py[cod]
+
 # Operating-system files
 Thumbs.db
 Desktop.ini
