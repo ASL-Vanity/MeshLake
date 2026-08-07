@@ -26,18 +26,18 @@ use meshlake_core::{
     accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state_with,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
     restrict_state_file_permissions, session_handshake_id, write_protected_state_file_with,
-    AgentStatus, AuthorizationEpochHint, DeviceId, EnrollmentResponse, InitiatorHandshake,
-    JoinedNetwork, MembershipCertificate, MembershipRefreshRequest, MembershipRefreshResponse,
-    NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkKey,
-    NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest, PlanetRelay,
-    PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration, RootRegistrationServiceKind,
-    RootResponse, ServiceIdentityPolicy, SessionList, SessionPath, SessionQueueCounters,
-    SessionSecurityCounters, SessionState, SignedRelayRegistrationAck, SignedRootResponse,
-    StateFileLock, StateKeyProvider, StateProtection, TransportStatus, UpsertNetworkRequest,
-    VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
-    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
-    RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
-    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    AgentStatus, AuthorizationEpochHint, DeviceId, EnrollmentResponse, ExitNodeSelection,
+    InitiatorHandshake, JoinedNetwork, MembershipCertificate, MembershipRefreshRequest,
+    MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkControlPlane, NetworkId,
+    NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest,
+    PlanetRelay, PlanetRoot, RelayPolicy, ReplayWindow, RootRegistration,
+    RootRegistrationServiceKind, RootResponse, ServiceIdentityPolicy, SessionList, SessionPath,
+    SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRelayRegistrationAck,
+    SignedRootResponse, StateFileLock, StateKeyProvider, StateProtection, TransportStatus,
+    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
+    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
+    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED,
+    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -208,6 +208,28 @@ struct PlanetConfig {
     controller_public_key_base64: String,
     #[serde(default)]
     tls_ca_certificate_pem: Option<String>,
+}
+
+/// A local, explicit exit-node choice. Controller policy advertises the
+/// candidates; it never supplies this request or enables an exit by itself.
+#[derive(Debug, Deserialize)]
+struct ExitSelectionConfig {
+    #[serde(default)]
+    ipv4_gateway: Option<DeviceId>,
+    #[serde(default)]
+    ipv6_gateway: Option<DeviceId>,
+    #[serde(default)]
+    kill_switch: bool,
+}
+
+impl From<ExitSelectionConfig> for ExitNodeSelection {
+    fn from(config: ExitSelectionConfig) -> Self {
+        Self {
+            ipv4_gateway: config.ipv4_gateway,
+            ipv6_gateway: config.ipv6_gateway,
+            kill_switch: config.kill_switch,
+        }
+    }
 }
 
 impl PersistedState {
@@ -566,6 +588,57 @@ impl Agent {
             .map_err(ApiError::internal)?;
         drop(state);
         self.request_transport_reload();
+        Ok(())
+    }
+
+    async fn configure_exit_selection(
+        &self,
+        network_id: NetworkId,
+        selection: ExitNodeSelection,
+    ) -> Result<(), ApiError> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        let mut state = self.state.write().await;
+        let index = state
+            .networks
+            .iter()
+            .position(|joined| joined.network.id == network_id)
+            .ok_or_else(|| ApiError::not_found("network does not exist"))?;
+        validate_exit_selection(&state.networks[index], &selection)?;
+        let previous = state.networks[index]
+            .control_plane
+            .exit_node_selection
+            .clone();
+        if previous == selection {
+            return Ok(());
+        }
+        state.networks[index].control_plane.exit_node_selection = selection;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
+        let networks = state.networks.clone();
+        drop(state);
+        if let Err(error) = self.adapter.configure_policy(&networks) {
+            let mut state = self.state.write().await;
+            if let Some(joined) = state
+                .networks
+                .iter_mut()
+                .find(|joined| joined.network.id == network_id)
+            {
+                joined.control_plane.exit_node_selection = previous;
+            }
+            write_state_with_protection(&self.path, &state, &self.state_protection)
+                .map_err(ApiError::internal)?;
+            let rollback_networks = state.networks.clone();
+            drop(state);
+            if let Err(rollback_error) = self.adapter.configure_policy(&rollback_networks) {
+                self.adapter.deactivate();
+                return Err(ApiError::internal(format!(
+                    "exit selection was rejected by the platform: {error:#}; persisted selection was restored but policy rollback also failed: {rollback_error:#}; adapter was disabled fail closed"
+                )));
+            }
+            return Err(ApiError::bad_request(format!(
+                "exit selection was rejected by the platform and the previous policy was restored: {error:#}"
+            )));
+        }
         Ok(())
     }
 
@@ -1445,6 +1518,72 @@ fn same_policy_semantics(left: &NetworkPolicyManifest, right: &NetworkPolicyMani
                     && left.supports_ipv4 == right.supports_ipv4
                     && left.supports_ipv6 == right.supports_ipv6
             })
+}
+
+fn validate_exit_selection(
+    joined: &JoinedNetwork,
+    selection: &ExitNodeSelection,
+) -> Result<(), ApiError> {
+    if selection.kill_switch && selection.ipv4_gateway.is_none() && selection.ipv6_gateway.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "an exit kill switch requires an IPv4 or IPv6 exit gateway selection",
+        ));
+    }
+    if selection.is_empty() {
+        return Ok(());
+    }
+    let policy = joined
+        .control_plane
+        .policy_manifest
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request("fetch a signed network policy before selecting an exit")
+        })?;
+    let authorization = joined
+        .control_plane
+        .authorization_manifest
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request("fetch current member authorization before selecting an exit")
+        })?;
+    policy
+        .verify_for_network(
+            joined.network.id,
+            &joined.control_plane.pinned_controller_public_key,
+            authorization,
+            now(),
+            None,
+        )
+        .map_err(|_| {
+            ApiError::bad_request(
+                "the signed exit policy is invalid, expired, or no longer authorized",
+            )
+        })?;
+    for (gateway, probe) in [
+        (
+            selection.ipv4_gateway,
+            "192.0.2.1"
+                .parse()
+                .expect("literal IPv4 exit-selection probe"),
+        ),
+        (
+            selection.ipv6_gateway,
+            "2001:db8::1"
+                .parse()
+                .expect("literal IPv6 exit-selection probe"),
+        ),
+    ] {
+        let Some(gateway) = gateway else {
+            continue;
+        };
+        if !policy.exit_node_supports(gateway, probe) {
+            return Err(ApiError::bad_request(
+                "the selected device is not an authorized exit gateway for this address family",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn activate_adapter_transaction<E>(
@@ -2452,6 +2591,16 @@ async fn configure_planet(
     agent.configure_planet(config).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+async fn configure_exit_selection(
+    State(agent): State<Arc<Agent>>,
+    Path(id): Path<Uuid>,
+    Json(config): Json<ExitSelectionConfig>,
+) -> Result<StatusCode, ApiError> {
+    agent
+        .configure_exit_selection(NetworkId(id), config.into())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 async fn leave_network(
     State(agent): State<Arc<Agent>>,
     Path(id): Path<Uuid>,
@@ -2555,6 +2704,10 @@ async fn main() -> Result<()> {
         .route("/v1/networks", get(list_networks).post(create_network))
         .route("/v1/networks/enroll", post(enroll_network))
         .route("/v1/networks/{id}", delete(leave_network))
+        .route(
+            "/v1/networks/{id}/exit-selection",
+            post(configure_exit_selection),
+        )
         .route("/v1/relay", post(configure_relay))
         .route("/v1/planet", post(configure_planet))
         .route(
@@ -5866,6 +6019,30 @@ mod tests {
         packet[24..40]
             .copy_from_slice(&destination.parse::<std::net::Ipv6Addr>().unwrap().octets());
         packet
+    }
+
+    #[test]
+    fn exit_selection_requires_a_current_signed_candidate_and_a_gateway_for_kill_switch() {
+        let network = test_joined_network();
+        assert!(validate_exit_selection(
+            &network,
+            &ExitNodeSelection {
+                ipv4_gateway: None,
+                ipv6_gateway: None,
+                kill_switch: true,
+            },
+        )
+        .is_err());
+        assert!(validate_exit_selection(
+            &network,
+            &ExitNodeSelection {
+                ipv4_gateway: Some(DeviceId(Uuid::from_u128(900))),
+                ipv6_gateway: None,
+                kill_switch: false,
+            },
+        )
+        .is_err());
+        assert!(validate_exit_selection(&network, &ExitNodeSelection::default()).is_ok());
     }
 
     #[test]
