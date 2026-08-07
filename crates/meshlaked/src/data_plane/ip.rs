@@ -73,6 +73,12 @@ pub(crate) fn outbound_route_for_ip_packet<'a>(
                 network,
                 gateway: None,
             }),
+            (None, None) => {
+                selected_exit_gateway(network, destination).map(|gateway| OutboundNetworkRoute {
+                    network,
+                    gateway: Some(gateway),
+                })
+            }
             _ => None,
         };
     }
@@ -81,8 +87,10 @@ pub(crate) fn outbound_route_for_ip_packet<'a>(
         if network.network_key.len() != 32 || !address_belongs_to_network(network, destination) {
             return None;
         }
-        let (prefix_len, gateway) = policy_gateway(network, source)?;
-        (gateway == local_device).then_some((prefix_len, network))
+        if let Some((prefix_len, gateway)) = policy_gateway(network, source) {
+            return (gateway == local_device).then_some((prefix_len, network));
+        }
+        local_device_is_exit_gateway_for(network, local_device, source).then_some((0, network))
     });
     let selected = gateway_returns.next()?;
     let mut best = selected;
@@ -109,6 +117,9 @@ pub(crate) fn local_device_is_gateway_for(
     destination: std::net::IpAddr,
 ) -> bool {
     policy_gateway(network, destination).is_some_and(|(_, gateway)| gateway == local_device)
+        || (!address_belongs_to_network(network, destination)
+            && !is_group_destination(network, destination)
+            && local_device_is_exit_gateway_for(network, local_device, destination))
 }
 
 pub(crate) fn peer_is_gateway_for_source(
@@ -117,6 +128,77 @@ pub(crate) fn peer_is_gateway_for_source(
     source: std::net::IpAddr,
 ) -> bool {
     policy_gateway(network, source).is_some_and(|(_, gateway)| gateway == peer_device)
+        || (!address_belongs_to_network(network, source)
+            && local_device_is_exit_gateway_for(network, peer_device, source))
+}
+
+/// Returns the locally selected exit only when it remains a current,
+/// controller-authorized candidate for the packet address family.
+fn selected_exit_gateway(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<DeviceId> {
+    let selected = match address {
+        std::net::IpAddr::V4(_) => network.control_plane.exit_node_selection.ipv4_gateway,
+        std::net::IpAddr::V6(_) => network.control_plane.exit_node_selection.ipv6_gateway,
+    }?;
+    exit_candidate_is_current(network, selected, address).then_some(selected)
+}
+
+/// Checks whether a peer remains an authorized exit candidate. Unlike
+/// `selected_exit_gateway`, this is used on the exit node itself and therefore
+/// does not consult a remote member's private local preference.
+fn local_device_is_exit_gateway_for(
+    network: &JoinedNetwork,
+    device_id: DeviceId,
+    address: std::net::IpAddr,
+) -> bool {
+    exit_candidate_is_current(network, device_id, address)
+}
+
+fn exit_candidate_is_current(
+    network: &JoinedNetwork,
+    device_id: DeviceId,
+    address: std::net::IpAddr,
+) -> bool {
+    let policy = match network.control_plane.policy_manifest.as_ref() {
+        Some(policy) => policy,
+        None => return false,
+    };
+    let authorization = match network.control_plane.authorization_manifest.as_ref() {
+        Some(authorization) => authorization,
+        None => return false,
+    };
+    let pinned_key = &network.control_plane.pinned_controller_public_key;
+    let current_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => return false,
+    };
+    if pinned_key.is_empty()
+        || policy.network_id != network.network.id
+        || policy.controller_public_key != *pinned_key
+        || policy.issued_at_unix_seconds > current_time.saturating_add(120)
+        || current_time > policy.expires_at_unix_seconds
+        || authorization.network_id != network.network.id
+        || authorization.controller_public_key != *pinned_key
+        || authorization.issued_at_unix_seconds > current_time.saturating_add(120)
+        || current_time > authorization.expires_at_unix_seconds
+    {
+        return false;
+    }
+    policy.exit_nodes.iter().any(|exit_node| {
+        let certificate = &exit_node.gateway_certificate;
+        certificate.claims.device_id == device_id
+            && certificate.controller_public_key == *pinned_key
+            && certificate.claims.network_id == network.network.id
+            && certificate.claims.issued_at_unix_seconds <= current_time.saturating_add(120)
+            && !certificate
+                .claims
+                .expires_at_unix_seconds
+                .is_some_and(|expiry| current_time > expiry)
+            && authorization.authorizes(certificate)
+            && match address {
+                std::net::IpAddr::V4(_) => exit_node.supports_ipv4,
+                std::net::IpAddr::V6(_) => exit_node.supports_ipv6,
+            }
+    })
 }
 
 fn policy_gateway(network: &JoinedNetwork, address: std::net::IpAddr) -> Option<(u8, DeviceId)> {
@@ -273,9 +355,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use meshlake_core::{
-        AuthorizedMembership, DnsPolicy, MembershipCertificate, MembershipClaims,
-        NetworkAuthorizationManifest, NetworkControlPlane, NetworkId, NetworkPolicyManifest,
-        PolicyRoute, RelayPolicy, VirtualNetwork,
+        AuthorizedMembership, DnsPolicy, ExitNode, ExitNodeSelection, MembershipCertificate,
+        MembershipClaims, NetworkAuthorizationManifest, NetworkControlPlane, NetworkId,
+        NetworkPolicyManifest, PolicyRoute, RelayPolicy, VirtualNetwork,
     };
     use uuid::Uuid;
 
@@ -375,6 +457,68 @@ mod tests {
         network
     }
 
+    fn with_selected_exit(mut network: JoinedNetwork, gateway: u128) -> JoinedNetwork {
+        let signing = SigningKey::from_bytes(&[45; 32]);
+        let gateway = DeviceId(Uuid::from_u128(gateway));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id: network.network.id,
+                device_id: gateway,
+                device_public_key: vec![9; 32],
+                assigned_addresses: vec!["100.64.0.254".parse().unwrap()],
+                allowed_routes: vec![network.network.ipv4_prefix.clone()],
+                issued_at_unix_seconds: 1,
+                expires_at_unix_seconds: Some(u64::MAX),
+            },
+            Uuid::from_u128(gateway.0.as_u128() + 100),
+            1,
+            &signing,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network.network.id,
+            1,
+            1,
+            vec![AuthorizedMembership {
+                device_id: gateway,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: 1,
+            }],
+            vec![],
+            1,
+            u64::MAX,
+            &signing,
+        )
+        .unwrap();
+        network.control_plane.policy_manifest = Some(
+            NetworkPolicyManifest::sign_with_exit_nodes(
+                network.network.id,
+                1,
+                vec![],
+                vec![ExitNode {
+                    gateway_certificate: certificate,
+                    supports_ipv4: true,
+                    supports_ipv6: false,
+                }],
+                DnsPolicy::default(),
+                1,
+                u64::MAX,
+                &signing,
+            )
+            .unwrap(),
+        );
+        network.control_plane.authorization_manifest = Some(authorization);
+        network.control_plane.pinned_controller_public_key =
+            signing.verifying_key().to_bytes().to_vec();
+        network.control_plane.exit_node_selection = ExitNodeSelection {
+            ipv4_gateway: Some(gateway),
+            ipv6_gateway: None,
+            kill_switch: false,
+        };
+        network
+    }
+
     #[test]
     fn packet_addresses_rejects_truncated_or_unknown_packets() {
         assert!(packet_addresses(&[]).is_none());
@@ -452,6 +596,48 @@ mod tests {
             std::slice::from_ref(&network),
             DeviceId(Uuid::from_u128(51)),
             &packet,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn selected_exit_routes_external_packets_and_accepts_only_signed_exit_returns() {
+        let network = with_selected_exit(network(6, &["100.64.0.6"]), 60);
+        let outbound = ipv4_packet([100, 64, 0, 6], [203, 0, 113, 9]);
+        let selected = outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(6)),
+            &outbound,
+        )
+        .unwrap();
+        assert_eq!(selected.gateway, Some(DeviceId(Uuid::from_u128(60))));
+        assert!(local_device_is_gateway_for(
+            &network,
+            DeviceId(Uuid::from_u128(60)),
+            "203.0.113.9".parse().unwrap(),
+        ));
+        assert!(peer_is_gateway_for_source(
+            &network,
+            DeviceId(Uuid::from_u128(60)),
+            "203.0.113.9".parse().unwrap(),
+        ));
+        assert!(!peer_is_gateway_for_source(
+            &network,
+            DeviceId(Uuid::from_u128(61)),
+            "203.0.113.9".parse().unwrap(),
+        ));
+
+        let return_packet = ipv4_packet([203, 0, 113, 9], [100, 64, 0, 6]);
+        assert!(outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(60)),
+            &return_packet,
+        )
+        .is_some());
+        assert!(outbound_route_for_ip_packet(
+            std::slice::from_ref(&network),
+            DeviceId(Uuid::from_u128(61)),
+            &return_packet,
         )
         .is_none());
     }
