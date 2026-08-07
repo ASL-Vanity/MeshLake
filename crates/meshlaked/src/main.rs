@@ -4,6 +4,7 @@ mod exit_gateway;
 mod port_mapping;
 mod session_observability;
 mod state_backup_command;
+mod tls_relay;
 mod transport_health;
 mod upnp;
 
