@@ -132,6 +132,41 @@ enum ControllerCommand {
         #[arg(long, default_value_t = 900)]
         expires_in_seconds: u64,
     },
+    /// Authorize or revoke a member as an exit-node candidate for one network.
+    Exit {
+        #[command(subcommand)]
+        command: ControllerExitCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ControllerExitCommand {
+    Set {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        network: Uuid,
+        #[arg(long)]
+        device: Uuid,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
+        /// Authorize this candidate for an IPv4 default route.
+        #[arg(long)]
+        ipv4: bool,
+        /// Authorize this candidate for an IPv6 default route.
+        #[arg(long)]
+        ipv6: bool,
+    },
+    Clear {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        network: Uuid,
+        #[arg(long)]
+        device: Uuid,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
+    },
 }
 
 #[derive(Args)]
@@ -231,6 +266,33 @@ enum NetworkCommand {
         controller_public_key_base64: String,
     },
     Leave {
+        #[arg(long)]
+        network: Uuid,
+    },
+    /// Select or clear a locally enabled exit gateway. This never changes the
+    /// controller policy and requires a current signed exit candidate.
+    Exit {
+        #[command(subcommand)]
+        command: NetworkExitCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkExitCommand {
+    Select {
+        #[arg(long)]
+        network: Uuid,
+        #[arg(long)]
+        ipv4_gateway: Option<Uuid>,
+        #[arg(long)]
+        ipv6_gateway: Option<Uuid>,
+        /// Block physical-network fallback if the selected exit cannot be
+        /// applied. Platform enforcement is introduced in the next stage-4
+        /// increment.
+        #[arg(long)]
+        kill_switch: bool,
+    },
+    Clear {
         #[arg(long)]
         network: Uuid,
     },
@@ -457,6 +519,61 @@ async fn main() -> Result<()> {
                 &mut stdout.lock(),
             )?;
         }
+        Command::Controller {
+            command:
+                ControllerCommand::Exit {
+                    command:
+                        ControllerExitCommand::Set {
+                            controller,
+                            network,
+                            device,
+                            admin_token,
+                            ipv4,
+                            ipv6,
+                        },
+                },
+        } => {
+            if !ipv4 && !ipv6 {
+                bail!("choose at least one of --ipv4 or --ipv6 for an exit candidate");
+            }
+            let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
+            let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
+            update_controller_exit_candidate(
+                &client,
+                &controller_url,
+                network,
+                device,
+                Some((ipv4, ipv6)),
+                admin_token.as_str(),
+            )
+            .await?;
+            println!("Exit candidate {device} saved for controller network {network}.");
+        }
+        Command::Controller {
+            command:
+                ControllerCommand::Exit {
+                    command:
+                        ControllerExitCommand::Clear {
+                            controller,
+                            network,
+                            device,
+                            admin_token,
+                        },
+                },
+        } => {
+            let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
+            let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
+            update_controller_exit_candidate(
+                &client,
+                &controller_url,
+                network,
+                device,
+                None,
+                admin_token.as_str(),
+            )
+            .await?;
+            println!("Exit candidate {device} cleared for controller network {network}.");
+        }
         Command::Adapter {
             command: AdapterCommand::Stop,
         } => {
@@ -466,6 +583,52 @@ async fn main() -> Result<()> {
         Command::Network {
             command: NetworkCommand::List,
         } => print_networks(client.get(format!("{LOCAL_API}/networks")).send().await?).await?,
+        Command::Network {
+            command:
+                NetworkCommand::Exit {
+                    command:
+                        NetworkExitCommand::Select {
+                            network,
+                            ipv4_gateway,
+                            ipv6_gateway,
+                            kill_switch,
+                        },
+                },
+        } => {
+            ensure_success(
+                client
+                    .post(format!("{LOCAL_API}/networks/{network}/exit-selection"))
+                    .json(&serde_json::json!({
+                        "ipv4_gateway": ipv4_gateway,
+                        "ipv6_gateway": ipv6_gateway,
+                        "kill_switch": kill_switch,
+                    }))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("Local exit selection saved for network {network}.");
+        }
+        Command::Network {
+            command:
+                NetworkCommand::Exit {
+                    command: NetworkExitCommand::Clear { network },
+                },
+        } => {
+            ensure_success(
+                client
+                    .post(format!("{LOCAL_API}/networks/{network}/exit-selection"))
+                    .json(&serde_json::json!({
+                        "ipv4_gateway": null,
+                        "ipv6_gateway": null,
+                        "kill_switch": false,
+                    }))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("Local exit selection cleared for network {network}.");
+        }
         Command::Network {
             command: NetworkCommand::JoinLink { link },
         } => {
@@ -529,6 +692,104 @@ async fn main() -> Result<()> {
             .await?;
         }
     }
+    Ok(())
+}
+
+/// Reads the current signed policy, changes only one exit candidate, then
+/// submits the controller's compact policy-update representation. Keeping this
+/// transformation in the CLI prevents an exit update from accidentally
+/// deleting existing split routes or DNS settings.
+async fn update_controller_exit_candidate(
+    client: &Client,
+    controller_url: &str,
+    network: Uuid,
+    device: Uuid,
+    capability: Option<(bool, bool)>,
+    admin_token: &str,
+) -> Result<()> {
+    let manifest: serde_json::Value = ensure_success(
+        client
+            .get(format!("{controller_url}/v1/networks/{network}/policy"))
+            .send()
+            .await?,
+    )
+    .await?
+    .json()
+    .await?;
+    let routes = manifest
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .context("controller returned an invalid signed policy route list")?
+        .iter()
+        .map(|route| {
+            let prefix = route
+                .get("prefix")
+                .and_then(serde_json::Value::as_str)
+                .context("controller policy route has no prefix")?;
+            let gateway = route
+                .pointer("/gateway_certificate/claims/device_id")
+                .and_then(serde_json::Value::as_str)
+                .context("controller policy route has no gateway device")?;
+            Ok(serde_json::json!({
+                "prefix": prefix,
+                "gateway_device_id": gateway,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut exit_nodes = manifest
+        .get("exit_nodes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|exit_node| {
+            let gateway = exit_node
+                .pointer("/gateway_certificate/claims/device_id")
+                .and_then(serde_json::Value::as_str)
+                .context("controller exit candidate has no gateway device")?;
+            let supports_ipv4 = exit_node
+                .get("supports_ipv4")
+                .and_then(serde_json::Value::as_bool)
+                .context("controller exit candidate has no IPv4 capability")?;
+            let supports_ipv6 = exit_node
+                .get("supports_ipv6")
+                .and_then(serde_json::Value::as_bool)
+                .context("controller exit candidate has no IPv6 capability")?;
+            Ok(serde_json::json!({
+                "gateway_device_id": gateway,
+                "supports_ipv4": supports_ipv4,
+                "supports_ipv6": supports_ipv6,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    exit_nodes.retain(|exit_node| {
+        exit_node
+            .get("gateway_device_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<Uuid>().ok())
+            != Some(device)
+    });
+    if let Some((supports_ipv4, supports_ipv6)) = capability {
+        exit_nodes.push(serde_json::json!({
+            "gateway_device_id": device,
+            "supports_ipv4": supports_ipv4,
+            "supports_ipv6": supports_ipv6,
+        }));
+    }
+    ensure_sensitive_success(
+        client
+            .post(format!("{controller_url}/v1/networks/{network}/policy"))
+            .header("x-meshlake-admin-token", admin_token)
+            .json(&serde_json::json!({
+                "routes": routes,
+                "exit_nodes": exit_nodes,
+                "dns": manifest.get("dns").cloned().unwrap_or_else(|| serde_json::json!({})),
+            }))
+            .send()
+            .await?,
+        "controller exit candidate update",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1355,6 +1616,60 @@ mod tests {
         };
         assert_eq!(ipv4_prefix, "100.64.50.0/24");
         assert_eq!(ipv6_prefix.as_deref(), Some("fd42:4d4c:50::/64"));
+    }
+
+    #[test]
+    fn parses_controller_and_local_exit_commands() {
+        let controller = Cli::try_parse_from([
+            "meshlake",
+            "controller",
+            "exit",
+            "set",
+            "--controller",
+            "https://controller.example",
+            "--network",
+            "00000000-0000-0000-0000-000000000001",
+            "--device",
+            "00000000-0000-0000-0000-000000000002",
+            "--ipv4",
+            "--admin-token-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            controller.command,
+            Command::Controller {
+                command: ControllerCommand::Exit {
+                    command: ControllerExitCommand::Set {
+                        ipv4: true,
+                        ipv6: false,
+                        ..
+                    }
+                }
+            }
+        ));
+        let local = Cli::try_parse_from([
+            "meshlake",
+            "network",
+            "exit",
+            "select",
+            "--network",
+            "00000000-0000-0000-0000-000000000001",
+            "--ipv4-gateway",
+            "00000000-0000-0000-0000-000000000002",
+            "--kill-switch",
+        ])
+        .unwrap();
+        assert!(matches!(
+            local.command,
+            Command::Network {
+                command: NetworkCommand::Exit {
+                    command: NetworkExitCommand::Select {
+                        kill_switch: true,
+                        ..
+                    }
+                }
+            }
+        ));
     }
 
     #[test]
