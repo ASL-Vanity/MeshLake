@@ -4,6 +4,7 @@
 //! `wintun.dll` next to `meshlaked.exe`; development can pass `--wintun-dll <path>`.
 
 use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
+use crate::exit_gateway::{ExitGatewayPlan, GatewayRoute};
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use meshlake_core::JoinedNetwork;
@@ -164,6 +165,7 @@ pub struct AdapterController {
     dll_path: PathBuf,
     session: Mutex<Option<AdapterSession>>,
     applied_policy: Mutex<PolicyPlan>,
+    applied_exit_gateways: Mutex<ExitGatewayPlan>,
 }
 
 impl AdapterController {
@@ -172,6 +174,7 @@ impl AdapterController {
             dll_path,
             session: Mutex::new(None),
             applied_policy: Mutex::new(PolicyPlan::default()),
+            applied_exit_gateways: Mutex::new(ExitGatewayPlan::default()),
         }
     }
     pub fn status(&self) -> String {
@@ -207,6 +210,11 @@ impl AdapterController {
         Ok(())
     }
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_exit_gateways() {
+            eprintln!(
+                "MeshLake could not completely roll back Windows exit-gateway rules: {error:#}"
+            );
+        }
         if let Err(error) = self.rollback_policy() {
             eprintln!(
                 "MeshLake could not completely roll back Windows route/DNS policy: {error:#}"
@@ -325,6 +333,52 @@ impl AdapterController {
         self.reconcile_policy(plan)
     }
 
+    /// Applies explicit local forwarding/NAT configuration. IPv4 uses a named
+    /// NetNat object per virtual prefix; IPv6 enables forwarding but does not
+    /// invent NAT66, so its return path remains an explicit network design.
+    pub fn configure_exit_gateways(&self, desired: ExitGatewayPlan) -> Result<()> {
+        if !self.is_active() {
+            bail!("MeshLake adapter is not active");
+        }
+        let mut current = self
+            .applied_exit_gateways
+            .lock()
+            .expect("exit gateway lock poisoned");
+        if *current == desired {
+            return Ok(());
+        }
+        let previous = current.clone();
+        if let Err(primary) = run_policy_scripts(&windows_exit_gateway_scripts(
+            &previous,
+            GatewayOperation::Remove,
+        ))
+        .and_then(|_| {
+            run_policy_scripts(&windows_exit_gateway_scripts(
+                &desired,
+                GatewayOperation::Apply,
+            ))
+        }) {
+            let cleanup = run_policy_scripts(&windows_exit_gateway_scripts(
+                &desired,
+                GatewayOperation::Remove,
+            ));
+            let restore = run_policy_scripts(&windows_exit_gateway_scripts(
+                &previous,
+                GatewayOperation::Apply,
+            ));
+            if cleanup.is_err() || restore.is_err() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                bail!(
+                    "Windows exit-gateway transaction failed: {primary:#}; rollback failed and the adapter was disabled fail closed"
+                );
+            }
+            bail!("Windows exit-gateway transaction failed and the previous rules were restored: {primary:#}");
+        }
+        *current = desired;
+        Ok(())
+    }
+
     fn reconcile_policy(&self, desired: PolicyPlan) -> Result<()> {
         if desired.search_domains.len() > 1 {
             bail!(
@@ -380,10 +434,29 @@ impl AdapterController {
         *current = PolicyPlan::default();
         result
     }
+
+    fn rollback_exit_gateways(&self) -> Result<()> {
+        let mut current = self
+            .applied_exit_gateways
+            .lock()
+            .expect("exit gateway lock poisoned");
+        let result = run_policy_scripts(&windows_exit_gateway_scripts(
+            &current,
+            GatewayOperation::Remove,
+        ));
+        *current = ExitGatewayPlan::default();
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyOperation {
+    Apply,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOperation {
     Apply,
     Remove,
 }
@@ -441,6 +514,52 @@ fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<
         }
     }
     scripts
+}
+
+fn windows_exit_gateway_scripts(
+    plan: &ExitGatewayPlan,
+    operation: GatewayOperation,
+) -> Vec<String> {
+    let mut scripts = Vec::new();
+    for route in &plan.routes {
+        let family = if route.ipv6 { "IPv6" } else { "IPv4" };
+        let nat_name = windows_nat_name(route);
+        match operation {
+            GatewayOperation::Apply => {
+                scripts.push(format!(
+                    "Set-NetIPInterface -InterfaceAlias '{}' -AddressFamily {family} -Forwarding Enabled -ErrorAction Stop",
+                    ADAPTER_NAME
+                ));
+                scripts.push(format!(
+                    "Set-NetIPInterface -InterfaceAlias '{}' -AddressFamily {family} -Forwarding Enabled -ErrorAction Stop",
+                    route.egress_interface
+                ));
+                if !route.ipv6 {
+                    scripts.push(format!(
+                        "New-NetNat -Name '{}' -InternalIPInterfaceAddressPrefix '{}' -ErrorAction Stop | Out-Null",
+                        nat_name, route.prefix
+                    ));
+                }
+            }
+            GatewayOperation::Remove => {
+                if !route.ipv6 {
+                    scripts.push(format!(
+                        "Get-NetNat -Name '{}' -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false -ErrorAction Stop",
+                        nat_name
+                    ));
+                }
+            }
+        }
+    }
+    scripts
+}
+
+fn windows_nat_name(route: &GatewayRoute) -> String {
+    format!(
+        "MeshLake-{}-{}",
+        route.network_id.0,
+        if route.ipv6 { "v6" } else { "v4" }
+    )
 }
 
 fn run_policy_scripts(scripts: &[String]) -> Result<()> {
@@ -619,6 +738,27 @@ mod tests {
         let remove = windows_policy_scripts(&plan, PolicyOperation::Remove).join("\n");
         assert!(remove.contains("Remove-NetRoute"));
         assert!(remove.contains("ResetServerAddresses"));
+    }
+
+    #[test]
+    fn builds_scoped_windows_nat_and_forwarding_transactions() {
+        let plan = ExitGatewayPlan {
+            routes: vec![GatewayRoute {
+                network_id: meshlake_core::NetworkId(uuid::Uuid::from_u128(21)),
+                prefix: "100.64.21.0/24".into(),
+                egress_interface: "Ethernet".into(),
+                ipv6: false,
+            }],
+        };
+        let apply = windows_exit_gateway_scripts(&plan, GatewayOperation::Apply).join("\n");
+        assert!(apply.contains("Set-NetIPInterface"));
+        assert!(apply.contains("New-NetNat"));
+        assert!(apply.contains("MeshLake-00000000-0000-0000-0000-000000000015-v4"));
+        assert!(!apply.contains("Remove-NetNat"));
+        let remove = windows_exit_gateway_scripts(&plan, GatewayOperation::Remove).join("\n");
+        assert!(remove.contains("Get-NetNat"));
+        assert!(remove.contains("Remove-NetNat"));
+        assert!(!remove.contains("Set-NetIPInterface"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Linux TUN adapter implementation used by the headless MeshLake agent.
 
 use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
+use crate::exit_gateway::{ExitGatewayPlan, GatewayRoute};
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
 use meshlake_core::JoinedNetwork;
@@ -51,6 +52,7 @@ impl AddressOperation {
 pub struct AdapterController {
     session: Mutex<Option<File>>,
     applied_policy: Mutex<PolicyPlan>,
+    applied_exit_gateways: Mutex<ExitGatewayPlan>,
 }
 
 impl AdapterController {
@@ -58,6 +60,7 @@ impl AdapterController {
         Self {
             session: Mutex::new(None),
             applied_policy: Mutex::new(PolicyPlan::default()),
+            applied_exit_gateways: Mutex::new(ExitGatewayPlan::default()),
         }
     }
 
@@ -106,6 +109,11 @@ impl AdapterController {
     }
 
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_exit_gateways() {
+            eprintln!(
+                "MeshLake could not completely roll back Linux exit-gateway rules: {error:#}"
+            );
+        }
         if let Err(error) = self.rollback_policy() {
             eprintln!("MeshLake could not completely roll back Linux route/DNS policy: {error:#}");
         }
@@ -177,6 +185,52 @@ impl AdapterController {
         self.reconcile_policy(plan)
     }
 
+    /// Applies explicit local forwarding/NAT rules. These rules are scoped to
+    /// MeshLake source prefixes and carry an exact per-network comment, so
+    /// teardown never flushes user-managed firewall state.
+    pub fn configure_exit_gateways(&self, desired: ExitGatewayPlan) -> Result<()> {
+        if !self.is_active() {
+            bail!("MeshLake adapter is not active");
+        }
+        let mut current = self
+            .applied_exit_gateways
+            .lock()
+            .expect("exit gateway lock poisoned");
+        if *current == desired {
+            return Ok(());
+        }
+        let previous = current.clone();
+        if let Err(primary) = run_linux_policy_commands(&linux_exit_gateway_commands(
+            &previous,
+            GatewayOperation::Remove,
+        ))
+        .and_then(|_| {
+            run_linux_policy_commands(&linux_exit_gateway_commands(
+                &desired,
+                GatewayOperation::Apply,
+            ))
+        }) {
+            let cleanup = run_linux_policy_commands(&linux_exit_gateway_commands(
+                &desired,
+                GatewayOperation::Remove,
+            ));
+            let restore = run_linux_policy_commands(&linux_exit_gateway_commands(
+                &previous,
+                GatewayOperation::Apply,
+            ));
+            if cleanup.is_err() || restore.is_err() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                bail!(
+                    "Linux exit-gateway transaction failed: {primary:#}; rollback failed and the adapter was disabled fail closed"
+                );
+            }
+            bail!("Linux exit-gateway transaction failed and the previous rules were restored: {primary:#}");
+        }
+        *current = desired;
+        Ok(())
+    }
+
     fn reconcile_policy(&self, desired: PolicyPlan) -> Result<()> {
         let mut current = self
             .applied_policy
@@ -230,10 +284,29 @@ impl AdapterController {
         *current = PolicyPlan::default();
         result
     }
+
+    fn rollback_exit_gateways(&self) -> Result<()> {
+        let mut current = self
+            .applied_exit_gateways
+            .lock()
+            .expect("exit gateway lock poisoned");
+        let result = run_linux_policy_commands(&linux_exit_gateway_commands(
+            &current,
+            GatewayOperation::Remove,
+        ));
+        *current = ExitGatewayPlan::default();
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyOperation {
+    Apply,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOperation {
     Apply,
     Remove,
 }
@@ -296,6 +369,117 @@ fn linux_policy_commands(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<L
         _ => {}
     }
     commands
+}
+
+fn linux_exit_gateway_commands(
+    plan: &ExitGatewayPlan,
+    operation: GatewayOperation,
+) -> Vec<LinuxPolicyCommand> {
+    let mut commands = Vec::new();
+    let mut enabled_ipv4_forwarding = false;
+    let mut enabled_ipv6_forwarding = false;
+    for route in &plan.routes {
+        if matches!(operation, GatewayOperation::Apply) {
+            let (sysctl_key, already_enabled) = if route.ipv6 {
+                (
+                    "net.ipv6.conf.all.forwarding=1",
+                    &mut enabled_ipv6_forwarding,
+                )
+            } else {
+                ("net.ipv4.ip_forward=1", &mut enabled_ipv4_forwarding)
+            };
+            if !*already_enabled {
+                commands.push(LinuxPolicyCommand {
+                    program: "sysctl",
+                    arguments: vec!["-w".into(), sysctl_key.into()],
+                });
+                *already_enabled = true;
+            }
+        }
+        let program = if route.ipv6 { "ip6tables" } else { "iptables" };
+        let operation_argument = match operation {
+            GatewayOperation::Apply => "-A",
+            GatewayOperation::Remove => "-D",
+        };
+        let comment = gateway_comment(route);
+        commands.push(LinuxPolicyCommand {
+            program,
+            arguments: vec![
+                "-w".into(),
+                "-t".into(),
+                "nat".into(),
+                operation_argument.into(),
+                "POSTROUTING".into(),
+                "-s".into(),
+                route.prefix.clone(),
+                "-o".into(),
+                route.egress_interface.clone(),
+                "-m".into(),
+                "comment".into(),
+                "--comment".into(),
+                comment.clone(),
+                "-j".into(),
+                "MASQUERADE".into(),
+            ],
+        });
+        commands.push(LinuxPolicyCommand {
+            program,
+            arguments: vec![
+                "-w".into(),
+                operation_argument.into(),
+                "FORWARD".into(),
+                "-i".into(),
+                INTERFACE_NAME.into(),
+                "-o".into(),
+                route.egress_interface.clone(),
+                "-s".into(),
+                route.prefix.clone(),
+                "-m".into(),
+                "conntrack".into(),
+                "--ctstate".into(),
+                "NEW,ESTABLISHED,RELATED".into(),
+                "-m".into(),
+                "comment".into(),
+                "--comment".into(),
+                comment.clone(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        });
+        commands.push(LinuxPolicyCommand {
+            program,
+            arguments: vec![
+                "-w".into(),
+                operation_argument.into(),
+                "FORWARD".into(),
+                "-i".into(),
+                route.egress_interface.clone(),
+                "-o".into(),
+                INTERFACE_NAME.into(),
+                "-d".into(),
+                route.prefix.clone(),
+                "-m".into(),
+                "conntrack".into(),
+                "--ctstate".into(),
+                "ESTABLISHED,RELATED".into(),
+                "-m".into(),
+                "comment".into(),
+                "--comment".into(),
+                comment,
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        });
+    }
+    commands
+}
+
+fn gateway_comment(route: &GatewayRoute) -> String {
+    format!(
+        "meshlake:{}:{}",
+        route.network_id.0,
+        if route.ipv6 { "v6" } else { "v4" }
+    )
 }
 
 fn run_linux_policy_commands(commands: &[LinuxPolicyCommand]) -> Result<()> {
@@ -658,6 +842,58 @@ mod tests {
             .arguments
             .iter()
             .any(|argument| argument == "/etc/resolv.conf")));
+    }
+
+    #[test]
+    fn builds_scoped_linux_nat_and_forwarding_rules_without_flushes() {
+        let route = GatewayRoute {
+            network_id: NetworkId(Uuid::from_u128(19)),
+            prefix: "100.64.19.0/24".into(),
+            egress_interface: "eth0".into(),
+            ipv6: false,
+        };
+        let commands = linux_exit_gateway_commands(
+            &ExitGatewayPlan {
+                routes: vec![route],
+            },
+            GatewayOperation::Apply,
+        );
+        assert_eq!(commands[0].program, "sysctl");
+        assert_eq!(commands[0].arguments, vec!["-w", "net.ipv4.ip_forward=1"]);
+        assert!(commands.iter().any(|command| {
+            command.program == "iptables"
+                && command
+                    .arguments
+                    .windows(2)
+                    .any(|part| part == ["-t", "nat"])
+                && command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "MASQUERADE")
+                && command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "meshlake:00000000-0000-0000-0000-000000000013:v4")
+        }));
+        assert!(commands.iter().all(|command| !command
+            .arguments
+            .iter()
+            .any(|argument| argument == "-F" || argument == "--flush")));
+        let remove = linux_exit_gateway_commands(
+            &ExitGatewayPlan {
+                routes: vec![GatewayRoute {
+                    network_id: NetworkId(Uuid::from_u128(19)),
+                    prefix: "100.64.19.0/24".into(),
+                    egress_interface: "eth0".into(),
+                    ipv6: false,
+                }],
+            },
+            GatewayOperation::Remove,
+        );
+        assert!(remove.iter().all(|command| command.program != "sysctl"));
+        assert!(remove
+            .iter()
+            .all(|command| command.arguments.iter().any(|argument| argument == "-D")));
     }
 
     #[test]

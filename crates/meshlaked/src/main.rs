@@ -23,6 +23,7 @@ use data_plane::ip::{
     outbound_route_for_ip_packet, packet_addresses, peer_is_gateway_for_source,
 };
 use ed25519_dalek::SigningKey;
+use exit_gateway::{ExitGatewayConfig, ExitGatewayPlan};
 use meshlake_core::{
     accept_pairwise_handshake, cleanup_stale_state_backup, decode_protected_state_with,
     parse_peer_identity, parse_session_routing_header, recover_protected_state_file,
@@ -69,7 +70,7 @@ use meshlake_core::decode_protected_state;
 use session_observability::{SessionObservability, SessionTelemetry};
 
 const LOCAL_API: &str = "127.0.0.1:51821";
-const AGENT_STATE_SCHEMA_VERSION: u32 = 3;
+const AGENT_STATE_SCHEMA_VERSION: u32 = 4;
 const PEER_DIRECTORY_TTL: Duration = Duration::from_secs(120);
 const PAIRWISE_SESSION_TTL: Duration = Duration::from_secs(3_600);
 const HANDSHAKE_TTL: Duration = Duration::from_secs(10);
@@ -165,6 +166,8 @@ struct PersistedState {
     authorizations: HashMap<NetworkId, meshlake_core::NetworkAuthorizationManifest>,
     #[serde(default)]
     planet: Option<PersistedPlanet>,
+    #[serde(default)]
+    exit_gateways: Vec<ExitGatewayConfig>,
 }
 
 /// Enrollment plus the controller public key supplied through a trusted, out-of-band channel.
@@ -223,6 +226,15 @@ struct ExitSelectionConfig {
     kill_switch: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExitGatewayRequest {
+    egress_interface: String,
+    #[serde(default)]
+    enable_ipv4: bool,
+    #[serde(default)]
+    enable_ipv6: bool,
+}
+
 impl From<ExitSelectionConfig> for ExitNodeSelection {
     fn from(config: ExitSelectionConfig) -> Self {
         Self {
@@ -250,6 +262,7 @@ impl PersistedState {
             root_servers: Vec::new(),
             authorizations: HashMap::new(),
             planet: None,
+            exit_gateways: Vec::new(),
         }
     }
 }
@@ -638,6 +651,94 @@ impl Agent {
             }
             return Err(ApiError::bad_request(format!(
                 "exit selection was rejected by the platform and the previous policy was restored: {error:#}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn configure_exit_gateway(
+        &self,
+        network_id: NetworkId,
+        request: ExitGatewayRequest,
+    ) -> Result<(), ApiError> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        let mut state = self.state.write().await;
+        let joined = state
+            .networks
+            .iter()
+            .find(|joined| joined.network.id == network_id)
+            .ok_or_else(|| ApiError::not_found("network does not exist"))?;
+        let config = ExitGatewayConfig {
+            network_id,
+            egress_interface: request.egress_interface,
+            enable_ipv4: request.enable_ipv4,
+            enable_ipv6: request.enable_ipv6,
+        };
+        validate_local_exit_gateway(joined, state.device_id, &config)?;
+        let previous = state.exit_gateways.clone();
+        state
+            .exit_gateways
+            .retain(|existing| existing.network_id != network_id);
+        state.exit_gateways.push(config);
+        let plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)
+            .map_err(ApiError::bad_request)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
+        drop(state);
+        if let Err(error) = self.adapter.configure_exit_gateways(plan) {
+            let mut state = self.state.write().await;
+            state.exit_gateways = previous;
+            let rollback_plan =
+                ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)
+                    .map_err(ApiError::internal)?;
+            write_state_with_protection(&self.path, &state, &self.state_protection)
+                .map_err(ApiError::internal)?;
+            drop(state);
+            if let Err(rollback_error) = self.adapter.configure_exit_gateways(rollback_plan) {
+                self.adapter.deactivate();
+                return Err(ApiError::internal(format!(
+                    "exit gateway configuration failed: {error:#}; rollback also failed: {rollback_error:#}; adapter was disabled fail closed"
+                )));
+            }
+            return Err(ApiError::bad_request(format!(
+                "exit gateway configuration failed and the previous gateway rules were restored: {error:#}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn remove_exit_gateway(&self, network_id: NetworkId) -> Result<(), ApiError> {
+        let _lifecycle = self.adapter_lifecycle.lock().await;
+        let mut state = self.state.write().await;
+        let previous = state.exit_gateways.clone();
+        state
+            .exit_gateways
+            .retain(|existing| existing.network_id != network_id);
+        if state.exit_gateways == previous {
+            return Ok(());
+        }
+        let plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)
+            .map_err(ApiError::internal)?;
+        write_state_with_protection(&self.path, &state, &self.state_protection)
+            .map_err(ApiError::internal)?;
+        drop(state);
+        if let Err(error) = self.adapter.configure_exit_gateways(plan) {
+            let mut state = self.state.write().await;
+            state.exit_gateways = previous;
+            let rollback_plan =
+                ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)
+                    .map_err(ApiError::internal)?;
+            write_state_with_protection(&self.path, &state, &self.state_protection)
+                .map_err(ApiError::internal)?;
+            drop(state);
+            if let Err(rollback_error) = self.adapter.configure_exit_gateways(rollback_plan) {
+                self.adapter.deactivate();
+                return Err(ApiError::internal(format!(
+                    "exit gateway removal failed: {error:#}; rollback also failed: {rollback_error:#}; adapter was disabled fail closed"
+                )));
+            }
+            return Err(ApiError::internal(format!(
+                "exit gateway removal failed and the previous rules were restored: {error:#}"
             )));
         }
         Ok(())
@@ -1109,6 +1210,7 @@ impl Agent {
             .verify_from_controller(&joined.control_plane.pinned_controller_public_key, now())?;
         let previous = joined.control_plane.policy_manifest.clone();
         let previous_exit_selection = joined.control_plane.exit_node_selection.clone();
+        let previous_exit_gateways = state.exit_gateways.clone();
         if let Some(previous) = &previous {
             if policy.policy_epoch < previous.policy_epoch
                 || (policy.policy_epoch == previous.policy_epoch
@@ -1133,11 +1235,17 @@ impl Agent {
         }
         state.networks[index].control_plane.policy_manifest = Some(policy);
         let exit_selection_cleared = clear_unusable_exit_selection(&mut state.networks[index]);
+        let gateway_networks = state.networks.clone();
+        let local_device = state.device_id;
+        let exit_gateways_cleared =
+            clear_unusable_exit_gateways(&mut state.exit_gateways, &gateway_networks, local_device);
+        let exit_gateway_plan =
+            ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
         if let Err(error) = self.adapter.configure_policy(&networks) {
-            if exit_selection_cleared {
+            if exit_selection_cleared || exit_gateways_cleared {
                 // A verified controller policy just withdrew a selected exit.
                 // Never restore the old default route while trying to recover
                 // from a platform failure; keep the new policy and disable the
@@ -1156,6 +1264,7 @@ impl Agent {
                 joined.control_plane.policy_manifest = previous;
                 joined.control_plane.exit_node_selection = previous_exit_selection;
             }
+            state.exit_gateways = previous_exit_gateways;
             write_state_with_protection(&self.path, &state, &self.state_protection)?;
             let rollback_networks = state.networks.clone();
             drop(state);
@@ -1173,6 +1282,15 @@ impl Agent {
                     " and the adapter is disabled fail closed"
                 }
             );
+        }
+        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+            if exit_gateways_cleared {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "policy withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                );
+            }
+            anyhow::bail!("could not apply local exit-gateway rules for the new policy: {error:#}");
         }
         self.request_transport_reload();
         Ok(())
@@ -1194,13 +1312,28 @@ impl Agent {
                 changed = true;
             }
         }
+        let gateway_networks = state.networks.clone();
+        let local_device = state.device_id;
+        let exit_gateways_cleared =
+            clear_unusable_exit_gateways(&mut state.exit_gateways, &gateway_networks, local_device);
+        changed |= exit_gateways_cleared;
         if !changed {
             return Ok(());
         }
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
+        let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)?;
         drop(state);
         self.adapter.configure_policy(&networks)?;
+        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+            if exit_gateways_cleared {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "an exit policy expired but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                );
+            }
+            return Err(error);
+        }
         self.request_transport_reload();
         Ok(())
     }
@@ -1340,12 +1473,20 @@ impl Agent {
             .map_err(ApiError::internal)?;
         state.networks.retain(|entry| entry.network.id != id);
         state.authorizations.remove(&id);
+        state
+            .exit_gateways
+            .retain(|gateway| gateway.network_id != id);
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
         let networks = state.networks.clone();
+        let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)
+            .map_err(ApiError::internal)?;
         drop(state);
         self.adapter
             .configure_policy(&networks)
+            .map_err(ApiError::internal)?;
+        self.adapter
+            .configure_exit_gateways(exit_gateway_plan)
             .map_err(ApiError::internal)?;
         self.request_transport_reload();
         Ok(())
@@ -1494,12 +1635,19 @@ impl Agent {
     async fn activate_adapter(&self) -> Result<(), ApiError> {
         let _lifecycle = self.adapter_lifecycle.lock().await;
         ensure_adapter_activation_allowed(self.shutting_down.load(Ordering::Acquire))?;
-        let networks = self.state.read().await.networks.clone();
+        let state = self.state.read().await;
+        let networks = state.networks.clone();
+        let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)
+            .map_err(ApiError::bad_request)?;
+        drop(state);
         let was_active = self.adapter.is_active();
         activate_adapter_transaction(
             was_active,
             || self.adapter.activate(),
-            || self.adapter.configure_networks(&networks),
+            || {
+                self.adapter.configure_networks(&networks)?;
+                self.adapter.configure_exit_gateways(exit_gateway_plan)
+            },
             || self.adapter.deactivate(),
         )
         .map_err(ApiError::internal)
@@ -1600,6 +1748,80 @@ fn validate_exit_selection(
     Ok(())
 }
 
+fn validate_local_exit_gateway(
+    joined: &JoinedNetwork,
+    local_device: DeviceId,
+    config: &ExitGatewayConfig,
+) -> Result<(), ApiError> {
+    if config.network_id != joined.network.id {
+        return Err(ApiError::bad_request(
+            "exit gateway configuration belongs to another network",
+        ));
+    }
+    let plan =
+        ExitGatewayPlan::from_configs(std::slice::from_ref(config), std::slice::from_ref(joined))
+            .map_err(ApiError::bad_request)?;
+    if plan.routes.is_empty() {
+        return Err(ApiError::bad_request(
+            "exit gateway configuration enables neither IPv4 nor IPv6",
+        ));
+    }
+    let policy = joined
+        .control_plane
+        .policy_manifest
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request("fetch a signed network policy before enabling an exit gateway")
+        })?;
+    let authorization = joined
+        .control_plane
+        .authorization_manifest
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "fetch current member authorization before enabling an exit gateway",
+            )
+        })?;
+    policy
+        .verify_for_network(
+            joined.network.id,
+            &joined.control_plane.pinned_controller_public_key,
+            authorization,
+            now(),
+            None,
+        )
+        .map_err(|_| {
+            ApiError::bad_request(
+                "the local exit-gateway policy is invalid, expired, or unauthorized",
+            )
+        })?;
+    if config.enable_ipv4
+        && !policy.exit_node_supports(
+            local_device,
+            "192.0.2.1"
+                .parse()
+                .expect("literal IPv4 exit-gateway probe"),
+        )
+    {
+        return Err(ApiError::bad_request(
+            "this device is not authorized as an IPv4 exit gateway for the network",
+        ));
+    }
+    if config.enable_ipv6
+        && !policy.exit_node_supports(
+            local_device,
+            "2001:db8::1"
+                .parse()
+                .expect("literal IPv6 exit-gateway probe"),
+        )
+    {
+        return Err(ApiError::bad_request(
+            "this device is not authorized as an IPv6 exit gateway for the network",
+        ));
+    }
+    Ok(())
+}
+
 /// Removes only the local portions of an exit preference that a newly verified
 /// policy no longer authorizes. Controller policy is authoritative for
 /// candidates; retaining a revoked local choice would otherwise make a later
@@ -1637,6 +1859,40 @@ fn clear_unusable_exit_selection(joined: &mut JoinedNetwork) -> bool {
         changed = true;
     }
     changed
+}
+
+fn clear_unusable_exit_gateways(
+    gateways: &mut Vec<ExitGatewayConfig>,
+    networks: &[JoinedNetwork],
+    local_device: DeviceId,
+) -> bool {
+    let original_len = gateways.len();
+    gateways.retain(|gateway| {
+        let Some(joined) = networks
+            .iter()
+            .find(|joined| joined.network.id == gateway.network_id)
+        else {
+            return false;
+        };
+        let Some(policy) = joined.control_plane.policy_manifest.as_ref() else {
+            return false;
+        };
+        (!gateway.enable_ipv4
+            || policy.exit_node_supports(
+                local_device,
+                "192.0.2.1"
+                    .parse()
+                    .expect("literal IPv4 exit-gateway probe"),
+            ))
+            && (!gateway.enable_ipv6
+                || policy.exit_node_supports(
+                    local_device,
+                    "2001:db8::1"
+                        .parse()
+                        .expect("literal IPv6 exit-gateway probe"),
+                ))
+    });
+    gateways.len() != original_len
 }
 
 fn activate_adapter_transaction<E>(
@@ -2654,6 +2910,21 @@ async fn configure_exit_selection(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+async fn configure_exit_gateway(
+    State(agent): State<Arc<Agent>>,
+    Path(id): Path<Uuid>,
+    Json(config): Json<ExitGatewayRequest>,
+) -> Result<StatusCode, ApiError> {
+    agent.configure_exit_gateway(NetworkId(id), config).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn remove_exit_gateway(
+    State(agent): State<Arc<Agent>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    agent.remove_exit_gateway(NetworkId(id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 async fn leave_network(
     State(agent): State<Arc<Agent>>,
     Path(id): Path<Uuid>,
@@ -2760,6 +3031,10 @@ async fn main() -> Result<()> {
         .route(
             "/v1/networks/{id}/exit-selection",
             post(configure_exit_selection),
+        )
+        .route(
+            "/v1/networks/{id}/exit-gateway",
+            post(configure_exit_gateway).delete(remove_exit_gateway),
         )
         .route("/v1/relay", post(configure_relay))
         .route("/v1/planet", post(configure_planet))
