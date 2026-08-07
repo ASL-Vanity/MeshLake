@@ -367,6 +367,10 @@ pub struct MembershipRefreshResponse {
     pub certificate: Option<MembershipCertificate>,
     #[serde(default)]
     pub network_key: Vec<u8>,
+    /// Ephemeral device-specific TURN credential. Never persist this value in
+    /// a joined-network state file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_credential: Option<crate::crypto::TurnCredential>,
 }
 
 #[cfg(test)]

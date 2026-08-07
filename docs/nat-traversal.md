@@ -50,7 +50,7 @@ Windows 往往把 Wintun 识别为“未识别的公用网络”。代理启用�
 
 标准 TURN（RFC 8656）适合对称 NAT、运营商级 NAT 与严格企业网络；推荐在公网服务器上部署 coturn，并优先开放 UDP 3478，同时保留 TCP/TLS 443 作为受限网络的最后回退。
 
-当前 MeshLake Windows 版本的可靠回退是内置 `meshlake-relay` 加密中继，**尚未把 coturn 的 TURN Allocate/Permission/ChannelData 客户端接入数据面**。因此不要把 coturn 地址填入“UDP 协调/中继地址”；那里只能填 MeshLake 中继的 `主机:端口`。coturn 可以先按下列配置预部署，待 TURN 客户端模块接入后再启用。
+Planet V5 已将 coturn 的标准 UDP TURN 客户端接入数据面：客户端使用短期 REST 凭据建立 `Allocate`、`CreatePermission`、`Send Indication`、`Data Indication` 与 `Refresh`，并仅转运已端到端加密的 MeshLake Relay 帧。不要把 coturn 地址填入“UDP 协调/中继地址”；那里仍只接受 MeshLake Relay 的 `主机:端口`。TURN 端点应由控制器以 `--planet-turn-server` 发布，详细配置见 [`turn.md`](turn.md)。
 
 最小化的 coturn 配置示例（Linux `/etc/turnserver.conf`）：
 
@@ -59,8 +59,9 @@ listening-port=3478
 tls-listening-port=5349
 fingerprint
 lt-cred-mech
+use-auth-secret
+static-auth-secret=请从受限文件安全设置高熵随机值
 realm=turn.example.com
-user=meshlake:请替换为高强度密码
 min-port=49160
 max-port=49200
 no-loopback-peers

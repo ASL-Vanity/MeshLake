@@ -16,6 +16,7 @@ base64.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 ipnet.workspace = true
 meshlake-core = { path = "../meshlake-core" }
 rustls.workspace = true
@@ -23,6 +24,7 @@ rustls-pemfile.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 url.workspace = true

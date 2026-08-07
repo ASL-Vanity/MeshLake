@@ -13,6 +13,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use hmac::{Hmac, Mac};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use meshlake_core::{
     cleanup_stale_state_backup, create_restricted_secret_file, decode_protected_state_with,
@@ -20,11 +21,13 @@ use meshlake_core::{
     write_protected_state_file_with, AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse,
     ExitNode, MembershipCertificate, MembershipClaims, MembershipRefreshRequest,
     MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId, NetworkKey,
-    NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PlanetTlsRelay, PolicyRoute,
-    ServiceIdentityPolicy, StateFileLock, StateKeyProvider, StateProtection, UpsertNetworkRequest,
-    VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PlanetTlsRelay,
+    PlanetTurnServer, PolicyRoute, ServiceIdentityPolicy, StateFileLock, StateKeyProvider,
+    StateProtection, TurnCredential, TurnTransport, UpsertNetworkRequest, VirtualNetwork,
+    CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -38,6 +41,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use state_backup_command::StateCommand as StateBackupCommand;
 
@@ -109,6 +113,17 @@ struct Cli {
     /// Planet V4 TLS relay: RELAY_UUID@IP:PORT@SERVER_NAME@BASE64_SHA256_CERT_PIN.
     #[arg(long = "planet-tls-relay", value_parser = parse_planet_tls_relay)]
     planet_tls_relays: Vec<PlanetTlsRelay>,
+    /// Planet V5 TURN endpoint: udp@IP:PORT, tcp@IP:PORT, or
+    /// tls@IP:PORT@SERVER_NAME@BASE64_SHA256_CERT_PIN. Repeat for failover order.
+    #[arg(long = "planet-turn-server", value_parser = parse_planet_turn_server)]
+    planet_turn_servers: Vec<PlanetTurnServer>,
+    /// Restricted file containing the coturn REST static-auth secret. Required
+    /// whenever --planet-turn-server is supplied; its contents are never logged.
+    #[arg(long, value_name = "SECRET_FILE")]
+    turn_static_auth_secret_file: Option<PathBuf>,
+    /// Lifetime in seconds for controller-issued coturn REST credentials.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(60..=86_400))]
+    turn_credential_ttl_seconds: u64,
     /// Root descriptor in BASE64_PUBLIC_KEY@IP:PORT form. Repeat for multiple roots.
     #[arg(long = "planet-root", value_parser = parse_planet_root)]
     planet_roots: Vec<PlanetRoot>,
@@ -263,7 +278,25 @@ struct PlanetSettings {
     roots: Vec<PlanetRoot>,
     relays: Vec<PlanetRelay>,
     tls_relays: Vec<PlanetTlsRelay>,
+    turn_servers: Vec<PlanetTurnServer>,
+    turn_auth: Option<TurnRestAuth>,
     stun_servers: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TurnRestAuth {
+    secret: Arc<Zeroizing<Vec<u8>>>,
+    credential_ttl_seconds: u64,
+}
+
+impl std::fmt::Debug for TurnRestAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRestAuth")
+            .field("secret", &"[REDACTED]")
+            .field("credential_ttl_seconds", &self.credential_ttl_seconds)
+            .finish()
+    }
 }
 
 struct Controller {
@@ -526,6 +559,9 @@ impl Controller {
             certificate,
             network_key,
             authorization,
+            turn_credential: self
+                .turn_credential(request.device_id)
+                .map_err(ApiError::internal)?,
         })
     }
 
@@ -786,6 +822,9 @@ impl Controller {
             authorization: sign_authorization(network, &signing_key).map_err(ApiError::internal)?,
             certificate: Some(certificate),
             network_key: network.network_key.clone(),
+            turn_credential: self
+                .turn_credential(request.payload.device_id)
+                .map_err(ApiError::internal)?,
         })
     }
 
@@ -806,7 +845,19 @@ impl Controller {
         };
         let state = self.state.read().await;
         let signing_key = signing_key(&state)?;
-        let manifest = if planet.version == 4 {
+        let manifest = if planet.version == 5 {
+            PlanetManifest::sign_v5(
+                planet.controller_url.clone(),
+                planet.roots.clone(),
+                planet.relays.clone(),
+                planet.tls_relays.clone(),
+                planet.turn_servers.clone(),
+                planet.stun_servers.clone(),
+                now(),
+                None,
+                &signing_key,
+            )?
+        } else if planet.version == 4 {
             PlanetManifest::sign_v4(
                 planet.controller_url.clone(),
                 planet.roots.clone(),
@@ -840,6 +891,31 @@ impl Controller {
         };
         Ok(Some(manifest))
     }
+
+    fn turn_credential(&self, device_id: DeviceId) -> Result<Option<TurnCredential>> {
+        let Some(planet) = &self.planet else {
+            return Ok(None);
+        };
+        let Some(auth) = &planet.turn_auth else {
+            return Ok(None);
+        };
+        mint_turn_credential(auth, device_id).map(Some)
+    }
+}
+
+fn mint_turn_credential(auth: &TurnRestAuth, device_id: DeviceId) -> Result<TurnCredential> {
+    let expires_at_unix_seconds = now().saturating_add(auth.credential_ttl_seconds);
+    let username = format!("{expires_at_unix_seconds}:{}", device_id.0);
+    let mut mac = Hmac::<Sha1>::new_from_slice(auth.secret.as_slice())
+        .map_err(|_| anyhow::anyhow!("TURN static-auth secret is invalid"))?;
+    mac.update(username.as_bytes());
+    let password = STANDARD.encode(mac.finalize().into_bytes());
+    Ok(TurnCredential {
+        version: 1,
+        username,
+        password,
+        expires_at_unix_seconds,
+    })
 }
 
 fn deliver_initial_admin_token(
@@ -1494,6 +1570,17 @@ async fn main() -> Result<()> {
     if !cli.planet_tls_relays.is_empty() && !uses_planet_v3 {
         anyhow::bail!("--planet-tls-relay requires Planet V3 Relay identities");
     }
+    if !cli.planet_turn_servers.is_empty() && !uses_planet_v3 {
+        anyhow::bail!("--planet-turn-server requires Planet V3 Relay identities");
+    }
+    if !cli.planet_turn_servers.is_empty() && cli.turn_static_auth_secret_file.is_none() {
+        anyhow::bail!(
+            "--planet-turn-server requires --turn-static-auth-secret-file so device credentials can be issued"
+        );
+    }
+    if cli.planet_turn_servers.is_empty() && cli.turn_static_auth_secret_file.is_some() {
+        anyhow::bail!("--turn-static-auth-secret-file requires at least one --planet-turn-server");
+    }
     if uses_planet_v3 && !cli.planet_roots.is_empty()
         || !uses_planet_v3 && !cli.planet_root_identities.is_empty()
     {
@@ -1503,9 +1590,36 @@ async fn main() -> Result<()> {
     }
     let has_relays =
         !cli.planet_relay_endpoints.is_empty() || !cli.planet_relay_identities.is_empty();
+    let turn_auth = cli
+        .turn_static_auth_secret_file
+        .as_deref()
+        .map(|path| {
+            let secret = meshlake_core::read_restricted_secret_file(path).with_context(|| {
+                format!(
+                    "cannot read restricted TURN static-auth secret {}",
+                    path.display()
+                )
+            })?;
+            if secret.len() < 16 {
+                anyhow::bail!("TURN static-auth secret must contain at least 16 bytes");
+            }
+            Ok(TurnRestAuth {
+                secret: Arc::new(secret),
+                credential_ttl_seconds: cli.turn_credential_ttl_seconds,
+            })
+        })
+        .transpose()?;
     let planet = match (cli.planet_controller_url, has_relays) {
         (Some(controller_url), true) => Some(PlanetSettings {
-            version: if !cli.planet_tls_relays.is_empty() { 4 } else if uses_planet_v3 { 3 } else { 2 },
+            version: if !cli.planet_turn_servers.is_empty() {
+                5
+            } else if !cli.planet_tls_relays.is_empty() {
+                4
+            } else if uses_planet_v3 {
+                3
+            } else {
+                2
+            },
             controller_url: validate_controller_url(
                 &controller_url,
                 cli.allow_insecure_public_http,
@@ -1543,6 +1657,16 @@ async fn main() -> Result<()> {
             })
             .collect(),
             tls_relays: cli.planet_tls_relays,
+            turn_servers: cli
+                .planet_turn_servers
+                .into_iter()
+                .enumerate()
+                .map(|(priority, mut server)| {
+                    server.priority = priority.min(u16::MAX as usize) as u16;
+                    server
+                })
+                .collect(),
+            turn_auth,
             stun_servers: cli
                 .planet_stun_servers
                 .into_iter()
@@ -1554,6 +1678,8 @@ async fn main() -> Result<()> {
         (None, false)
             if cli.planet_roots.is_empty()
                 && cli.planet_root_identities.is_empty()
+                && cli.planet_turn_servers.is_empty()
+                && cli.turn_static_auth_secret_file.is_none()
                 && cli.planet_stun_servers.is_empty() =>
         {
             None
@@ -1820,6 +1946,44 @@ fn parse_planet_tls_relay(value: &str) -> Result<PlanetTlsRelay, String> {
     })
 }
 
+fn parse_planet_turn_server(value: &str) -> Result<PlanetTurnServer, String> {
+    let parts = value.split('@').collect::<Vec<_>>();
+    let transport = match parts.first().copied() {
+        Some("udp") => TurnTransport::Udp,
+        Some("tcp") => TurnTransport::Tcp,
+        Some("tls") => TurnTransport::Tls,
+        _ => return Err("TURN server must start with udp, tcp, or tls".into()),
+    };
+    let expected_parts = match transport {
+        TurnTransport::Tls => 4,
+        TurnTransport::Udp | TurnTransport::Tcp => 2,
+    };
+    if parts.len() != expected_parts {
+        return Err("TURN server must use udp@IP:PORT, tcp@IP:PORT, or tls@IP:PORT@SERVER_NAME@BASE64_SHA256_CERT_PIN".into());
+    }
+    let endpoint = parts[1]
+        .parse::<SocketAddr>()
+        .map_err(|_| "TURN endpoint must be a numeric IP:PORT socket address".to_string())?;
+    let (server_name, certificate_sha256) = if matches!(transport, TurnTransport::Tls) {
+        let certificate_sha256 = STANDARD
+            .decode(parts[3])
+            .map_err(|_| "TURN TLS certificate pin is not valid Base64".to_string())?;
+        if certificate_sha256.len() != 32 {
+            return Err("TURN TLS certificate pin must contain exactly 32 bytes".into());
+        }
+        (Some(parts[2].to_owned()), certificate_sha256)
+    } else {
+        (None, Vec::new())
+    };
+    Ok(PlanetTurnServer {
+        endpoint,
+        transport,
+        server_name,
+        certificate_sha256,
+        priority: 0,
+    })
+}
+
 fn parse_planet_root_identity(value: &str) -> Result<PlanetRoot, String> {
     let (identity, endpoint) = parse_service_identity_descriptor(value)?;
     Ok(PlanetRoot {
@@ -1942,6 +2106,9 @@ mod tests {
             planet_relay_endpoints: Vec::new(),
             planet_relay_identities: Vec::new(),
             planet_tls_relays: Vec::new(),
+            planet_turn_servers: Vec::new(),
+            turn_static_auth_secret_file: None,
+            turn_credential_ttl_seconds: 3600,
             planet_roots: Vec::new(),
             planet_root_identities: Vec::new(),
             planet_stun_servers: Vec::new(),
@@ -1957,6 +2124,21 @@ mod tests {
             networks: HashMap::new(),
             enrollment_tokens: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn coturn_rest_credential_is_device_bound_and_redacted() {
+        let auth = TurnRestAuth {
+            secret: Arc::new(Zeroizing::new(b"controller-turn-secret".to_vec())),
+            credential_ttl_seconds: 600,
+        };
+        let device_id = DeviceId(Uuid::from_u128(77));
+        let credential = mint_turn_credential(&auth, device_id).unwrap();
+        assert_eq!(credential.version, 1);
+        assert!(credential.username.ends_with(&device_id.0.to_string()));
+        assert!(credential.expires_at_unix_seconds >= now() + 599);
+        assert!(!credential.password.is_empty());
+        assert!(!format!("{credential:?}").contains(&credential.password));
     }
 
     fn backup_path(path: &FsPath) -> PathBuf {

@@ -6,6 +6,7 @@ mod session_observability;
 mod state_backup_command;
 mod tls_relay;
 mod transport_health;
+mod turn;
 mod upnp;
 
 use adapter::{BootstrapEndpoint, BootstrapTransport, KillSwitchPlan};
@@ -34,14 +35,15 @@ use meshlake_core::{
     InitiatorHandshake, JoinedNetwork, MembershipCertificate, MembershipRefreshRequest,
     MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkControlPlane, NetworkId,
     NetworkKey, NetworkPolicyManifest, PairwiseSessionKeys, PeerPathStatus, PlanetManifest,
-    PlanetRelay, PlanetRoot, PlanetTlsRelay, RelayPolicy, ReplayWindow, RootRegistration,
-    RootRegistrationServiceKind, RootResponse, ServiceIdentityPolicy, SessionList, SessionPath,
-    SessionQueueCounters, SessionSecurityCounters, SessionState, SignedRelayRegistrationAck,
-    SignedRootResponse, StateFileLock, StateKeyProvider, StateProtection, TransportStatus,
-    UpsertNetworkRequest, VirtualNetwork, AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE,
-    RELAY_DATA, RELAY_MAGIC, RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY,
-    RELAY_PUNCH, RELAY_PUNCH_ACK, RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED,
-    RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA, RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
+    PlanetRelay, PlanetRoot, PlanetTlsRelay, PlanetTurnServer, RelayPolicy, ReplayWindow,
+    RootRegistration, RootRegistrationServiceKind, RootResponse, ServiceIdentityPolicy,
+    SessionList, SessionPath, SessionQueueCounters, SessionSecurityCounters, SessionState,
+    SignedRelayRegistrationAck, SignedRootResponse, StateFileLock, StateKeyProvider,
+    StateProtection, TransportStatus, TurnCredential, UpsertNetworkRequest, VirtualNetwork,
+    AGENT_STATE_PROTECTION_PURPOSE, RELAY_CANDIDATE, RELAY_DATA, RELAY_MAGIC,
+    RELAY_MAX_ASSIGNED_ADDRESSES, RELAY_PEER, RELAY_PEER_IDENTITY, RELAY_PUNCH, RELAY_PUNCH_ACK,
+    RELAY_REGISTER_ACK, RELAY_REGISTER_ACK_SIGNED, RELAY_REGISTER_SIGNED, RELAY_SESSION_DATA,
+    RELAY_SESSION_INIT, RELAY_SESSION_RESPONSE,
 };
 use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,7 @@ use transport_health::{
     select_relay_endpoint, EndpointHealthTable, RegistrationSchedule, RegistrationServiceKind,
     RegistrationTarget,
 };
+use turn::{TurnTelemetry, TurnUdpRoute, TurnUdpTransport};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -289,6 +292,10 @@ struct Agent {
     authorization_hint_refreshes: AtomicU64,
     registration_backoff_seconds: AtomicU64,
     tls_relay_telemetry: Arc<TlsRelayTelemetry>,
+    turn_telemetry: Arc<TurnTelemetry>,
+    /// Short-lived TURN REST credentials received over the authenticated
+    /// control plane. This map intentionally has no persisted counterpart.
+    turn_credentials: RwLock<HashMap<NetworkId, TurnCredential>>,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
     session_observability: SessionObservability,
@@ -302,6 +309,7 @@ struct NetworkTransportConfiguration {
     relay_endpoints: Vec<SocketAddr>,
     relay_identities: HashMap<SocketAddr, ServiceIdentityPolicy>,
     tls_relays: Vec<TlsRelayRoute>,
+    turn_servers: Vec<PlanetTurnServer>,
     planet_manifest_version: Option<u8>,
     planet_expires_at_unix_seconds: Option<u64>,
     root_servers: Vec<PlanetRoot>,
@@ -314,6 +322,7 @@ struct TransportConfiguration {
     root_servers: Vec<PlanetRoot>,
     stun_servers: Vec<String>,
     upnp_enabled: bool,
+    turn_routes: Vec<TurnUdpRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +333,7 @@ struct AuthorizationRefreshTarget {
     pinned_controller_public_key: Vec<u8>,
     certificate: MembershipCertificate,
     authorization_epoch: Option<u64>,
+    turn_credential_refresh_required: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +355,7 @@ struct VerifiedPlanetUpdate {
     roots: Vec<PlanetRoot>,
     relays: Vec<PlanetRelay>,
     tls_relays: Vec<PlanetTlsRelay>,
+    turn_servers: Vec<PlanetTurnServer>,
     stun_servers: Vec<String>,
 }
 
@@ -360,6 +371,7 @@ enum AuthorizationRefreshAction {
         certificate: MembershipCertificate,
         network_key: Vec<u8>,
         authorization: NetworkAuthorizationManifest,
+        turn_credential: Option<TurnCredential>,
     },
     UpdateManifest(NetworkAuthorizationManifest),
     Revoke,
@@ -486,6 +498,8 @@ impl Agent {
             authorization_hint_refreshes: AtomicU64::new(0),
             registration_backoff_seconds: AtomicU64::new(0),
             tls_relay_telemetry: Arc::new(TlsRelayTelemetry::default()),
+            turn_telemetry: Arc::new(TurnTelemetry::default()),
+            turn_credentials: RwLock::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
             session_observability,
@@ -537,6 +551,7 @@ impl Agent {
         drop(state);
         let health = self.transport_health.read().await;
         let tls_relay = self.tls_relay_telemetry.snapshot();
+        let turn = self.turn_telemetry.snapshot();
         let peer_paths = health.peer_paths.clone();
         let health_time = Instant::now();
         let mut responsive_roots = health
@@ -578,6 +593,12 @@ impl Agent {
                 tls_relay_frames_sent: tls_relay.frames_sent,
                 tls_relay_frames_received: tls_relay.frames_received,
                 tls_relay_queue_drops: tls_relay.queue_drops,
+                turn_configured: turn.configured,
+                turn_allocated: turn.allocated,
+                turn_allocation_failures: turn.allocation_failures,
+                turn_frames_sent: turn.frames_sent,
+                turn_frames_received: turn.frames_received,
+                turn_queue_drops: turn.queue_drops,
                 peer_paths,
             },
         }
@@ -908,7 +929,28 @@ impl Agent {
 
     async fn transport_configuration(&self) -> TransportConfiguration {
         let state = self.state.read().await;
-        transport_configuration_from_state(&state)
+        let mut configuration = transport_configuration_from_state(&state);
+        drop(state);
+        let credentials = self.turn_credentials.read().await;
+        let current_time = now();
+        for (network_id, network) in &configuration.networks {
+            let Some(credential) = credentials.get(network_id) else {
+                continue;
+            };
+            if credential.expires_at_unix_seconds <= current_time.saturating_add(30) {
+                continue;
+            }
+            for server in &network.turn_servers {
+                if matches!(server.transport, meshlake_core::TurnTransport::Udp) {
+                    configuration.turn_routes.push(TurnUdpRoute {
+                        network_id: *network_id,
+                        server: server.clone(),
+                        credential: credential.clone(),
+                    });
+                }
+            }
+        }
+        configuration
     }
 
     fn request_transport_reload(&self) {
@@ -980,7 +1022,8 @@ impl Agent {
         &self,
     ) -> Result<(DeviceId, SigningKey, Vec<AuthorizationRefreshTarget>)> {
         let state = self.state.read().await;
-        let targets = state
+        let identity = identity_signing_key(&state)?;
+        let mut targets: Vec<AuthorizationRefreshTarget> = state
             .networks
             .iter()
             .filter_map(|network| {
@@ -999,10 +1042,25 @@ impl Agent {
                         .authorization_manifest
                         .as_ref()
                         .map(|authorization| authorization.authorization_epoch),
+                    turn_credential_refresh_required: !network
+                        .control_plane
+                        .verified_turn_servers
+                        .is_empty(),
                 })
             })
             .collect();
-        Ok((state.device_id, identity_signing_key(&state)?, targets))
+        let device_id = state.device_id;
+        drop(state);
+        let credentials = self.turn_credentials.read().await;
+        for target in &mut targets {
+            target.turn_credential_refresh_required &= credentials
+                .get(&target.network_id)
+                .is_none_or(|credential| {
+                    credential.expires_at_unix_seconds
+                        <= now().saturating_add(CERTIFICATE_REFRESH_MARGIN_SECONDS)
+                });
+        }
+        Ok((device_id, identity, targets))
     }
 
     async fn planet_refresh_targets(&self) -> Vec<PlanetRefreshTarget> {
@@ -1116,6 +1174,7 @@ impl Agent {
 
         let reload_transport;
         let mut removed_network = None;
+        let mut turn_credential_update = None;
         let previous_exit_gateways = state.exit_gateways.clone();
         match action {
             AuthorizationRefreshAction::UpdateManifest(authorization) => {
@@ -1133,16 +1192,23 @@ impl Agent {
                 certificate,
                 network_key,
                 authorization,
+                turn_credential,
             } => {
+                if let Some(credential) = turn_credential.as_ref() {
+                    validate_turn_credential(credential)
+                        .map_err(|error| anyhow::anyhow!(error.1))?;
+                }
                 let joined = &mut state.networks[index];
                 joined.assigned_addresses = certificate.claims.assigned_addresses.clone();
                 joined.certificate = Some(certificate);
                 joined.network_key = network_key;
                 joined.control_plane.authorization_manifest = Some(authorization);
+                turn_credential_update = Some(turn_credential);
                 reload_transport = true;
             }
             AuthorizationRefreshAction::Revoke => {
                 removed_network = Some(state.networks.remove(index));
+                turn_credential_update = Some(None);
                 reload_transport = true;
             }
         }
@@ -1183,6 +1249,14 @@ impl Agent {
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
+        if let Some(credential) = turn_credential_update {
+            let mut credentials = self.turn_credentials.write().await;
+            if let Some(credential) = credential {
+                credentials.insert(target.network_id, credential);
+            } else {
+                credentials.remove(&target.network_id);
+            }
+        }
 
         if reload_transport {
             // Security state changes must invalidate the old peer/session worker
@@ -1672,6 +1746,9 @@ impl Agent {
                 "membership certificate is not active in the controller authorization manifest",
             ));
         }
+        if let Some(credential) = enrollment.turn_credential.as_ref() {
+            validate_turn_credential(credential)?;
+        }
         NetworkKey::from_slice(&enrollment.network_key).map_err(ApiError::bad_request)?;
         if enrollment.certificate.claims.network_id != enrollment.network.id {
             return Err(ApiError::bad_request(
@@ -1721,6 +1798,8 @@ impl Agent {
             existing_control_plane.as_ref(),
         )
         .await?;
+        let network_id = enrollment.network.id;
+        let turn_credential = enrollment.turn_credential;
         let _lifecycle = self.adapter_lifecycle.lock().await;
         let mut state = self.state.write().await;
         let joined = JoinedNetwork {
@@ -1776,6 +1855,14 @@ impl Agent {
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
         drop(state);
+        {
+            let mut credentials = self.turn_credentials.write().await;
+            if let Some(credential) = turn_credential {
+                credentials.insert(network_id, credential);
+            } else {
+                credentials.remove(&network_id);
+            }
+        }
         if self.adapter.is_active() {
             if let Some(previous) = &previous {
                 self.adapter
@@ -2214,6 +2301,8 @@ fn validate_planet_update(
     }
     let mut tls_relays = manifest.tls_relays.clone();
     tls_relays.sort_by_key(|relay| relay.priority);
+    let mut turn_servers = manifest.turn_servers.clone();
+    turn_servers.sort_by_key(|server| (server.priority, server.endpoint, server.transport as u8));
     let mut stun_servers = manifest
         .stun_servers
         .iter()
@@ -2232,6 +2321,7 @@ fn validate_planet_update(
         roots,
         relays,
         tls_relays,
+        turn_servers,
         stun_servers,
     })
 }
@@ -2303,6 +2393,7 @@ fn apply_planet_update(
         || control_plane.verified_roots != update.roots
         || control_plane.verified_relays != update.relays
         || control_plane.verified_tls_relays != update.tls_relays
+        || control_plane.verified_turn_servers != update.turn_servers
         || control_plane.verified_stun_servers != update.stun_servers;
     control_plane.planet_manifest_url = manifest_url;
     control_plane.planet_manifest_version = Some(update.version);
@@ -2313,6 +2404,7 @@ fn apply_planet_update(
     control_plane.verified_roots = update.roots.clone();
     control_plane.verified_relays = update.relays.clone();
     control_plane.verified_tls_relays = update.tls_relays.clone();
+    control_plane.verified_turn_servers = update.turn_servers.clone();
     control_plane.verified_stun_servers = update.stun_servers.clone();
     changed
 }
@@ -2327,6 +2419,28 @@ fn apply_configured_planet_update(
     control_plane.controller_tls_ca_pem = controller_tls_ca_pem;
     let manifest_changed = apply_planet_update(control_plane, Some(manifest_url), update);
     ca_changed || manifest_changed
+}
+
+fn validate_turn_credential(credential: &TurnCredential) -> Result<(), ApiError> {
+    if credential.version != 1
+        || credential.username.is_empty()
+        || credential.username.len() > 512
+        || credential.password.is_empty()
+        || credential.password.len() > 1024
+        || credential
+            .username
+            .bytes()
+            .chain(credential.password.bytes())
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(ApiError::bad_request("TURN credential is malformed"));
+    }
+    if credential.expires_at_unix_seconds <= now().saturating_add(30) {
+        return Err(ApiError::bad_request(
+            "TURN credential is expired or too close to expiry",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_http_url(value: &str, description: &str) -> Result<String, ApiError> {
@@ -2521,7 +2635,10 @@ async fn fetch_authorization_action(
         .claims
         .expires_at_unix_seconds
         .is_some_and(|expiry| expiry <= now().saturating_add(CERTIFICATE_REFRESH_MARGIN_SECONDS));
-    if authorization.authorizes(&target.certificate) && !certificate_expires_soon {
+    if authorization.authorizes(&target.certificate)
+        && !certificate_expires_soon
+        && !target.turn_credential_refresh_required
+    {
         return Ok(AuthorizationRefreshAction::UpdateManifest(authorization));
     }
 
@@ -2590,10 +2707,14 @@ async fn fetch_authorization_action(
     }
     NetworkKey::from_slice(&response.network_key)
         .context("controller refresh response contains an invalid network key")?;
+    if target.turn_credential_refresh_required && response.turn_credential.is_none() {
+        anyhow::bail!("controller did not return the required TURN credential");
+    }
     Ok(AuthorizationRefreshAction::Update {
         certificate,
         network_key: response.network_key,
         authorization: response.authorization,
+        turn_credential: response.turn_credential,
     })
 }
 
@@ -2782,6 +2903,7 @@ fn migrate_planet_acceptance_metadata(control_plane: &mut NetworkControlPlane) -
             roots,
             relays,
             tls_relays: Vec::new(),
+            turn_servers: Vec::new(),
             stun_servers,
             issued_at_unix_seconds: 0,
             expires_at_unix_seconds: None,
@@ -2889,6 +3011,13 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
                     })
             })
             .collect::<Vec<_>>();
+        let mut turn_servers = if planet_expired {
+            Vec::new()
+        } else {
+            joined.control_plane.verified_turn_servers.clone()
+        };
+        turn_servers
+            .sort_by_key(|server| (server.priority, server.endpoint, server.transport as u8));
         let mut relay_endpoints = relays
             .iter()
             .map(|relay| relay.endpoint)
@@ -2941,6 +3070,7 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
                 relay_endpoints,
                 relay_identities,
                 tls_relays,
+                turn_servers,
                 planet_manifest_version: joined.control_plane.planet_manifest_version,
                 planet_expires_at_unix_seconds: (!planet_expired)
                     .then_some(joined.control_plane.planet_expires_at_unix_seconds)
@@ -4114,6 +4244,7 @@ async fn send_peer_routed_packet(
     relay_endpoints: &[SocketAddr],
     tls_relays: &[TlsRelayRoute],
     tls_relay_transport: &TlsRelayTransport,
+    turn_transport: &TurnUdpTransport,
     endpoint_health: &EndpointHealthTable,
     network: &JoinedNetwork,
     route: &PeerRoute,
@@ -4134,6 +4265,15 @@ async fn send_peer_routed_packet(
     }
     if matches!(network.network.relay_policy, RelayPolicy::Disabled) {
         return None;
+    }
+    if let Some(relay_endpoint) = relay_endpoints.first().copied() {
+        if turn_transport.try_send_any(relay_endpoint, packet) {
+            trace_transport(format!(
+                "sent {description} for member {} through authenticated UDP TURN",
+                target_device.0
+            ));
+            return Some(SessionPath::Relay);
+        }
     }
     let relay_endpoint = select_relay_endpoint(
         network.network.id,
@@ -4192,12 +4332,15 @@ fn session_path_description(path: SessionPath) -> &'static str {
 async fn send_to_inbound_path(
     sockets: &TransportSockets,
     tls_relay_transport: &TlsRelayTransport,
+    turn_transport: &TurnUdpTransport,
     remote: SocketAddr,
     packet: &[u8],
     via_tls_relay: bool,
 ) -> bool {
     if via_tls_relay {
         tls_relay_transport.try_send(remote, packet)
+    } else if turn_transport.try_send_any(remote, packet) {
+        true
     } else {
         sockets.send_to(packet, remote).await
     }
@@ -4231,7 +4374,7 @@ fn sign_registration_for_planet_service(
     signing_key: &SigningKey,
 ) -> std::result::Result<Option<RootRegistration>, meshlake_core::RootProtocolError> {
     match planet_manifest_version {
-        Some(3 | 4) => {
+        Some(3 | 4 | 5) => {
             let Some(identity) = service_identity else {
                 return Ok(None);
             };
@@ -4349,6 +4492,10 @@ async fn run_relay_worker(
         configuration.all_tls_relays(),
         Arc::clone(&agent.tls_relay_telemetry),
     )?;
+    let mut turn_transport = TurnUdpTransport::start(
+        configuration.turn_routes.clone(),
+        Arc::clone(&agent.turn_telemetry),
+    )?;
     let relay_endpoints = configuration.relay_endpoints.clone();
     let root_servers = configuration.root_servers.clone();
     trace_transport(format!(
@@ -4450,6 +4597,7 @@ async fn run_relay_worker(
                     &mut endpoint_health,
                     &mut registration_schedules,
                     &tls_relay_transport,
+                    &turn_transport,
                     false,
                 ).await?;
             }
@@ -4473,6 +4621,7 @@ async fn run_relay_worker(
                     &mut endpoint_health,
                     &mut registration_schedules,
                     &tls_relay_transport,
+                    &turn_transport,
                     false,
                 ).await?;
             }
@@ -4496,7 +4645,32 @@ async fn run_relay_worker(
                     &mut endpoint_health,
                     &mut registration_schedules,
                     &tls_relay_transport,
+                    &turn_transport,
                     true,
+                ).await?;
+            }
+            received = turn_transport.receive() => {
+                let Some(received) = received else { continue; };
+                receive_udp_packet(
+                    &agent,
+                    &sockets,
+                    &configuration,
+                    configuration_revision,
+                    received.relay_endpoint,
+                    &received.packet,
+                    &mut peers,
+                    &mut sessions,
+                    &mut seen_handshakes,
+                    &identity,
+                    &mut stun_transactions,
+                    &mut root_transactions,
+                    &mut relay_registration_transactions,
+                    &mut advertised_candidates,
+                    &mut endpoint_health,
+                    &mut registration_schedules,
+                    &tls_relay_transport,
+                    &turn_transport,
+                    false,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -4604,6 +4778,7 @@ async fn run_relay_worker(
                             configuration.relay_endpoints_for(network_id),
                             configuration.tls_relays_for(network_id),
                             &tls_relay_transport,
+                            &turn_transport,
                             &endpoint_health,
                             network,
                             route,
@@ -4732,7 +4907,7 @@ async fn run_relay_worker(
                             )?
                             else {
                                 trace_transport(match manifest_version {
-                                    Some(3 | 4) => format!(
+                                    Some(3 | 4 | 5) => format!(
                                         "skipped signed Planet Relay registration without a pinned service identity for network {}",
                                         certificate.claims.network_id.0
                                     ),
@@ -4749,12 +4924,13 @@ async fn run_relay_worker(
                             registration.push(RELAY_REGISTER_SIGNED);
                             registration.extend_from_slice(&serde_json::to_vec(&signed)?);
                             let udp_sent = sockets.send_to(&registration, *relay_endpoint).await;
+                            let turn_sent = turn_transport.try_send_any(*relay_endpoint, &registration);
                             let tls_sent = configuration
                                 .tls_relays_for(certificate.claims.network_id)
                                 .iter()
                                 .filter(|route| route.relay_endpoint == *relay_endpoint)
                                 .any(|route| tls_relay_transport.try_send(route.relay_endpoint, &registration));
-                            if udp_sent || tls_sent {
+                            if udp_sent || turn_sent || tls_sent {
                                 schedule.mark_sent(schedule_time);
                                 relay_registration_transactions.insert(
                                     nonce,
@@ -4817,7 +4993,7 @@ async fn run_relay_worker(
                                     )?
                                 else {
                                     trace_transport(match manifest_version {
-                                        Some(3 | 4) => format!(
+                                        Some(3 | 4 | 5) => format!(
                                             "skipped signed Planet Root registration without a pinned service identity for network {}",
                                             certificate.claims.network_id.0
                                         ),
@@ -4927,6 +5103,7 @@ async fn run_relay_worker(
                             configuration.relay_endpoints_for(network.network.id),
                             configuration.tls_relays_for(network.network.id),
                             &tls_relay_transport,
+                            &turn_transport,
                             &endpoint_health,
                             network,
                             &route,
@@ -4973,6 +5150,7 @@ async fn receive_udp_packet(
     endpoint_health: &mut EndpointHealthTable,
     registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
     tls_relay_transport: &TlsRelayTransport,
+    turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
@@ -5228,6 +5406,7 @@ async fn receive_udp_packet(
                 identity,
                 configuration_revision,
                 tls_relay_transport,
+                turn_transport,
                 via_tls_relay,
             )
             .await?;
@@ -5243,6 +5422,7 @@ async fn receive_udp_packet(
                 sessions,
                 configuration_revision,
                 tls_relay_transport,
+                turn_transport,
                 via_tls_relay,
             )
             .await?;
@@ -5436,6 +5616,7 @@ async fn receive_session_init(
     identity: &SigningKey,
     configuration_revision: u64,
     tls_relay_transport: &TlsRelayTransport,
+    turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
@@ -5487,6 +5668,7 @@ async fn receive_session_init(
         send_to_inbound_path(
             sockets,
             tls_relay_transport,
+            turn_transport,
             remote,
             &response,
             via_tls_relay,
@@ -5576,6 +5758,7 @@ async fn receive_session_init(
     send_to_inbound_path(
         sockets,
         tls_relay_transport,
+        turn_transport,
         remote,
         &response,
         via_tls_relay,
@@ -5587,6 +5770,7 @@ async fn receive_session_init(
             send_to_inbound_path(
                 sockets,
                 tls_relay_transport,
+                turn_transport,
                 remote,
                 &encrypted,
                 via_tls_relay,
@@ -5617,6 +5801,7 @@ async fn receive_session_response(
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     configuration_revision: u64,
     tls_relay_transport: &TlsRelayTransport,
+    turn_transport: &TurnUdpTransport,
     via_tls_relay: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
@@ -5715,6 +5900,7 @@ async fn receive_session_response(
             send_to_inbound_path(
                 sockets,
                 tls_relay_transport,
+                turn_transport,
                 remote,
                 &encrypted,
                 via_tls_relay,
@@ -6028,7 +6214,7 @@ fn acknowledge_signed_relay_registration(
     let nonce = acknowledgement.payload.request_nonce;
     let transaction = transactions.get(&nonce)?;
     let identity = transaction.identity.as_ref()?;
-    if !matches!(transaction.planet_manifest_version, Some(3 | 4))
+    if !matches!(transaction.planet_manifest_version, Some(3 | 4 | 5))
         || transaction.endpoint != endpoint
         || now_instant.saturating_duration_since(transaction.issued_at) >= TRANSPORT_TRANSACTION_TTL
         || acknowledgement
@@ -6674,6 +6860,7 @@ mod tests {
                 .authorization_manifest
                 .as_ref()
                 .map(|authorization| authorization.authorization_epoch),
+            turn_credential_refresh_required: false,
         }
     }
 
@@ -9712,6 +9899,7 @@ mod tests {
             authorization: authorization.clone(),
             certificate: Some(new_certificate.clone()),
             network_key: vec![9_u8; 32],
+            turn_credential: None,
         };
         let (address, server) = spawn_json_server(vec![
             serde_json::to_vec(&authorization).unwrap(),
@@ -9732,6 +9920,7 @@ mod tests {
                 certificate,
                 network_key,
                 authorization,
+                ..
             } => {
                 assert_eq!(certificate, new_certificate);
                 assert_eq!(network_key, vec![9_u8; 32]);
@@ -9965,6 +10154,7 @@ mod tests {
                 certificate,
                 network_key: vec![3; 32],
                 authorization,
+                turn_credential: None,
             },
             controller_public_key: controller.verifying_key().to_bytes().to_vec(),
             control_plane: Some(EnrollmentControlPlane {

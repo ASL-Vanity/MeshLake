@@ -106,6 +106,10 @@ pub struct NetworkControlPlane {
     /// TLS relay endpoints copied from a verified Planet V4 manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_tls_relays: Vec<crate::crypto::PlanetTlsRelay>,
+    /// Public TURN endpoints copied from a verified Planet V5 manifest.
+    /// Device-specific TURN credentials never appear in this persisted state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_turn_servers: Vec<crate::crypto::PlanetTurnServer>,
     /// STUN server names copied from a verified Planet manifest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_stun_servers: Vec<String>,
@@ -136,6 +140,7 @@ impl NetworkControlPlane {
             && self.verified_roots.is_empty()
             && self.verified_relays.is_empty()
             && self.verified_tls_relays.is_empty()
+            && self.verified_turn_servers.is_empty()
             && self.verified_stun_servers.is_empty()
             && self.authorization_manifest.is_none()
             && self.policy_manifest.is_none()
@@ -219,6 +224,20 @@ pub struct TransportStatus {
     pub tls_relay_frames_received: u64,
     #[serde(default)]
     pub tls_relay_queue_drops: u64,
+    /// Sanitized UDP TURN health. Credentials and endpoints are never exposed
+    /// through the local status API.
+    #[serde(default)]
+    pub turn_configured: u64,
+    #[serde(default)]
+    pub turn_allocated: u64,
+    #[serde(default)]
+    pub turn_allocation_failures: u64,
+    #[serde(default)]
+    pub turn_frames_sent: u64,
+    #[serde(default)]
+    pub turn_frames_received: u64,
+    #[serde(default)]
+    pub turn_queue_drops: u64,
     #[serde(default)]
     pub peer_paths: Vec<PeerPathStatus>,
 }
@@ -400,6 +419,7 @@ mod tests {
                     identity: None,
                 }],
                 verified_tls_relays: Vec::new(),
+                verified_turn_servers: Vec::new(),
                 verified_stun_servers: vec!["stun.example:3478".into()],
                 authorization_manifest: Some(NetworkAuthorizationManifest {
                     version: 1,

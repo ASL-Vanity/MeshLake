@@ -11,7 +11,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -169,6 +169,57 @@ pub struct EnrollmentResponse {
     /// loopback development, and agents must protect this value at rest.
     pub network_key: Vec<u8>,
     pub authorization: crate::authorization::NetworkAuthorizationManifest,
+    /// Ephemeral TURN REST credential. It is intentionally not part of a
+    /// joined network's persisted control-plane state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_credential: Option<TurnCredential>,
+}
+
+/// TURN server transport distributed as signed public Planet metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTransport {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+/// Controller-signed public TURN endpoint. TLS transports pin the server leaf
+/// certificate just like a Planet V4 TLS Relay; UDP/TCP TURN use no implicit
+/// platform trust store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanetTurnServer {
+    pub endpoint: SocketAddr,
+    pub transport: TurnTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificate_sha256: Vec<u8>,
+    #[serde(default)]
+    pub priority: u16,
+}
+
+/// Short-lived credential generated from the Controller's protected TURN REST
+/// shared secret. It is sent only through enrollment/refresh HTTPS responses,
+/// is never persisted, and is redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCredential {
+    pub version: u8,
+    pub username: String,
+    pub password: String,
+    pub expires_at_unix_seconds: u64,
+}
+
+impl std::fmt::Debug for TurnCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnCredential")
+            .field("version", &self.version)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -226,6 +277,8 @@ pub struct PlanetManifest {
     pub relays: Vec<PlanetRelay>,
     #[serde(default)]
     pub tls_relays: Vec<PlanetTlsRelay>,
+    #[serde(default)]
+    pub turn_servers: Vec<PlanetTurnServer>,
     #[serde(default)]
     pub stun_servers: Vec<String>,
     pub issued_at_unix_seconds: u64,
@@ -286,6 +339,21 @@ struct PlanetManifestV4Payload<'a> {
 }
 
 #[derive(Serialize)]
+struct PlanetManifestV5Payload<'a> {
+    version: u8,
+    controller_url: &'a str,
+    relay_endpoint: SocketAddr,
+    roots: &'a [PlanetRoot],
+    relays: &'a [PlanetRelay],
+    tls_relays: &'a [PlanetTlsRelay],
+    turn_servers: &'a [PlanetTurnServer],
+    stun_servers: &'a [String],
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: Option<u64>,
+    controller_public_key: &'a [u8],
+}
+
+#[derive(Serialize)]
 struct PlanetManifestSemanticPayload<'a> {
     version: u8,
     controller_url: &'a str,
@@ -293,6 +361,7 @@ struct PlanetManifestSemanticPayload<'a> {
     roots: &'a [PlanetRoot],
     relays: &'a [PlanetRelay],
     tls_relays: &'a [PlanetTlsRelay],
+    turn_servers: &'a [PlanetTurnServer],
     stun_servers: &'a [String],
     controller_public_key: &'a [u8],
 }
@@ -309,6 +378,7 @@ impl PlanetManifest {
             roots: &self.roots,
             relays: &self.relays,
             tls_relays: &self.tls_relays,
+            turn_servers: &self.turn_servers,
             stun_servers: &self.stun_servers,
             controller_public_key: &self.controller_public_key,
         })
@@ -343,6 +413,7 @@ impl PlanetManifest {
             roots: Vec::new(),
             relays: Vec::new(),
             tls_relays: Vec::new(),
+            turn_servers: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
@@ -387,6 +458,7 @@ impl PlanetManifest {
             roots,
             relays,
             tls_relays: Vec::new(),
+            turn_servers: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
@@ -454,6 +526,7 @@ impl PlanetManifest {
             roots,
             relays,
             tls_relays: Vec::new(),
+            turn_servers: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
@@ -503,6 +576,54 @@ impl PlanetManifest {
         Ok(manifest)
     }
 
+    /// Creates a Planet V5 manifest with controller-signed public TURN
+    /// endpoints. TURN credentials themselves deliberately remain outside the
+    /// manifest because they are short lived and device specific.
+    pub fn sign_v5(
+        controller_url: String,
+        roots: Vec<PlanetRoot>,
+        relays: Vec<PlanetRelay>,
+        tls_relays: Vec<PlanetTlsRelay>,
+        mut turn_servers: Vec<PlanetTurnServer>,
+        stun_servers: Vec<String>,
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: Option<u64>,
+        signing_key: &SigningKey,
+    ) -> Result<Self, CryptoError> {
+        let mut manifest = Self::sign_v4(
+            controller_url,
+            roots,
+            relays,
+            tls_relays,
+            stun_servers,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            signing_key,
+        )?;
+        turn_servers
+            .sort_by_key(|server| (server.priority, server.endpoint, server.transport as u8));
+        validate_turn_servers(&turn_servers)?;
+        let payload = PlanetManifestV5Payload {
+            version: 5,
+            controller_url: &manifest.controller_url,
+            relay_endpoint: manifest.relay_endpoint,
+            roots: &manifest.roots,
+            relays: &manifest.relays,
+            tls_relays: &manifest.tls_relays,
+            turn_servers: &turn_servers,
+            stun_servers: &manifest.stun_servers,
+            issued_at_unix_seconds: manifest.issued_at_unix_seconds,
+            expires_at_unix_seconds: manifest.expires_at_unix_seconds,
+            controller_public_key: &manifest.controller_public_key,
+        };
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|_| CryptoError::CertificateEncodingFailed)?;
+        manifest.version = 5;
+        manifest.turn_servers = turn_servers;
+        manifest.signature = signing_key.sign(&bytes).to_bytes().to_vec();
+        Ok(manifest)
+    }
+
     /// Validates both the signature and the out-of-band pinned controller key.
     /// A manifest downloaded from an arbitrary web server is never trusted just
     /// because it is self-consistent.
@@ -511,7 +632,7 @@ impl PlanetManifest {
         trusted_controller_public_key: &[u8],
         now_unix_seconds: u64,
     ) -> Result<(), CryptoError> {
-        if !matches!(self.version, 1 | 2 | 3 | 4)
+        if !matches!(self.version, 1 | 2 | 3 | 4 | 5)
             || self.controller_public_key != trusted_controller_public_key
         {
             return Err(CryptoError::UntrustedController);
@@ -565,9 +686,14 @@ impl PlanetManifest {
                     .required_public_keys(now_unix_seconds)
                     .map_err(|_| CryptoError::InvalidServiceIdentity)?;
             }
-            if self.version == 4 {
+            if self.version >= 4 {
                 validate_tls_relays(&self.tls_relays, &self.relays)?;
             } else if !self.tls_relays.is_empty() {
+                return Err(CryptoError::InvalidCertificate);
+            }
+            if self.version == 5 {
+                validate_turn_servers(&self.turn_servers)?;
+            } else if !self.turn_servers.is_empty() {
                 return Err(CryptoError::InvalidCertificate);
             }
         }
@@ -605,7 +731,7 @@ impl PlanetManifest {
                 expires_at_unix_seconds: self.expires_at_unix_seconds,
                 controller_public_key: &self.controller_public_key,
             })
-        } else {
+        } else if self.version == 4 {
             serde_json::to_vec(&PlanetManifestV4Payload {
                 version: self.version,
                 controller_url: &self.controller_url,
@@ -613,6 +739,20 @@ impl PlanetManifest {
                 roots: &self.roots,
                 relays: &self.relays,
                 tls_relays: &self.tls_relays,
+                stun_servers: &self.stun_servers,
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                expires_at_unix_seconds: self.expires_at_unix_seconds,
+                controller_public_key: &self.controller_public_key,
+            })
+        } else {
+            serde_json::to_vec(&PlanetManifestV5Payload {
+                version: self.version,
+                controller_url: &self.controller_url,
+                relay_endpoint: self.relay_endpoint,
+                roots: &self.roots,
+                relays: &self.relays,
+                tls_relays: &self.tls_relays,
+                turn_servers: &self.turn_servers,
                 stun_servers: &self.stun_servers,
                 issued_at_unix_seconds: self.issued_at_unix_seconds,
                 expires_at_unix_seconds: self.expires_at_unix_seconds,
@@ -655,6 +795,62 @@ fn validate_tls_relays(
         }
     }
     Ok(())
+}
+
+fn validate_turn_servers(turn_servers: &[PlanetTurnServer]) -> Result<(), CryptoError> {
+    let mut endpoints = std::collections::BTreeSet::new();
+    for server in turn_servers {
+        if !is_public_unicast_endpoint(server.endpoint)
+            || !endpoints.insert((server.endpoint, server.transport as u8))
+        {
+            return Err(CryptoError::InvalidCertificate);
+        }
+        match server.transport {
+            TurnTransport::Udp | TurnTransport::Tcp => {
+                if server.server_name.is_some() || !server.certificate_sha256.is_empty() {
+                    return Err(CryptoError::InvalidCertificate);
+                }
+            }
+            TurnTransport::Tls => {
+                let Some(server_name) = server.server_name.as_deref() else {
+                    return Err(CryptoError::InvalidCertificate);
+                };
+                if server_name.is_empty()
+                    || server_name.len() > 253
+                    || server_name
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                    || server.certificate_sha256.len() != 32
+                {
+                    return Err(CryptoError::InvalidCertificate);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_public_unicast_endpoint(endpoint: SocketAddr) -> bool {
+    if endpoint.port() == 0 {
+        return false;
+    }
+    match endpoint.ip() {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !address.is_private()
+                && !address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+        }
+    }
 }
 
 impl MembershipCertificate {
@@ -938,6 +1134,68 @@ mod tests {
         );
         let mut tampered = manifest;
         tampered.tls_relays[0].certificate_sha256[0] ^= 1;
+        assert_eq!(
+            tampered.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Err(CryptoError::InvalidCertificate)
+        );
+    }
+
+    #[test]
+    fn planet_v5_signs_public_turn_endpoints_and_rejects_tampering() {
+        let controller = SigningKey::from_bytes(&[21; 32]);
+        let root = SigningKey::from_bytes(&[22; 32]);
+        let relay = SigningKey::from_bytes(&[23; 32]);
+        let relay_id = uuid::Uuid::from_u128(24);
+        let manifest = PlanetManifest::sign_v5(
+            "https://planet.example".into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec!["203.0.113.21:51819".parse().unwrap()],
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    uuid::Uuid::from_u128(25),
+                    root.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![PlanetRelay {
+                endpoint: "203.0.113.22:51820".parse().unwrap(),
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    relay_id,
+                    relay.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![],
+            vec![
+                PlanetTurnServer {
+                    endpoint: "203.0.113.23:3478".parse().unwrap(),
+                    transport: TurnTransport::Udp,
+                    server_name: None,
+                    certificate_sha256: Vec::new(),
+                    priority: 2,
+                },
+                PlanetTurnServer {
+                    endpoint: "203.0.113.24:443".parse().unwrap(),
+                    transport: TurnTransport::Tls,
+                    server_name: Some("turn.example".into()),
+                    certificate_sha256: vec![26; 32],
+                    priority: 1,
+                },
+            ],
+            vec![],
+            100,
+            Some(200),
+            &controller,
+        )
+        .unwrap();
+        assert_eq!(manifest.version, 5);
+        assert_eq!(manifest.turn_servers[0].priority, 1);
+        assert_eq!(
+            manifest.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Ok(())
+        );
+        let mut tampered = manifest;
+        tampered.turn_servers[0].certificate_sha256[0] ^= 1;
         assert_eq!(
             tampered.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
             Err(CryptoError::InvalidCertificate)
