@@ -390,7 +390,7 @@ enum PolicyOperation {
 
 fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<String> {
     let mut scripts = Vec::new();
-    for route in &plan.routes {
+    for route in plan.routes.iter().chain(&plan.exit_routes) {
         scripts.push(match operation {
             PolicyOperation::Apply => format!(
                 "New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{}' -InterfaceAlias '{}' -NextHop '{}' -RouteMetric 5 -ErrorAction Stop | Out-Null",
@@ -607,6 +607,8 @@ mod tests {
                 network_id: meshlake_core::NetworkId(uuid::Uuid::from_u128(1)),
                 gateway_device_id: meshlake_core::DeviceId(uuid::Uuid::from_u128(2)),
             }],
+            exit_routes: vec![],
+            exit_kill_switch: false,
             dns_servers: vec!["10.20.0.53".parse().unwrap()],
             search_domains: vec!["corp.example".into()],
         };

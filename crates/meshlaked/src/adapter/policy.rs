@@ -15,6 +15,10 @@ pub(super) struct PlannedRoute {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct PolicyPlan {
     pub routes: Vec<PlannedRoute>,
+    /// Locally selected, controller-authorized default routes. Kept separate
+    /// from split routes so platform adapters can apply stronger safeguards.
+    pub exit_routes: Vec<PlannedRoute>,
+    pub exit_kill_switch: bool,
     pub dns_servers: Vec<IpAddr>,
     pub search_domains: Vec<String>,
 }
@@ -22,6 +26,8 @@ pub(super) struct PolicyPlan {
 impl PolicyPlan {
     pub fn from_networks(networks: &[JoinedNetwork], now_unix_seconds: u64) -> Result<Self> {
         let mut routes = BTreeMap::<String, PlannedRoute>::new();
+        let mut exit_routes = BTreeMap::<String, PlannedRoute>::new();
+        let mut exit_kill_switch = false;
         let mut dns_servers = Vec::new();
         let mut search_domains = Vec::new();
         let mut dns_owner: Option<NetworkId> = None;
@@ -71,6 +77,76 @@ impl PolicyPlan {
                     }
                 }
             }
+            let selection = &joined.control_plane.exit_node_selection;
+            if selection.kill_switch
+                && selection.ipv4_gateway.is_none()
+                && selection.ipv6_gateway.is_none()
+            {
+                bail!(
+                    "network {} enables an exit kill switch without selecting an exit gateway",
+                    joined.network.id.0
+                );
+            }
+            for (gateway, prefix, probe) in [
+                (
+                    selection.ipv4_gateway,
+                    "0.0.0.0/0",
+                    "192.0.2.1".parse::<IpAddr>().expect("literal IPv4 address"),
+                ),
+                (
+                    selection.ipv6_gateway,
+                    "::/0",
+                    "2001:db8::1"
+                        .parse::<IpAddr>()
+                        .expect("literal IPv6 address"),
+                ),
+            ] {
+                let Some(gateway_device_id) = gateway else {
+                    continue;
+                };
+                policy
+                    .verify_for_network(
+                        joined.network.id,
+                        &joined.control_plane.pinned_controller_public_key,
+                        joined
+                            .control_plane
+                            .authorization_manifest
+                            .as_ref()
+                            .context("exit selection requires controller authorization")?,
+                        now_unix_seconds,
+                        None,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "network {} exit selection has no current verified policy",
+                            joined.network.id.0
+                        )
+                    })?;
+                if !policy.exit_node_supports(gateway_device_id, probe) {
+                    bail!(
+                        "network {} selected gateway {} is not authorized for exit route {prefix}",
+                        joined.network.id.0,
+                        gateway_device_id.0
+                    );
+                }
+                let planned = PlannedRoute {
+                    prefix: prefix.into(),
+                    network_id: joined.network.id,
+                    gateway_device_id,
+                };
+                if let Some(previous) = exit_routes.insert(planned.prefix.clone(), planned.clone())
+                {
+                    if previous.network_id != planned.network_id
+                        || previous.gateway_device_id != planned.gateway_device_id
+                    {
+                        bail!(
+                            "exit route {} is ambiguous across networks or gateways",
+                            planned.prefix
+                        );
+                    }
+                }
+                exit_kill_switch |= selection.kill_switch;
+            }
             if !policy.dns.servers.is_empty() || !policy.dns.search_domains.is_empty() {
                 if let Some(owner) = dns_owner {
                     bail!(
@@ -93,6 +169,8 @@ impl PolicyPlan {
         }
         Ok(Self {
             routes: routes.into_values().collect(),
+            exit_routes: exit_routes.into_values().collect(),
+            exit_kill_switch,
             dns_servers,
             search_domains,
         })
@@ -247,8 +325,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use meshlake_core::{
-        DnsPolicy, MembershipCertificate, MembershipClaims, NetworkControlPlane,
-        NetworkPolicyManifest, PolicyRoute, RelayPolicy, VirtualNetwork,
+        AuthorizedMembership, DnsPolicy, ExitNode, ExitNodeSelection, MembershipCertificate,
+        MembershipClaims, NetworkAuthorizationManifest, NetworkControlPlane, NetworkPolicyManifest,
+        PolicyRoute, RelayPolicy, VirtualNetwork,
     };
     use uuid::Uuid;
 
@@ -312,6 +391,91 @@ mod tests {
         let plan = PolicyPlan::from_networks(&[first, second], 50).unwrap();
         assert_eq!(plan.routes.len(), 2);
         assert_eq!(plan.search_domains, vec!["n1.example"]);
+    }
+
+    #[test]
+    fn projects_only_explicitly_selected_signed_exit_routes() {
+        let signing = SigningKey::from_bytes(&[71; 32]);
+        let network_id = NetworkId(Uuid::from_u128(71));
+        let gateway = DeviceId(Uuid::from_u128(72));
+        let certificate = MembershipCertificate::sign_authorized(
+            MembershipClaims {
+                network_id,
+                device_id: gateway,
+                device_public_key: vec![7; 32],
+                assigned_addresses: vec!["100.64.71.2".parse().unwrap()],
+                allowed_routes: vec!["100.64.71.0/24".into()],
+                issued_at_unix_seconds: 1,
+                expires_at_unix_seconds: Some(100),
+            },
+            Uuid::from_u128(73),
+            1,
+            &signing,
+        )
+        .unwrap();
+        let authorization = NetworkAuthorizationManifest::sign(
+            network_id,
+            1,
+            1,
+            vec![AuthorizedMembership {
+                device_id: gateway,
+                certificate_id: certificate.certificate_id,
+                device_public_key: certificate.claims.device_public_key.clone(),
+                network_key_epoch: 1,
+            }],
+            vec![],
+            1,
+            100,
+            &signing,
+        )
+        .unwrap();
+        let policy = NetworkPolicyManifest::sign_with_exit_nodes(
+            network_id,
+            1,
+            vec![],
+            vec![ExitNode {
+                gateway_certificate: certificate,
+                supports_ipv4: true,
+                supports_ipv6: true,
+            }],
+            DnsPolicy::default(),
+            1,
+            100,
+            &signing,
+        )
+        .unwrap();
+        let joined = JoinedNetwork {
+            network: VirtualNetwork {
+                id: network_id,
+                name: "exit".into(),
+                ipv4_prefix: "100.64.71.0/24".into(),
+                ipv6_prefix: Some("fd42:4d4c:71::/64".into()),
+                relay_policy: RelayPolicy::Preferred,
+            },
+            assigned_addresses: vec!["100.64.71.1".parse().unwrap()],
+            certificate: None,
+            network_key: vec![1; 32],
+            control_plane: NetworkControlPlane {
+                pinned_controller_public_key: signing.verifying_key().to_bytes().to_vec(),
+                authorization_manifest: Some(authorization),
+                policy_manifest: Some(policy),
+                exit_node_selection: ExitNodeSelection {
+                    ipv4_gateway: Some(gateway),
+                    ipv6_gateway: Some(gateway),
+                    kill_switch: true,
+                },
+                ..NetworkControlPlane::default()
+            },
+        };
+        let plan = PolicyPlan::from_networks(&[joined], 50).unwrap();
+        assert_eq!(
+            plan.exit_routes
+                .iter()
+                .map(|route| route.prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0.0.0.0/0", "::/0"]
+        );
+        assert!(plan.exit_kill_switch);
     }
 
     #[test]

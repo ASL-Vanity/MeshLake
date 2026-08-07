@@ -248,6 +248,7 @@ fn linux_policy_commands(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<L
     let mut commands = plan
         .routes
         .iter()
+        .chain(&plan.exit_routes)
         .map(|route| LinuxPolicyCommand {
             program: "ip",
             arguments: vec![
@@ -635,6 +636,8 @@ mod tests {
                 network_id: NetworkId(Uuid::from_u128(1)),
                 gateway_device_id: meshlake_core::DeviceId(Uuid::from_u128(2)),
             }],
+            exit_routes: vec![],
+            exit_kill_switch: false,
             dns_servers: vec!["2001:db8:10::53".parse().unwrap()],
             search_domains: vec!["corp.example".into()],
         };
