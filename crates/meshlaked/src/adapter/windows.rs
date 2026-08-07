@@ -3,7 +3,10 @@
 //! The driver is intentionally not linked at build time. A release package places the signed
 //! `wintun.dll` next to `meshlaked.exe`; development can pass `--wintun-dll <path>`.
 
-use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
+use super::{
+    kill_switch::KillSwitchPlan,
+    policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan},
+};
 use crate::exit_gateway::{ExitGatewayPlan, GatewayRoute};
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
@@ -376,6 +379,19 @@ impl AdapterController {
             bail!("Windows exit-gateway transaction failed and the previous rules were restored: {primary:#}");
         }
         *current = desired;
+        Ok(())
+    }
+
+    /// Windows Firewall's broad block rules override ordinary allow rules, so
+    /// a safe exit kill switch requires dedicated WFP filters rather than a
+    /// tempting global firewall toggle. Until those filters are installed,
+    /// refuse an enabled plan; callers then restore the prior selection.
+    pub fn configure_kill_switch(&self, desired: KillSwitchPlan) -> Result<()> {
+        if desired.enabled {
+            bail!(
+                "Windows exit kill switch requires MeshLake WFP filters and cannot be enabled until that protected filter set is installed"
+            );
+        }
         Ok(())
     }
 

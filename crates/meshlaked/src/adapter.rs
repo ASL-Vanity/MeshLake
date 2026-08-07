@@ -1,9 +1,11 @@
+mod kill_switch;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;
 #[cfg(windows)]
 mod windows;
 
+pub(crate) use kill_switch::{BootstrapEndpoint, BootstrapTransport, KillSwitchPlan};
 #[cfg(target_os = "linux")]
 pub use linux::{default_wintun_path, AdapterController};
 #[cfg(windows)]

@@ -7,6 +7,7 @@ mod state_backup_command;
 mod transport_health;
 mod upnp;
 
+use adapter::{BootstrapEndpoint, BootstrapTransport, KillSwitchPlan};
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
@@ -46,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     env, fs,
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -626,6 +627,8 @@ impl Agent {
             return Ok(());
         }
         state.networks[index].control_plane.exit_node_selection = selection;
+        let kill_switch_plan =
+            kill_switch_plan_from_state(&state).map_err(ApiError::bad_request)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)
             .map_err(ApiError::internal)?;
         let networks = state.networks.clone();
@@ -651,6 +654,35 @@ impl Agent {
             }
             return Err(ApiError::bad_request(format!(
                 "exit selection was rejected by the platform and the previous policy was restored: {error:#}"
+            )));
+        }
+        if let Err(error) = self.adapter.configure_kill_switch(kill_switch_plan) {
+            let mut state = self.state.write().await;
+            if let Some(joined) = state
+                .networks
+                .iter_mut()
+                .find(|joined| joined.network.id == network_id)
+            {
+                joined.control_plane.exit_node_selection = previous;
+            }
+            let rollback_kill_switch_plan =
+                kill_switch_plan_from_state(&state).map_err(ApiError::internal)?;
+            write_state_with_protection(&self.path, &state, &self.state_protection)
+                .map_err(ApiError::internal)?;
+            let rollback_networks = state.networks.clone();
+            drop(state);
+            let policy_rollback = self.adapter.configure_policy(&rollback_networks);
+            let kill_switch_rollback = self
+                .adapter
+                .configure_kill_switch(rollback_kill_switch_plan);
+            if policy_rollback.is_err() || kill_switch_rollback.is_err() {
+                self.adapter.deactivate();
+                return Err(ApiError::internal(format!(
+                    "exit kill-switch configuration failed: {error:#}; rollback failed and the adapter was disabled fail closed"
+                )));
+            }
+            return Err(ApiError::bad_request(format!(
+                "exit kill-switch configuration failed and the previous exit selection was restored: {error:#}"
             )));
         }
         Ok(())
@@ -1099,6 +1131,7 @@ impl Agent {
             clear_unusable_exit_gateways(&mut state.exit_gateways, &gateway_networks, local_device);
         let exit_gateway_plan =
             ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)?;
+        let kill_switch_plan = kill_switch_plan_from_state(&state)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
@@ -1152,6 +1185,12 @@ impl Agent {
                 return Err(anyhow::anyhow!(
                     "could not apply local exit-gateway rules after authorization update: {error:#}; persisted local gateway configuration was restored"
                 ));
+            }
+            if let Err(error) = self.adapter.configure_kill_switch(kill_switch_plan) {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "authorization update could not reconcile the exit kill switch: {error:#}; adapter was disabled fail closed"
+                );
             }
         }
         Ok(())
@@ -1285,6 +1324,7 @@ impl Agent {
             clear_unusable_exit_gateways(&mut state.exit_gateways, &gateway_networks, local_device);
         let exit_gateway_plan =
             ExitGatewayPlan::from_configs(&state.exit_gateways, &state.networks)?;
+        let kill_switch_plan = kill_switch_plan_from_state(&state)?;
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         drop(state);
@@ -1327,14 +1367,24 @@ impl Agent {
                 }
             );
         }
-        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
-            if exit_gateways_cleared {
-                self.adapter.deactivate();
+        if self.adapter.is_active() {
+            if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+                if exit_gateways_cleared {
+                    self.adapter.deactivate();
+                    anyhow::bail!(
+                        "policy withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                    );
+                }
                 anyhow::bail!(
-                    "policy withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                    "could not apply local exit-gateway rules for the new policy: {error:#}"
                 );
             }
-            anyhow::bail!("could not apply local exit-gateway rules for the new policy: {error:#}");
+            if let Err(error) = self.adapter.configure_kill_switch(kill_switch_plan) {
+                self.adapter.deactivate();
+                anyhow::bail!(
+                    "could not reconcile the exit kill switch for the new policy: {error:#}; adapter was disabled fail closed"
+                );
+            }
         }
         self.request_transport_reload();
         Ok(())
@@ -1353,6 +1403,7 @@ impl Agent {
                 .is_some_and(|policy| current_time > policy.expires_at_unix_seconds)
             {
                 joined.control_plane.policy_manifest = None;
+                clear_unusable_exit_selection(joined);
                 changed = true;
             }
         }
@@ -1367,16 +1418,25 @@ impl Agent {
         write_state_with_protection(&self.path, &state, &self.state_protection)?;
         let networks = state.networks.clone();
         let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)?;
+        let kill_switch_plan = kill_switch_plan_from_state(&state)?;
         drop(state);
         self.adapter.configure_policy(&networks)?;
-        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
-            if exit_gateways_cleared {
+        if self.adapter.is_active() {
+            if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+                if exit_gateways_cleared {
+                    self.adapter.deactivate();
+                    anyhow::bail!(
+                        "an exit policy expired but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                    );
+                }
+                return Err(error);
+            }
+            if let Err(error) = self.adapter.configure_kill_switch(kill_switch_plan) {
                 self.adapter.deactivate();
                 anyhow::bail!(
-                    "an exit policy expired but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                    "an exit policy expired but kill-switch cleanup failed: {error:#}; adapter was disabled fail closed"
                 );
             }
-            return Err(error);
         }
         self.request_transport_reload();
         Ok(())
@@ -1525,13 +1585,19 @@ impl Agent {
         let networks = state.networks.clone();
         let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)
             .map_err(ApiError::internal)?;
+        let kill_switch_plan = kill_switch_plan_from_state(&state).map_err(ApiError::internal)?;
         drop(state);
         self.adapter
             .configure_policy(&networks)
             .map_err(ApiError::internal)?;
-        self.adapter
-            .configure_exit_gateways(exit_gateway_plan)
-            .map_err(ApiError::internal)?;
+        if self.adapter.is_active() {
+            self.adapter
+                .configure_exit_gateways(exit_gateway_plan)
+                .map_err(ApiError::internal)?;
+            self.adapter
+                .configure_kill_switch(kill_switch_plan)
+                .map_err(ApiError::internal)?;
+        }
         self.request_transport_reload();
         Ok(())
     }
@@ -1683,6 +1749,8 @@ impl Agent {
         let networks = state.networks.clone();
         let exit_gateway_plan = ExitGatewayPlan::from_configs(&state.exit_gateways, &networks)
             .map_err(ApiError::bad_request)?;
+        let kill_switch_plan =
+            kill_switch_plan_from_state(&state).map_err(ApiError::bad_request)?;
         drop(state);
         let was_active = self.adapter.is_active();
         activate_adapter_transaction(
@@ -1690,7 +1758,8 @@ impl Agent {
             || self.adapter.activate(),
             || {
                 self.adapter.configure_networks(&networks)?;
-                self.adapter.configure_exit_gateways(exit_gateway_plan)
+                self.adapter.configure_exit_gateways(exit_gateway_plan)?;
+                self.adapter.configure_kill_switch(kill_switch_plan)
             },
             || self.adapter.deactivate(),
         )
@@ -2811,6 +2880,87 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
     configuration.stun_servers.sort();
     configuration.stun_servers.dedup();
     configuration
+}
+
+/// Builds exact, IP-address-only exceptions for a locally selected exit kill
+/// switch. Endpoint resolution happens before the firewall transaction; if a
+/// controller or manifest endpoint cannot be resolved, MeshLake refuses to
+/// enable the kill switch rather than silently permitting physical DNS.
+fn kill_switch_plan_from_state(state: &PersistedState) -> Result<KillSwitchPlan> {
+    let enabled = state
+        .networks
+        .iter()
+        .any(|joined| joined.control_plane.exit_node_selection.kill_switch);
+    if !enabled {
+        return Ok(KillSwitchPlan::default());
+    }
+    let configuration = transport_configuration_from_state(state);
+    let mut endpoints = Vec::new();
+    endpoints.extend(
+        configuration
+            .relay_endpoints
+            .iter()
+            .copied()
+            .map(|endpoint| BootstrapEndpoint {
+                endpoint,
+                transport: BootstrapTransport::Udp,
+            }),
+    );
+    for root in &configuration.root_servers {
+        endpoints.extend(
+            root.endpoints
+                .iter()
+                .copied()
+                .map(|endpoint| BootstrapEndpoint {
+                    endpoint,
+                    transport: BootstrapTransport::Udp,
+                }),
+        );
+    }
+    for server in &configuration.stun_servers {
+        if let Ok(endpoint) = server.parse::<SocketAddr>() {
+            endpoints.push(BootstrapEndpoint {
+                endpoint,
+                transport: BootstrapTransport::Udp,
+            });
+        }
+    }
+    for joined in &state.networks {
+        for url in [
+            joined.control_plane.controller_url.as_deref(),
+            joined.control_plane.planet_manifest_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            endpoints.extend(resolve_kill_switch_url(url)?);
+        }
+    }
+    KillSwitchPlan::new(true, endpoints)
+}
+
+fn resolve_kill_switch_url(url: &str) -> Result<Vec<BootstrapEndpoint>> {
+    let parsed =
+        Url::parse(url).with_context(|| format!("invalid kill-switch service URL {url}"))?;
+    let host = parsed
+        .host_str()
+        .context("kill-switch service URL is missing a host")?;
+    let port = parsed
+        .port_or_known_default()
+        .context("kill-switch service URL has no known port")?;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("cannot resolve kill-switch service host {host}"))?;
+    let endpoints = addresses
+        .map(|endpoint| BootstrapEndpoint {
+            endpoint,
+            transport: BootstrapTransport::Tcp,
+        })
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        anyhow::bail!("kill-switch service host {host} resolved to no addresses");
+    }
+    Ok(endpoints)
 }
 
 fn write_state_with_protection(
@@ -6334,6 +6484,40 @@ mod tests {
             network_key: vec![7; 32],
             control_plane: NetworkControlPlane::default(),
         }
+    }
+
+    #[test]
+    fn kill_switch_plan_uses_only_exact_signed_bootstrap_endpoints() {
+        let mut state = PersistedState::new();
+        let mut network = test_joined_network();
+        network.control_plane.exit_node_selection.kill_switch = true;
+        network.control_plane.controller_url = Some("https://198.51.100.20:8443".into());
+        network.control_plane.verified_relays = vec![PlanetRelay {
+            endpoint: "203.0.113.20:29999".parse().unwrap(),
+            priority: 1,
+            identity: None,
+        }];
+        network.control_plane.verified_roots = vec![PlanetRoot {
+            public_key: vec![4; 32],
+            endpoints: vec!["[2001:db8::20]:29998".parse().unwrap()],
+            priority: 1,
+            identity: None,
+        }];
+        state.networks.push(network);
+        let plan = kill_switch_plan_from_state(&state).unwrap();
+        assert!(plan.enabled);
+        assert!(plan.bootstrap_endpoints.iter().any(|entry| {
+            entry.endpoint == "198.51.100.20:8443".parse().unwrap()
+                && entry.transport == BootstrapTransport::Tcp
+        }));
+        assert!(plan.bootstrap_endpoints.iter().any(|entry| {
+            entry.endpoint == "203.0.113.20:29999".parse().unwrap()
+                && entry.transport == BootstrapTransport::Udp
+        }));
+        assert!(plan.bootstrap_endpoints.iter().any(|entry| {
+            entry.endpoint == "[2001:db8::20]:29998".parse().unwrap()
+                && entry.transport == BootstrapTransport::Udp
+        }));
     }
 
     fn test_established_session(

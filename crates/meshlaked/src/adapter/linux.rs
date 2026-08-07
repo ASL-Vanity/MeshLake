@@ -1,6 +1,9 @@
 //! Linux TUN adapter implementation used by the headless MeshLake agent.
 
-use super::policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan};
+use super::{
+    kill_switch::{BootstrapTransport, KillSwitchPlan},
+    policy::{apply_policy_transaction, finalize_policy_transaction, PolicyPlan},
+};
 use crate::exit_gateway::{ExitGatewayPlan, GatewayRoute};
 use anyhow::{anyhow, bail, Context, Result};
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -53,6 +56,7 @@ pub struct AdapterController {
     session: Mutex<Option<File>>,
     applied_policy: Mutex<PolicyPlan>,
     applied_exit_gateways: Mutex<ExitGatewayPlan>,
+    applied_kill_switch: Mutex<KillSwitchPlan>,
 }
 
 impl AdapterController {
@@ -61,6 +65,7 @@ impl AdapterController {
             session: Mutex::new(None),
             applied_policy: Mutex::new(PolicyPlan::default()),
             applied_exit_gateways: Mutex::new(ExitGatewayPlan::default()),
+            applied_kill_switch: Mutex::new(KillSwitchPlan::default()),
         }
     }
 
@@ -109,6 +114,9 @@ impl AdapterController {
     }
 
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_kill_switch() {
+            eprintln!("MeshLake could not completely roll back Linux kill-switch rules: {error:#}");
+        }
         if let Err(error) = self.rollback_exit_gateways() {
             eprintln!(
                 "MeshLake could not completely roll back Linux exit-gateway rules: {error:#}"
@@ -231,6 +239,52 @@ impl AdapterController {
         Ok(())
     }
 
+    /// Installs only MeshLake-owned OUTPUT rules. Exact controller/root/relay
+    /// endpoints remain reachable, while all other non-local physical-network
+    /// egress is rejected whenever an explicit exit kill switch is selected.
+    pub fn configure_kill_switch(&self, desired: KillSwitchPlan) -> Result<()> {
+        if !self.is_active() {
+            bail!("MeshLake adapter is not active");
+        }
+        let mut current = self
+            .applied_kill_switch
+            .lock()
+            .expect("kill-switch lock poisoned");
+        if *current == desired {
+            return Ok(());
+        }
+        let previous = current.clone();
+        if let Err(primary) = run_linux_policy_commands(&linux_kill_switch_commands(
+            &previous,
+            KillSwitchOperation::Remove,
+        ))
+        .and_then(|_| {
+            run_linux_policy_commands(&linux_kill_switch_commands(
+                &desired,
+                KillSwitchOperation::Apply,
+            ))
+        }) {
+            let cleanup = run_linux_policy_commands(&linux_kill_switch_commands(
+                &desired,
+                KillSwitchOperation::Remove,
+            ));
+            let restore = run_linux_policy_commands(&linux_kill_switch_commands(
+                &previous,
+                KillSwitchOperation::Apply,
+            ));
+            if cleanup.is_err() || restore.is_err() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                bail!(
+                    "Linux kill-switch transaction failed: {primary:#}; rollback failed and the adapter was disabled fail closed"
+                );
+            }
+            bail!("Linux kill-switch transaction failed and the previous rules were restored: {primary:#}");
+        }
+        *current = desired;
+        Ok(())
+    }
+
     fn reconcile_policy(&self, desired: PolicyPlan) -> Result<()> {
         let mut current = self
             .applied_policy
@@ -297,6 +351,19 @@ impl AdapterController {
         *current = ExitGatewayPlan::default();
         result
     }
+
+    fn rollback_kill_switch(&self) -> Result<()> {
+        let mut current = self
+            .applied_kill_switch
+            .lock()
+            .expect("kill-switch lock poisoned");
+        let result = run_linux_policy_commands(&linux_kill_switch_commands(
+            &current,
+            KillSwitchOperation::Remove,
+        ));
+        *current = KillSwitchPlan::default();
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +374,12 @@ enum PolicyOperation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayOperation {
+    Apply,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillSwitchOperation {
     Apply,
     Remove,
 }
@@ -482,6 +555,96 @@ fn linux_exit_gateway_commands(
                 comment,
                 "-j".into(),
                 "ACCEPT".into(),
+            ],
+        });
+    }
+    commands
+}
+
+fn linux_kill_switch_commands(
+    plan: &KillSwitchPlan,
+    operation: KillSwitchOperation,
+) -> Vec<LinuxPolicyCommand> {
+    if !plan.enabled {
+        return Vec::new();
+    }
+    let mut commands = Vec::new();
+    for (program, ipv6) in [("iptables", false), ("ip6tables", true)] {
+        let family = if ipv6 { "v6" } else { "v4" };
+        let rule_operation = match operation {
+            KillSwitchOperation::Apply => "-I",
+            KillSwitchOperation::Remove => "-D",
+        };
+        commands.push(LinuxPolicyCommand {
+            program,
+            arguments: vec![
+                "-w".into(),
+                rule_operation.into(),
+                "OUTPUT".into(),
+                "-o".into(),
+                INTERFACE_NAME.into(),
+                "-m".into(),
+                "comment".into(),
+                "--comment".into(),
+                format!("meshlake:killswitch:{family}:overlay"),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        });
+        for endpoint in plan
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.endpoint.is_ipv6() == ipv6)
+        {
+            let transport = match endpoint.transport {
+                BootstrapTransport::Tcp => "tcp",
+                BootstrapTransport::Udp => "udp",
+            };
+            commands.push(LinuxPolicyCommand {
+                program,
+                arguments: vec![
+                    "-w".into(),
+                    rule_operation.into(),
+                    "OUTPUT".into(),
+                    "-d".into(),
+                    endpoint.endpoint.ip().to_string(),
+                    "-p".into(),
+                    transport.into(),
+                    "--dport".into(),
+                    endpoint.endpoint.port().to_string(),
+                    "-m".into(),
+                    "comment".into(),
+                    "--comment".into(),
+                    format!("meshlake:killswitch:{family}:bootstrap"),
+                    "-j".into(),
+                    "ACCEPT".into(),
+                ],
+            });
+        }
+        commands.push(LinuxPolicyCommand {
+            program,
+            arguments: vec![
+                "-w".into(),
+                match operation {
+                    KillSwitchOperation::Apply => "-A",
+                    KillSwitchOperation::Remove => "-D",
+                }
+                .into(),
+                "OUTPUT".into(),
+                "!".into(),
+                "-o".into(),
+                INTERFACE_NAME.into(),
+                "-m".into(),
+                "addrtype".into(),
+                "!".into(),
+                "--dst-type".into(),
+                "LOCAL".into(),
+                "-m".into(),
+                "comment".into(),
+                "--comment".into(),
+                format!("meshlake:killswitch:{family}:block"),
+                "-j".into(),
+                "REJECT".into(),
             ],
         });
     }
@@ -905,6 +1068,61 @@ mod tests {
             GatewayOperation::Remove,
         );
         assert!(remove.iter().all(|command| command.program != "sysctl"));
+        assert!(remove
+            .iter()
+            .all(|command| command.arguments.iter().any(|argument| argument == "-D")));
+    }
+
+    #[test]
+    fn builds_exact_linux_kill_switch_exceptions_without_global_flushes() {
+        let plan = KillSwitchPlan::new(
+            true,
+            [
+                super::super::kill_switch::BootstrapEndpoint {
+                    endpoint: "198.51.100.20:443".parse().unwrap(),
+                    transport: BootstrapTransport::Tcp,
+                },
+                super::super::kill_switch::BootstrapEndpoint {
+                    endpoint: "[2001:db8::20]:3478".parse().unwrap(),
+                    transport: BootstrapTransport::Udp,
+                },
+            ],
+        )
+        .unwrap();
+        let apply = linux_kill_switch_commands(&plan, KillSwitchOperation::Apply);
+        assert!(apply.iter().any(|command| {
+            command.program == "iptables"
+                && command
+                    .arguments
+                    .windows(2)
+                    .any(|part| part == ["-d", "198.51.100.20"])
+                && command.arguments.iter().any(|argument| argument == "443")
+                && command.arguments.iter().any(|argument| argument == "tcp")
+        }));
+        assert!(apply.iter().any(|command| {
+            command.program == "ip6tables"
+                && command
+                    .arguments
+                    .windows(2)
+                    .any(|part| part == ["-d", "2001:db8::20"])
+                && command.arguments.iter().any(|argument| argument == "3478")
+                && command.arguments.iter().any(|argument| argument == "udp")
+        }));
+        assert!(apply.iter().any(|command| {
+            command
+                .arguments
+                .iter()
+                .any(|argument| argument == "REJECT")
+                && command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "meshlake:killswitch:v4:block")
+        }));
+        assert!(apply.iter().all(|command| !command
+            .arguments
+            .iter()
+            .any(|argument| argument == "-F" || argument == "--flush")));
+        let remove = linux_kill_switch_commands(&plan, KillSwitchOperation::Remove);
         assert!(remove
             .iter()
             .all(|command| command.arguments.iter().any(|argument| argument == "-D")));
