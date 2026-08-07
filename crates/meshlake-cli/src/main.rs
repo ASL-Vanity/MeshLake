@@ -275,6 +275,12 @@ enum NetworkCommand {
         #[command(subcommand)]
         command: NetworkExitCommand,
     },
+    /// Enable or disable this device as a locally operated forwarding/NAT exit
+    /// gateway after the controller has authorized it as a candidate.
+    Gateway {
+        #[command(subcommand)]
+        command: NetworkGatewayCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +299,26 @@ enum NetworkExitCommand {
         kill_switch: bool,
     },
     Clear {
+        #[arg(long)]
+        network: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkGatewayCommand {
+    Enable {
+        #[arg(long)]
+        network: Uuid,
+        /// Physical egress interface, for example `Ethernet`, `eth0`, or
+        /// `ens3`. It is always passed as data, never evaluated by a shell.
+        #[arg(long)]
+        egress_interface: String,
+        #[arg(long)]
+        ipv4: bool,
+        #[arg(long)]
+        ipv6: bool,
+    },
+    Disable {
         #[arg(long)]
         network: Uuid,
     },
@@ -628,6 +654,50 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("Local exit selection cleared for network {network}.");
+        }
+        Command::Network {
+            command:
+                NetworkCommand::Gateway {
+                    command:
+                        NetworkGatewayCommand::Enable {
+                            network,
+                            egress_interface,
+                            ipv4,
+                            ipv6,
+                        },
+                },
+        } => {
+            if !ipv4 && !ipv6 {
+                bail!("choose at least one of --ipv4 or --ipv6 for an exit gateway");
+            }
+            ensure_success(
+                client
+                    .post(format!("{LOCAL_API}/networks/{network}/exit-gateway"))
+                    .json(&serde_json::json!({
+                        "egress_interface": egress_interface,
+                        "enable_ipv4": ipv4,
+                        "enable_ipv6": ipv6,
+                    }))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("Local exit gateway enabled for network {network}.");
+        }
+        Command::Network {
+            command:
+                NetworkCommand::Gateway {
+                    command: NetworkGatewayCommand::Disable { network },
+                },
+        } => {
+            ensure_success(
+                client
+                    .delete(format!("{LOCAL_API}/networks/{network}/exit-gateway"))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("Local exit gateway disabled for network {network}.");
         }
         Command::Network {
             command: NetworkCommand::JoinLink { link },
@@ -1665,6 +1735,30 @@ mod tests {
                 command: NetworkCommand::Exit {
                     command: NetworkExitCommand::Select {
                         kill_switch: true,
+                        ..
+                    }
+                }
+            }
+        ));
+        let gateway = Cli::try_parse_from([
+            "meshlake",
+            "network",
+            "gateway",
+            "enable",
+            "--network",
+            "00000000-0000-0000-0000-000000000001",
+            "--egress-interface",
+            "Ethernet",
+            "--ipv4",
+        ])
+        .unwrap();
+        assert!(matches!(
+            gateway.command,
+            Command::Network {
+                command: NetworkCommand::Gateway {
+                    command: NetworkGatewayCommand::Enable {
+                        ipv4: true,
+                        ipv6: false,
                         ..
                     }
                 }
