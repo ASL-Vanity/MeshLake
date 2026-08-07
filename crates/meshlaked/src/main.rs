@@ -1138,19 +1138,21 @@ impl Agent {
                 return Err(error);
             }
         }
-        if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
-            if exit_gateways_cleared {
-                self.adapter.deactivate();
-                anyhow::bail!(
-                    "authorization update withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
-                );
+        if self.adapter.is_active() {
+            if let Err(error) = self.adapter.configure_exit_gateways(exit_gateway_plan) {
+                if exit_gateways_cleared {
+                    self.adapter.deactivate();
+                    anyhow::bail!(
+                        "authorization update withdrew a locally enabled exit gateway but gateway-rule cleanup failed: {error:#}; adapter was disabled fail closed"
+                    );
+                }
+                let mut state = self.state.write().await;
+                state.exit_gateways = previous_exit_gateways;
+                write_state_with_protection(&self.path, &state, &self.state_protection)?;
+                return Err(anyhow::anyhow!(
+                    "could not apply local exit-gateway rules after authorization update: {error:#}; persisted local gateway configuration was restored"
+                ));
             }
-            let mut state = self.state.write().await;
-            state.exit_gateways = previous_exit_gateways;
-            write_state_with_protection(&self.path, &state, &self.state_protection)?;
-            return Err(anyhow::anyhow!(
-                "could not apply local exit-gateway rules after authorization update: {error:#}; persisted local gateway configuration was restored"
-            ));
         }
         Ok(())
     }
