@@ -4817,8 +4817,8 @@ async fn run_relay_worker(
                                     )?
                                 else {
                                     trace_transport(match manifest_version {
-                                        Some(3) => format!(
-                                            "skipped V3 Root registration without a pinned service identity for network {}",
+                                        Some(3 | 4) => format!(
+                                            "skipped signed Planet Root registration without a pinned service identity for network {}",
                                             certificate.claims.network_id.0
                                         ),
                                         Some(version) => format!(
@@ -6028,7 +6028,7 @@ fn acknowledge_signed_relay_registration(
     let nonce = acknowledgement.payload.request_nonce;
     let transaction = transactions.get(&nonce)?;
     let identity = transaction.identity.as_ref()?;
-    if transaction.planet_manifest_version != Some(3)
+    if !matches!(transaction.planet_manifest_version, Some(3 | 4))
         || transaction.endpoint != endpoint
         || now_instant.saturating_duration_since(transaction.issued_at) >= TRANSPORT_TRANSACTION_TTL
         || acknowledgement
@@ -7646,6 +7646,33 @@ mod tests {
             105,
         )
         .is_none());
+
+        let v4_nonce = [80; 16];
+        let v4_acknowledgement = SignedRelayRegistrationAck::sign(
+            network,
+            device,
+            relay_id,
+            v4_nonce,
+            "198.51.100.76:41000".parse().unwrap(),
+            100,
+            115,
+            None,
+            &[&relay_key],
+        )
+        .unwrap();
+        let mut v4_transaction = transaction;
+        v4_transaction.planet_manifest_version = Some(4);
+        let mut v4_transactions = HashMap::from([(v4_nonce, v4_transaction)]);
+        assert!(acknowledge_signed_relay_registration(
+            &mut v4_transactions,
+            &mut health,
+            &v4_acknowledgement,
+            relay,
+            issued_at,
+            105,
+        )
+        .is_some());
+        assert!(v4_transactions.is_empty());
     }
 
     #[tokio::test]
