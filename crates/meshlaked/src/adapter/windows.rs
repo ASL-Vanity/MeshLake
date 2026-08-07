@@ -21,6 +21,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[path = "windows/wfp.rs"]
+mod wfp;
+
 const RING_CAPACITY: u32 = 0x400000; // 4 MiB; required by Wintun to be a power of two.
 const ADAPTER_NAME: &str = "MeshLake";
 const TUNNEL_TYPE: &str = "MeshLake";
@@ -169,6 +172,7 @@ pub struct AdapterController {
     session: Mutex<Option<AdapterSession>>,
     applied_policy: Mutex<PolicyPlan>,
     applied_exit_gateways: Mutex<ExitGatewayPlan>,
+    applied_kill_switch: Mutex<KillSwitchPlan>,
 }
 
 impl AdapterController {
@@ -178,6 +182,7 @@ impl AdapterController {
             session: Mutex::new(None),
             applied_policy: Mutex::new(PolicyPlan::default()),
             applied_exit_gateways: Mutex::new(ExitGatewayPlan::default()),
+            applied_kill_switch: Mutex::new(KillSwitchPlan::default()),
         }
     }
     pub fn status(&self) -> String {
@@ -213,6 +218,9 @@ impl AdapterController {
         Ok(())
     }
     pub fn deactivate(&self) {
+        if let Err(error) = self.rollback_kill_switch() {
+            eprintln!("MeshLake could not completely roll back Windows WFP kill-switch filters: {error:#}");
+        }
         if let Err(error) = self.rollback_exit_gateways() {
             eprintln!(
                 "MeshLake could not completely roll back Windows exit-gateway rules: {error:#}"
@@ -382,16 +390,31 @@ impl AdapterController {
         Ok(())
     }
 
-    /// Windows Firewall's broad block rules override ordinary allow rules, so
-    /// a safe exit kill switch requires dedicated WFP filters rather than a
-    /// tempting global firewall toggle. Until those filters are installed,
-    /// refuse an enabled plan; callers then restore the prior selection.
+    /// Reconciles MeshLake-owned persistent WFP filters. The broad block lives
+    /// below higher-weight permits for the virtual interface, loopback, and
+    /// exact signed bootstrap endpoints; no global Firewall profile is changed.
     pub fn configure_kill_switch(&self, desired: KillSwitchPlan) -> Result<()> {
-        if desired.enabled {
-            bail!(
-                "Windows exit kill switch requires MeshLake WFP filters and cannot be enabled until that protected filter set is installed"
-            );
+        if !self.is_active() {
+            bail!("MeshLake adapter is not active");
         }
+        let mut current = self
+            .applied_kill_switch
+            .lock()
+            .expect("kill-switch lock poisoned");
+        let previous = current.clone();
+        // Always reconcile at least once: persistent WFP filters can survive a
+        // crash, while this in-memory controller begins with an empty plan.
+        if let Err(primary) = wfp::reconcile_kill_switch(ADAPTER_NAME, &desired) {
+            if wfp::reconcile_kill_switch(ADAPTER_NAME, &previous).is_err() {
+                drop(current);
+                self.session.lock().expect("adapter lock poisoned").take();
+                bail!(
+                    "Windows WFP kill-switch transaction failed: {primary:#}; previous protected filters could not be restored and the adapter was disabled fail closed"
+                );
+            }
+            bail!("Windows WFP kill-switch transaction failed and the previous filters were restored: {primary:#}");
+        }
+        *current = desired;
         Ok(())
     }
 
@@ -407,6 +430,11 @@ impl AdapterController {
             .lock()
             .expect("applied policy lock poisoned");
         if *current == desired {
+            // NRPT rules are persistent and can outlive a crashed agent. A
+            // default policy therefore still clears only MeshLake's own rule.
+            if desired == PolicyPlan::default() {
+                run_policy_scripts(&[windows_dns_leak_guard_cleanup_script()])?;
+            }
             return Ok(());
         }
         let previous = current.clone();
@@ -463,6 +491,16 @@ impl AdapterController {
         *current = ExitGatewayPlan::default();
         result
     }
+
+    fn rollback_kill_switch(&self) -> Result<()> {
+        let mut current = self
+            .applied_kill_switch
+            .lock()
+            .expect("kill-switch lock poisoned");
+        wfp::reconcile_kill_switch(ADAPTER_NAME, &KillSwitchPlan::default())?;
+        *current = KillSwitchPlan::default();
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +544,12 @@ fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<
                     "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses @({servers}) -ErrorAction Stop",
                     ADAPTER_NAME
                 ));
+                if !plan.exit_routes.is_empty() {
+                    scripts.push(windows_dns_leak_guard_cleanup_script());
+                    scripts.push(format!(
+                        "Add-DnsClientNrptRule -Namespace '.' -NameServers @({servers}) -Comment 'MeshLake managed DNS leak guard' -DisplayName 'MeshLake DNS Leak Guard' -ErrorAction Stop | Out-Null"
+                    ));
+                }
             }
             if let Some(domain) = plan.search_domains.first() {
                 scripts.push(format!(
@@ -527,9 +571,22 @@ fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<
                     ADAPTER_NAME
                 ));
             }
+            scripts.push(windows_dns_leak_guard_cleanup_script());
         }
     }
     scripts
+}
+
+/// Removes only NRPT entries with MeshLake's fixed comment. Unlike adapter DNS
+/// settings these rules persist across process crashes, so every policy
+/// transaction explicitly reconciles them.
+fn windows_dns_leak_guard_cleanup_script() -> String {
+    concat!(
+        "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | ",
+        "Where-Object { $_.Comment -eq 'MeshLake managed DNS leak guard' } | ",
+        "ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force -ErrorAction Stop }"
+    )
+    .into()
 }
 
 fn windows_exit_gateway_scripts(
@@ -750,10 +807,30 @@ mod tests {
         let apply = windows_policy_scripts(&plan, PolicyOperation::Apply).join("\n");
         assert!(apply.contains("New-NetRoute"));
         assert!(apply.contains("Set-DnsClientServerAddress"));
+        assert!(!apply.contains("Add-DnsClientNrptRule -Namespace '.'"));
         assert!(apply.contains("ConnectionSpecificSuffix 'corp.example'"));
         let remove = windows_policy_scripts(&plan, PolicyOperation::Remove).join("\n");
         assert!(remove.contains("Remove-NetRoute"));
         assert!(remove.contains("ResetServerAddresses"));
+        assert!(remove.contains("Remove-DnsClientNrptRule"));
+    }
+
+    #[test]
+    fn exit_dns_uses_a_global_mesh_only_nrpt_guard() {
+        let plan = PolicyPlan {
+            routes: vec![],
+            exit_routes: vec![super::super::policy::PlannedRoute {
+                prefix: "0.0.0.0/0".into(),
+                network_id: meshlake_core::NetworkId(uuid::Uuid::from_u128(3)),
+                gateway_device_id: meshlake_core::DeviceId(uuid::Uuid::from_u128(4)),
+            }],
+            exit_kill_switch: true,
+            dns_servers: vec!["100.64.3.53".parse().unwrap()],
+            search_domains: vec![],
+        };
+        let apply = windows_policy_scripts(&plan, PolicyOperation::Apply).join("\n");
+        assert!(apply.contains("Add-DnsClientNrptRule -Namespace '.'"));
+        assert!(apply.contains("MeshLake managed DNS leak guard"));
     }
 
     #[test]

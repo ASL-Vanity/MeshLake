@@ -3001,6 +3001,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

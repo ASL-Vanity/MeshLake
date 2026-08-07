@@ -205,6 +205,20 @@ pub struct TransportStatus {
     pub authorization_hint_refreshes: u64,
     #[serde(default)]
     pub registration_backoff_seconds: u64,
+    /// Sanitized TLS Relay health: no endpoint, certificate, credential, or
+    /// encrypted frame content is exposed through the local status API.
+    #[serde(default)]
+    pub tls_relay_configured: u64,
+    #[serde(default)]
+    pub tls_relay_connected: u64,
+    #[serde(default)]
+    pub tls_relay_connection_failures: u64,
+    #[serde(default)]
+    pub tls_relay_frames_sent: u64,
+    #[serde(default)]
+    pub tls_relay_frames_received: u64,
+    #[serde(default)]
+    pub tls_relay_queue_drops: u64,
     #[serde(default)]
     pub peer_paths: Vec<PeerPathStatus>,
 }

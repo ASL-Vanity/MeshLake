@@ -56,6 +56,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tls_relay::{TlsRelayRoute, TlsRelayTelemetry, TlsRelayTransport};
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock},
@@ -64,7 +65,6 @@ use transport_health::{
     select_relay_endpoint, EndpointHealthTable, RegistrationSchedule, RegistrationServiceKind,
     RegistrationTarget,
 };
-use tls_relay::{TlsRelayRoute, TlsRelayTransport};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -288,6 +288,7 @@ struct Agent {
     relay_confirmations_rejected: AtomicU64,
     authorization_hint_refreshes: AtomicU64,
     registration_backoff_seconds: AtomicU64,
+    tls_relay_telemetry: Arc<TlsRelayTelemetry>,
     shutting_down: AtomicBool,
     transport_health: RwLock<TransportHealth>,
     session_observability: SessionObservability,
@@ -484,6 +485,7 @@ impl Agent {
             relay_confirmations_rejected: AtomicU64::new(0),
             authorization_hint_refreshes: AtomicU64::new(0),
             registration_backoff_seconds: AtomicU64::new(0),
+            tls_relay_telemetry: Arc::new(TlsRelayTelemetry::default()),
             shutting_down: AtomicBool::new(false),
             transport_health: RwLock::new(TransportHealth::default()),
             session_observability,
@@ -534,6 +536,7 @@ impl Agent {
         configured_relays.dedup();
         drop(state);
         let health = self.transport_health.read().await;
+        let tls_relay = self.tls_relay_telemetry.snapshot();
         let peer_paths = health.peer_paths.clone();
         let health_time = Instant::now();
         let mut responsive_roots = health
@@ -569,6 +572,12 @@ impl Agent {
                 registration_backoff_seconds: self
                     .registration_backoff_seconds
                     .load(Ordering::Relaxed),
+                tls_relay_configured: tls_relay.configured,
+                tls_relay_connected: tls_relay.connected,
+                tls_relay_connection_failures: tls_relay.connection_failures,
+                tls_relay_frames_sent: tls_relay.frames_sent,
+                tls_relay_frames_received: tls_relay.frames_received,
+                tls_relay_queue_drops: tls_relay.queue_drops,
                 peer_paths,
             },
         }
@@ -2975,6 +2984,15 @@ fn kill_switch_plan_from_state(state: &PersistedState) -> Result<KillSwitchPlan>
                 transport: BootstrapTransport::Udp,
             }),
     );
+    endpoints.extend(
+        configuration
+            .all_tls_relays()
+            .into_iter()
+            .map(|route| BootstrapEndpoint {
+                endpoint: route.relay.endpoint,
+                transport: BootstrapTransport::Tcp,
+            }),
+    );
     for root in &configuration.root_servers {
         endpoints.extend(
             root.endpoints
@@ -4122,7 +4140,10 @@ async fn send_peer_routed_packet(
         relay_endpoints,
         endpoint_health,
         Instant::now(),
-        network.control_plane.planet_manifest_version.is_some_and(|version| version >= 3),
+        network
+            .control_plane
+            .planet_manifest_version
+            .is_some_and(|version| version >= 3),
     );
     if let Some(relay_endpoint) = relay_endpoint {
         if sockets.send_to(packet, relay_endpoint).await {
@@ -4324,7 +4345,10 @@ async fn run_relay_worker(
             .relay_endpoints
             .retain(|endpoint| sockets.supports(*endpoint));
     }
-    let mut tls_relay_transport = TlsRelayTransport::start(configuration.all_tls_relays())?;
+    let mut tls_relay_transport = TlsRelayTransport::start(
+        configuration.all_tls_relays(),
+        Arc::clone(&agent.tls_relay_telemetry),
+    )?;
     let relay_endpoints = configuration.relay_endpoints.clone();
     let root_servers = configuration.root_servers.clone();
     trace_transport(format!(
@@ -6678,10 +6702,25 @@ mod tests {
         let mut network = test_joined_network();
         network.control_plane.exit_node_selection.kill_switch = true;
         network.control_plane.controller_url = Some("https://198.51.100.20:8443".into());
+        let relay_id = Uuid::from_u128(44);
         network.control_plane.verified_relays = vec![PlanetRelay {
             endpoint: "203.0.113.20:29999".parse().unwrap(),
             priority: 1,
-            identity: None,
+            identity: Some(ServiceIdentityPolicy {
+                service_id: relay_id,
+                current_public_key: vec![8; 32],
+                next_public_key: None,
+                transition_not_before_unix_seconds: None,
+                transition_not_after_unix_seconds: None,
+                revoked_public_keys: Vec::new(),
+            }),
+        }];
+        network.control_plane.verified_tls_relays = vec![PlanetTlsRelay {
+            relay_id,
+            endpoint: "203.0.113.20:443".parse().unwrap(),
+            server_name: "relay.test".into(),
+            certificate_sha256: vec![9; 32],
+            priority: 1,
         }];
         network.control_plane.verified_roots = vec![PlanetRoot {
             public_key: vec![4; 32],
@@ -6703,6 +6742,10 @@ mod tests {
         assert!(plan.bootstrap_endpoints.iter().any(|entry| {
             entry.endpoint == "[2001:db8::20]:29998".parse().unwrap()
                 && entry.transport == BootstrapTransport::Udp
+        }));
+        assert!(plan.bootstrap_endpoints.iter().any(|entry| {
+            entry.endpoint == "203.0.113.20:443".parse().unwrap()
+                && entry.transport == BootstrapTransport::Tcp
         }));
     }
 

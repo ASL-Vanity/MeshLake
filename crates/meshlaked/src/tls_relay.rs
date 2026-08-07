@@ -46,6 +46,50 @@ pub(crate) struct TlsRelayInbound {
     pub(crate) packet: Vec<u8>,
 }
 
+#[derive(Default)]
+pub(crate) struct TlsRelayTelemetry {
+    configured: std::sync::atomic::AtomicU64,
+    connected: std::sync::atomic::AtomicU64,
+    connection_failures: std::sync::atomic::AtomicU64,
+    frames_sent: std::sync::atomic::AtomicU64,
+    frames_received: std::sync::atomic::AtomicU64,
+    queue_drops: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TlsRelayTelemetrySnapshot {
+    pub(crate) configured: u64,
+    pub(crate) connected: u64,
+    pub(crate) connection_failures: u64,
+    pub(crate) frames_sent: u64,
+    pub(crate) frames_received: u64,
+    pub(crate) queue_drops: u64,
+}
+
+impl TlsRelayTelemetry {
+    pub(crate) fn reset(&self, configured: usize) {
+        use std::sync::atomic::Ordering;
+        self.configured.store(configured as u64, Ordering::Relaxed);
+        self.connected.store(0, Ordering::Relaxed);
+        self.connection_failures.store(0, Ordering::Relaxed);
+        self.frames_sent.store(0, Ordering::Relaxed);
+        self.frames_received.store(0, Ordering::Relaxed);
+        self.queue_drops.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> TlsRelayTelemetrySnapshot {
+        use std::sync::atomic::Ordering;
+        TlsRelayTelemetrySnapshot {
+            configured: self.configured.load(Ordering::Relaxed),
+            connected: self.connected.load(Ordering::Relaxed),
+            connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            frames_sent: self.frames_sent.load(Ordering::Relaxed),
+            frames_received: self.frames_received.load(Ordering::Relaxed),
+            queue_drops: self.queue_drops.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct OutboundRelay {
     sender: mpsc::Sender<Vec<u8>>,
@@ -58,15 +102,20 @@ pub(crate) struct TlsRelayTransport {
     relays: HashMap<SocketAddr, OutboundRelay>,
     incoming: mpsc::Receiver<TlsRelayInbound>,
     shutdown: watch::Sender<bool>,
+    telemetry: Arc<TlsRelayTelemetry>,
 }
 
 impl TlsRelayTransport {
-    pub(crate) fn start(routes: Vec<TlsRelayRoute>) -> Result<Self> {
+    pub(crate) fn start(
+        routes: Vec<TlsRelayRoute>,
+        telemetry: Arc<TlsRelayTelemetry>,
+    ) -> Result<Self> {
         let provider = Arc::new(ring::default_provider());
         let (incoming_tx, incoming) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let mut relays = HashMap::new();
 
+        telemetry.reset(routes.len());
         for route in routes {
             if relays.contains_key(&route.relay_endpoint) {
                 continue;
@@ -80,16 +129,15 @@ impl TlsRelayTransport {
                 connected.clone(),
                 shutdown_rx.clone(),
                 provider.clone(),
+                telemetry.clone(),
             ));
-            relays.insert(
-                route.relay_endpoint,
-                OutboundRelay { sender, connected },
-            );
+            relays.insert(route.relay_endpoint, OutboundRelay { sender, connected });
         }
         Ok(Self {
             relays,
             incoming,
             shutdown,
+            telemetry,
         })
     }
 
@@ -100,8 +148,15 @@ impl TlsRelayTransport {
         let Some(relay) = self.relays.get(&relay_endpoint) else {
             return false;
         };
-        relay.connected.load(Ordering::Acquire)
-            && relay.sender.try_send(packet.to_vec()).is_ok()
+        if !relay.connected.load(Ordering::Acquire) {
+            self.telemetry.queue_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if relay.sender.try_send(packet.to_vec()).is_err() {
+            self.telemetry.queue_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     pub(crate) async fn receive(&mut self) -> Option<TlsRelayInbound> {
@@ -122,6 +177,7 @@ async fn run_relay_connection(
     connected: Arc<AtomicBool>,
     mut shutdown: watch::Receiver<bool>,
     provider: Arc<CryptoProvider>,
+    telemetry: Arc<TlsRelayTelemetry>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -134,14 +190,22 @@ async fn run_relay_connection(
             &connected,
             &mut shutdown,
             provider.clone(),
+            telemetry.clone(),
         )
         .await;
-        connected.store(false, Ordering::Release);
+        if connected.swap(false, Ordering::AcqRel) {
+            telemetry.connected.fetch_sub(1, Ordering::Relaxed);
+        }
         if *shutdown.borrow() || outbound.is_closed() {
             return;
         }
         if let Err(error) = result {
-            trace_tls_relay(format!("pinned TLS relay connection changed state: {error:#}"));
+            telemetry
+                .connection_failures
+                .fetch_add(1, Ordering::Relaxed);
+            trace_tls_relay(format!(
+                "pinned TLS relay connection changed state: {error:#}"
+            ));
         }
         tokio::select! {
             _ = tokio::time::sleep(RECONNECT_DELAY) => {}
@@ -159,6 +223,7 @@ async fn connect_and_forward(
     connected: &AtomicBool,
     shutdown: &mut watch::Receiver<bool>,
     provider: Arc<CryptoProvider>,
+    telemetry: Arc<TlsRelayTelemetry>,
 ) -> Result<()> {
     let server_name = ServerName::try_from(route.relay.server_name.clone())
         .map_err(|_| anyhow!("controller-signed TLS relay server name is invalid"))?;
@@ -178,7 +243,9 @@ async fn connect_and_forward(
         .connect(server_name, stream)
         .await
         .context("TLS relay certificate pin verification failed")?;
-    connected.store(true, Ordering::Release);
+    if !connected.swap(true, Ordering::AcqRel) {
+        telemetry.connected.fetch_add(1, Ordering::Relaxed);
+    }
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut read_buffer = vec![0_u8; MAX_TCP_FRAME_BYTES];
     loop {
@@ -189,6 +256,7 @@ async fn connect_and_forward(
             outbound_packet = outbound.recv() => {
                 let Some(packet) = outbound_packet else { return Ok(()); };
                 write_tcp_frame(&mut writer, &packet).await?;
+                telemetry.frames_sent.fetch_add(1, Ordering::Relaxed);
             }
             packet = read_tcp_frame(&mut reader, &mut read_buffer) => {
                 let Some(packet) = packet? else { return Ok(()); };
@@ -198,6 +266,7 @@ async fn connect_and_forward(
                 }).await.is_err() {
                     return Ok(());
                 }
+                telemetry.frames_received.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -226,7 +295,9 @@ async fn write_tcp_frame(writer: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -
     if frame.is_empty() || frame.len() > MAX_TCP_FRAME_BYTES {
         bail!("TLS relay frame length is outside the accepted range");
     }
-    writer.write_all(&(frame.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(frame.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(frame).await?;
     writer.flush().await?;
     Ok(())
@@ -331,11 +402,13 @@ fn signature_algorithms(
 
 use webpki::ring as webpki_algorithms;
 
-static ECDSA_NISTP384_SHA384_ALGORITHMS: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm] = &[
+static ECDSA_NISTP384_SHA384_ALGORITHMS:
+    &[&dyn rustls::pki_types::SignatureVerificationAlgorithm] = &[
     webpki_algorithms::ECDSA_P384_SHA384,
     webpki_algorithms::ECDSA_P256_SHA384,
 ];
-static ECDSA_NISTP256_SHA256_ALGORITHMS: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm] = &[
+static ECDSA_NISTP256_SHA256_ALGORITHMS:
+    &[&dyn rustls::pki_types::SignatureVerificationAlgorithm] = &[
     webpki_algorithms::ECDSA_P256_SHA256,
     webpki_algorithms::ECDSA_P384_SHA256,
 ];
@@ -376,7 +449,10 @@ pub(crate) fn verify_leaf_certificate_pin(
     verify_leaf_certificate_pin_bytes(&relay.certificate_sha256, certificate_der)
 }
 
-fn verify_leaf_certificate_pin_bytes(certificate_sha256: &[u8], certificate_der: &[u8]) -> Result<()> {
+fn verify_leaf_certificate_pin_bytes(
+    certificate_sha256: &[u8],
+    certificate_der: &[u8],
+) -> Result<()> {
     use sha2::{Digest, Sha256};
     if certificate_der.is_empty() || certificate_sha256.len() != 32 {
         bail!("TLS Relay certificate pin is invalid");

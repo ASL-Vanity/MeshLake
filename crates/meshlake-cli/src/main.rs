@@ -1345,6 +1345,15 @@ async fn print_status(response: reqwest::Response) -> Result<()> {
         status.transport.healthy_relays.len(),
         status.transport.configured_relays.len()
     );
+    println!(
+        "TLS relays: {}/{} connected  failures={}  frames={}/{}  queue_drops={}",
+        status.transport.tls_relay_connected,
+        status.transport.tls_relay_configured,
+        status.transport.tls_relay_connection_failures,
+        status.transport.tls_relay_frames_sent,
+        status.transport.tls_relay_frames_received,
+        status.transport.tls_relay_queue_drops,
+    );
     for relay in &status.transport.configured_relays {
         println!(
             "  relay {}  {}",
