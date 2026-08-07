@@ -2745,6 +2745,7 @@ fn migrate_planet_acceptance_metadata(control_plane: &mut NetworkControlPlane) -
             relay_endpoint: relays[0].endpoint,
             roots,
             relays,
+            tls_relays: Vec::new(),
             stun_servers,
             issued_at_unix_seconds: 0,
             expires_at_unix_seconds: None,

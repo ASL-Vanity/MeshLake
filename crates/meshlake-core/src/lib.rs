@@ -21,7 +21,7 @@ pub use authorization::{
 };
 pub use crypto::{
     CryptoError, EnrollmentResponse, MembershipCertificate, MembershipClaims, NetworkKey,
-    PlanetManifest, PlanetRelay, PlanetRoot, SealedPacket,
+    PlanetManifest, PlanetRelay, PlanetRoot, PlanetTlsRelay, SealedPacket,
 };
 pub use model::{
     AgentStatus, DeviceId, EnrollmentRequest, ExitNodeSelection, JoinedNetwork, Membership,

@@ -201,6 +201,19 @@ pub struct PlanetRelay {
     pub identity: Option<ServiceIdentityPolicy>,
 }
 
+/// Controller-signed pinned TLS endpoint attached to a Planet V3 Relay
+/// service identity. The SHA-256 value is calculated over the leaf
+/// certificate's DER encoding; clients never substitute system trust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanetTlsRelay {
+    pub relay_id: uuid::Uuid,
+    pub endpoint: SocketAddr,
+    pub server_name: String,
+    pub certificate_sha256: Vec<u8>,
+    #[serde(default)]
+    pub priority: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanetManifest {
     pub version: u8,
@@ -211,6 +224,8 @@ pub struct PlanetManifest {
     pub roots: Vec<PlanetRoot>,
     #[serde(default)]
     pub relays: Vec<PlanetRelay>,
+    #[serde(default)]
+    pub tls_relays: Vec<PlanetTlsRelay>,
     #[serde(default)]
     pub stun_servers: Vec<String>,
     pub issued_at_unix_seconds: u64,
@@ -257,12 +272,27 @@ struct PlanetManifestV3Payload<'a> {
 }
 
 #[derive(Serialize)]
+struct PlanetManifestV4Payload<'a> {
+    version: u8,
+    controller_url: &'a str,
+    relay_endpoint: SocketAddr,
+    roots: &'a [PlanetRoot],
+    relays: &'a [PlanetRelay],
+    tls_relays: &'a [PlanetTlsRelay],
+    stun_servers: &'a [String],
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: Option<u64>,
+    controller_public_key: &'a [u8],
+}
+
+#[derive(Serialize)]
 struct PlanetManifestSemanticPayload<'a> {
     version: u8,
     controller_url: &'a str,
     relay_endpoint: SocketAddr,
     roots: &'a [PlanetRoot],
     relays: &'a [PlanetRelay],
+    tls_relays: &'a [PlanetTlsRelay],
     stun_servers: &'a [String],
     controller_public_key: &'a [u8],
 }
@@ -278,6 +308,7 @@ impl PlanetManifest {
             relay_endpoint: self.relay_endpoint,
             roots: &self.roots,
             relays: &self.relays,
+            tls_relays: &self.tls_relays,
             stun_servers: &self.stun_servers,
             controller_public_key: &self.controller_public_key,
         })
@@ -311,6 +342,7 @@ impl PlanetManifest {
             relay_endpoint,
             roots: Vec::new(),
             relays: Vec::new(),
+            tls_relays: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
@@ -354,6 +386,7 @@ impl PlanetManifest {
             relay_endpoint,
             roots,
             relays,
+            tls_relays: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
@@ -420,12 +453,54 @@ impl PlanetManifest {
             relay_endpoint,
             roots,
             relays,
+            tls_relays: Vec::new(),
             stun_servers,
             issued_at_unix_seconds,
             expires_at_unix_seconds,
             controller_public_key,
             signature: signing_key.sign(&bytes).to_bytes().to_vec(),
         })
+    }
+
+    pub fn sign_v4(
+        controller_url: String,
+        roots: Vec<PlanetRoot>,
+        relays: Vec<PlanetRelay>,
+        mut tls_relays: Vec<PlanetTlsRelay>,
+        stun_servers: Vec<String>,
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: Option<u64>,
+        signing_key: &SigningKey,
+    ) -> Result<Self, CryptoError> {
+        let mut manifest = Self::sign_v3(
+            controller_url,
+            roots,
+            relays,
+            stun_servers,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            signing_key,
+        )?;
+        tls_relays.sort_by_key(|relay| relay.priority);
+        validate_tls_relays(&tls_relays, &manifest.relays)?;
+        let payload = PlanetManifestV4Payload {
+            version: 4,
+            controller_url: &manifest.controller_url,
+            relay_endpoint: manifest.relay_endpoint,
+            roots: &manifest.roots,
+            relays: &manifest.relays,
+            tls_relays: &tls_relays,
+            stun_servers: &manifest.stun_servers,
+            issued_at_unix_seconds: manifest.issued_at_unix_seconds,
+            expires_at_unix_seconds: manifest.expires_at_unix_seconds,
+            controller_public_key: &manifest.controller_public_key,
+        };
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|_| CryptoError::CertificateEncodingFailed)?;
+        manifest.version = 4;
+        manifest.tls_relays = tls_relays;
+        manifest.signature = signing_key.sign(&bytes).to_bytes().to_vec();
+        Ok(manifest)
     }
 
     /// Validates both the signature and the out-of-band pinned controller key.
@@ -436,7 +511,7 @@ impl PlanetManifest {
         trusted_controller_public_key: &[u8],
         now_unix_seconds: u64,
     ) -> Result<(), CryptoError> {
-        if !matches!(self.version, 1 | 2 | 3)
+        if !matches!(self.version, 1 | 2 | 3 | 4)
             || self.controller_public_key != trusted_controller_public_key
         {
             return Err(CryptoError::UntrustedController);
@@ -463,7 +538,7 @@ impl PlanetManifest {
         {
             return Err(CryptoError::InvalidServiceIdentity);
         }
-        if self.version == 3 {
+        if self.version >= 3 {
             if self.roots.iter().any(|root| root.identity.is_none())
                 || self.relays.is_empty()
                 || self.relays.iter().any(|relay| relay.identity.is_none())
@@ -490,6 +565,11 @@ impl PlanetManifest {
                     .required_public_keys(now_unix_seconds)
                     .map_err(|_| CryptoError::InvalidServiceIdentity)?;
             }
+            if self.version == 4 {
+                validate_tls_relays(&self.tls_relays, &self.relays)?;
+            } else if !self.tls_relays.is_empty() {
+                return Err(CryptoError::InvalidCertificate);
+            }
         }
         let bytes = if self.version == 1 {
             serde_json::to_vec(&PlanetManifestPayload {
@@ -513,13 +593,26 @@ impl PlanetManifest {
                 expires_at_unix_seconds: self.expires_at_unix_seconds,
                 controller_public_key: &self.controller_public_key,
             })
-        } else {
+        } else if self.version == 3 {
             serde_json::to_vec(&PlanetManifestV3Payload {
                 version: self.version,
                 controller_url: &self.controller_url,
                 relay_endpoint: self.relay_endpoint,
                 roots: &self.roots,
                 relays: &self.relays,
+                stun_servers: &self.stun_servers,
+                issued_at_unix_seconds: self.issued_at_unix_seconds,
+                expires_at_unix_seconds: self.expires_at_unix_seconds,
+                controller_public_key: &self.controller_public_key,
+            })
+        } else {
+            serde_json::to_vec(&PlanetManifestV4Payload {
+                version: self.version,
+                controller_url: &self.controller_url,
+                relay_endpoint: self.relay_endpoint,
+                roots: &self.roots,
+                relays: &self.relays,
+                tls_relays: &self.tls_relays,
                 stun_servers: &self.stun_servers,
                 issued_at_unix_seconds: self.issued_at_unix_seconds,
                 expires_at_unix_seconds: self.expires_at_unix_seconds,
@@ -532,6 +625,36 @@ impl PlanetManifest {
         key.verify(&bytes, &ed25519_dalek::Signature::from_bytes(&signature))
             .map_err(|_| CryptoError::InvalidCertificate)
     }
+}
+
+fn validate_tls_relays(
+    tls_relays: &[PlanetTlsRelay],
+    relays: &[PlanetRelay],
+) -> Result<(), CryptoError> {
+    let mut relay_ids = std::collections::BTreeSet::new();
+    let mut endpoints = std::collections::BTreeSet::new();
+    for relay in tls_relays {
+        if relay.relay_id.is_nil()
+            || relay.server_name.is_empty()
+            || relay.server_name.len() > 253
+            || relay
+                .server_name
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || relay.certificate_sha256.len() != 32
+            || !relay_ids.insert(relay.relay_id)
+            || !endpoints.insert(relay.endpoint)
+            || !relays.iter().any(|udp_relay| {
+                udp_relay
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.service_id == relay.relay_id)
+            })
+        {
+            return Err(CryptoError::InvalidCertificate);
+        }
+    }
+    Ok(())
 }
 
 impl MembershipCertificate {
@@ -767,6 +890,57 @@ mod tests {
         assert_eq!(
             downgraded.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
             Err(CryptoError::InvalidServiceIdentity)
+        );
+    }
+
+    #[test]
+    fn planet_v4_binds_tls_relay_to_a_signed_service_identity_and_certificate_pin() {
+        let controller = SigningKey::from_bytes(&[15; 32]);
+        let root = SigningKey::from_bytes(&[16; 32]);
+        let relay = SigningKey::from_bytes(&[17; 32]);
+        let relay_id = uuid::Uuid::from_u128(18);
+        let manifest = PlanetManifest::sign_v4(
+            "https://planet.example".into(),
+            vec![PlanetRoot {
+                public_key: root.verifying_key().to_bytes().to_vec(),
+                endpoints: vec!["203.0.113.17:51819".parse().unwrap()],
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    uuid::Uuid::from_u128(19),
+                    root.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![PlanetRelay {
+                endpoint: "203.0.113.18:51820".parse().unwrap(),
+                priority: 0,
+                identity: Some(ServiceIdentityPolicy::stable(
+                    relay_id,
+                    relay.verifying_key().to_bytes().to_vec(),
+                )),
+            }],
+            vec![PlanetTlsRelay {
+                relay_id,
+                endpoint: "203.0.113.18:443".parse().unwrap(),
+                server_name: "relay.example".into(),
+                certificate_sha256: vec![20; 32],
+                priority: 0,
+            }],
+            vec![],
+            100,
+            Some(200),
+            &controller,
+        )
+        .unwrap();
+        assert_eq!(manifest.version, 4);
+        assert_eq!(
+            manifest.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Ok(())
+        );
+        let mut tampered = manifest;
+        tampered.tls_relays[0].certificate_sha256[0] ^= 1;
+        assert_eq!(
+            tampered.verify_from_controller(&controller.verifying_key().to_bytes(), 150),
+            Err(CryptoError::InvalidCertificate)
         );
     }
 }
