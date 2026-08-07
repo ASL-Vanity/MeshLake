@@ -20,12 +20,14 @@ use std::{
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -39,6 +41,15 @@ struct Cli {
     /// registration remain unchanged; TLS is configured separately.
     #[arg(long)]
     tcp_bind: Option<SocketAddr>,
+    /// TLS-framed TCP Relay listener. Requires both certificate and private key.
+    #[arg(long, requires_all = ["tcp_tls_certificate", "tcp_tls_private_key"])]
+    tcp_tls_bind: Option<SocketAddr>,
+    /// PEM certificate chain for --tcp-tls-bind.
+    #[arg(long)]
+    tcp_tls_certificate: Option<PathBuf>,
+    /// PEM private key for --tcp-tls-bind.
+    #[arg(long)]
+    tcp_tls_private_key: Option<PathBuf>,
     /// Base64 Ed25519 controller public key distributed through a trusted channel.
     #[arg(long)]
     controller_public_key_base64: String,
@@ -121,15 +132,35 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::bind(cli.bind).await?;
     println!("MeshLake relay listening on udp://{}", cli.bind);
     println!("The relay forwards encrypted payloads only.");
+    let udp_target = local_udp_proxy_target(cli.bind, socket.local_addr()?);
     if let Some(tcp_bind) = cli.tcp_bind {
-        let udp_target = local_udp_proxy_target(cli.bind, socket.local_addr()?);
         let listener = TcpListener::bind(tcp_bind)
             .await
             .with_context(|| format!("cannot bind MeshLake TCP relay proxy at {tcp_bind}"))?;
         println!("MeshLake TCP relay proxy listening on tcp://{tcp_bind}");
         tokio::spawn(async move {
-            if let Err(error) = run_tcp_proxy_listener(listener, udp_target).await {
+            if let Err(error) = run_tcp_proxy_listener(listener, udp_target, None).await {
                 eprintln!("MeshLake TCP relay proxy stopped: {error:#}");
+            }
+        });
+    }
+    if let Some(tcp_tls_bind) = cli.tcp_tls_bind {
+        let certificate = cli
+            .tcp_tls_certificate
+            .as_deref()
+            .context("--tcp-tls-bind requires --tcp-tls-certificate")?;
+        let private_key = cli
+            .tcp_tls_private_key
+            .as_deref()
+            .context("--tcp-tls-bind requires --tcp-tls-private-key")?;
+        let acceptor = TlsAcceptor::from(Arc::new(load_tcp_tls_config(certificate, private_key)?));
+        let listener = TcpListener::bind(tcp_tls_bind).await.with_context(|| {
+            format!("cannot bind MeshLake TLS TCP relay proxy at {tcp_tls_bind}")
+        })?;
+        println!("MeshLake TLS TCP relay proxy listening on tls://{tcp_tls_bind}");
+        tokio::spawn(async move {
+            if let Err(error) = run_tcp_proxy_listener(listener, udp_target, Some(acceptor)).await {
+                eprintln!("MeshLake TLS TCP relay proxy stopped: {error:#}");
             }
         });
     }
@@ -168,18 +199,33 @@ async fn main() -> Result<()> {
 /// TCP is only a transport envelope. Every frame is handed to the existing
 /// local UDP relay, which remains the sole verifier of signed registrations
 /// and the sole router for opaque overlay ciphertext.
-async fn run_tcp_proxy_listener(listener: TcpListener, udp_target: SocketAddr) -> Result<()> {
+async fn run_tcp_proxy_listener(
+    listener: TcpListener,
+    udp_target: SocketAddr,
+    tls: Option<TlsAcceptor>,
+) -> Result<()> {
     loop {
         let (stream, remote) = listener.accept().await?;
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(error) = proxy_tcp_connection(stream, udp_target).await {
+            let result = match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => proxy_tcp_connection(stream, udp_target).await,
+                    Err(error) => Err(error).context("TLS relay handshake failed"),
+                },
+                None => proxy_tcp_connection(stream, udp_target).await,
+            };
+            if let Err(error) = result {
                 trace_transport(format!("TCP relay proxy client {remote} closed: {error:#}"));
             }
         });
     }
 }
 
-async fn proxy_tcp_connection(stream: TcpStream, udp_target: SocketAddr) -> Result<()> {
+async fn proxy_tcp_connection<S>(stream: S, udp_target: SocketAddr) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let bind = if udp_target.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -188,7 +234,7 @@ async fn proxy_tcp_connection(stream: TcpStream, udp_target: SocketAddr) -> Resu
     let socket = UdpSocket::bind(bind)
         .await
         .context("cannot create a local UDP socket for TCP relay proxy")?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let mut tcp_incoming = vec![0_u8; MAX_TCP_FRAME_BYTES];
     let mut udp_incoming = vec![0_u8; MAX_TCP_FRAME_BYTES];
     loop {
@@ -209,7 +255,7 @@ async fn proxy_tcp_connection(stream: TcpStream, udp_target: SocketAddr) -> Resu
 }
 
 async fn read_tcp_frame<'a>(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut (impl AsyncRead + Unpin),
     buffer: &'a mut Vec<u8>,
 ) -> Result<Option<&'a [u8]>> {
     let mut length = [0_u8; 4];
@@ -227,7 +273,7 @@ async fn read_tcp_frame<'a>(
     Ok(Some(buffer.as_slice()))
 }
 
-async fn write_tcp_frame(writer: &mut tokio::net::tcp::OwnedWriteHalf, frame: &[u8]) -> Result<()> {
+async fn write_tcp_frame(writer: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -> Result<()> {
     if frame.is_empty() || frame.len() > MAX_TCP_FRAME_BYTES {
         bail!(
             "TCP relay frame length {} is outside the accepted range",
@@ -254,6 +300,36 @@ fn local_udp_proxy_target(configured: SocketAddr, actual: SocketAddr) -> SocketA
         },
         actual.port(),
     )
+}
+
+fn load_tcp_tls_config(
+    certificate_path: &std::path::Path,
+    private_key_path: &std::path::Path,
+) -> Result<rustls::ServerConfig> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let mut certificate_reader =
+        std::io::BufReader::new(std::fs::File::open(certificate_path).with_context(|| {
+            format!("cannot open TLS certificate {}", certificate_path.display())
+        })?);
+    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("cannot read TLS certificate chain")?;
+    if certificates.is_empty() {
+        bail!("TLS certificate chain is empty");
+    }
+    let mut key_reader =
+        std::io::BufReader::new(std::fs::File::open(private_key_path).with_context(|| {
+            format!("cannot open TLS private key {}", private_key_path.display())
+        })?);
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .context("cannot read TLS private key")?
+        .context("TLS private key file contains no supported key")?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .context("TLS certificate chain and private key are incompatible")
 }
 
 async fn handle_packet(
@@ -656,6 +732,7 @@ mod tests {
         AuthorizedMembership, InitiatorHandshake, MembershipClaims, NetworkAuthorizationManifest,
         NetworkKey, ReplayWindow,
     };
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
 
     fn test_relay_identity() -> RelayIdentity {
         RelayIdentity {
@@ -673,7 +750,7 @@ mod tests {
         let tcp_address = tcp_listener.local_addr().unwrap();
         let relay_address = udp_relay.local_addr().unwrap();
         let proxy = tokio::spawn(async move {
-            let _ = run_tcp_proxy_listener(tcp_listener, relay_address).await;
+            let _ = run_tcp_proxy_listener(tcp_listener, relay_address, None).await;
         });
 
         let stream = TcpStream::connect(tcp_address).await.unwrap();
@@ -706,6 +783,70 @@ mod tests {
         .unwrap();
         assert_eq!(returned, outbound.as_slice());
         proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_tcp_proxy_accepts_a_pinned_certificate_and_preserves_frames() {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
+        let directory = std::env::temp_dir().join(format!("meshlake-relay-tls-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let certificate_path = directory.join("certificate.pem");
+        let private_key_path = directory.join("private-key.pem");
+        std::fs::write(&certificate_path, cert.pem()).unwrap();
+        std::fs::write(&private_key_path, signing_key.serialize_pem()).unwrap();
+        let tls = TlsAcceptor::from(Arc::new(
+            load_tcp_tls_config(&certificate_path, &private_key_path).unwrap(),
+        ));
+        let udp_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_address = tcp_listener.local_addr().unwrap();
+        let relay_address = udp_relay.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let _ = run_tcp_proxy_listener(tcp_listener, relay_address, Some(tls)).await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let stream = TcpStream::connect(tcp_address).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("relay.test")
+            .unwrap()
+            .to_owned();
+        let stream = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+            .connect(server_name, stream)
+            .await
+            .unwrap();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let outbound = vec![0x4d, 0x4c, 0x4b, 0x45, RELAY_DATA, 11, 12, 13];
+        write_tcp_frame(&mut writer, &outbound).await.unwrap();
+        let mut relay_buffer = vec![0_u8; MAX_TCP_FRAME_BYTES];
+        let (received, proxy_udp_address) = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_relay.recv_from(&mut relay_buffer),
+        )
+        .await
+        .expect("TLS TCP proxy did not forward the frame")
+        .unwrap();
+        assert_eq!(&relay_buffer[..received], outbound.as_slice());
+        udp_relay
+            .send_to(&relay_buffer[..received], proxy_udp_address)
+            .await
+            .unwrap();
+        let mut client_buffer = vec![0_u8; MAX_TCP_FRAME_BYTES];
+        let returned = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_tcp_frame(&mut reader, &mut client_buffer),
+        )
+        .await
+        .expect("TLS TCP proxy did not return the relay response")
+        .unwrap()
+        .unwrap();
+        assert_eq!(returned, outbound.as_slice());
+        proxy.abort();
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     async fn handle_packet(
