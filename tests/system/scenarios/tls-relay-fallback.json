@@ -30,6 +30,14 @@
           "cleanup": { "type": "restore_direct_path", "roles": ["node_a", "node_b"], "idempotent": true }
         },
         {
+          "type": "block_udp_turn", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_udp_turn", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
+        },
+        {
+          "type": "block_tls_turn", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
+          "cleanup": { "type": "restore_tls_turn", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
+        },
+        {
           "type": "block_udp_relay", "roles": ["node_a", "node_b", "relay_primary"], "scope": "disposable_hosts_only",
           "cleanup": { "type": "restore_udp_relay", "roles": ["node_a", "node_b", "relay_primary"], "idempotent": true }
         },
@@ -46,6 +54,8 @@
       "name": "cleanup",
       "actions": [
         { "type": "restore_udp_relay", "roles": ["node_a", "node_b", "relay_primary"] },
+        { "type": "restore_tls_turn", "roles": ["node_a", "node_b", "relay_primary"] },
+        { "type": "restore_udp_turn", "roles": ["node_a", "node_b", "relay_primary"] },
         { "type": "restore_direct_path", "roles": ["node_a", "node_b"] }
       ],
       "assertions": [
