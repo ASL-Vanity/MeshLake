@@ -29,7 +29,8 @@ pub use model::{
 };
 pub use overlay::{open_relay_packet, seal_relay_packet};
 pub use policy::{
-    DnsPolicy, NetworkPolicyManifest, PolicyError, PolicyRoute, NETWORK_POLICY_MANIFEST_VERSION,
+    DnsPolicy, ExitNode, NetworkPolicyManifest, PolicyError, PolicyRoute,
+    NETWORK_POLICY_MANIFEST_VERSION,
 };
 pub use relay::{
     parse_peer_identity, peer_identity_announcement, relay_associated_data, RelayProtocolError,

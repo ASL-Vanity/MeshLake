@@ -18,10 +18,11 @@ use meshlake_core::{
     cleanup_stale_state_backup, create_restricted_secret_file, decode_protected_state_with,
     recover_protected_state_file, resolve_state_backup_path, restrict_state_file_permissions,
     write_protected_state_file_with, AuthorizedMembership, DeviceId, DnsPolicy, EnrollmentResponse,
-    MembershipCertificate, MembershipClaims, MembershipRefreshRequest, MembershipRefreshResponse,
-    NetworkAuthorizationManifest, NetworkId, NetworkKey, NetworkPolicyManifest, PlanetManifest,
-    PlanetRelay, PlanetRoot, PolicyRoute, ServiceIdentityPolicy, StateFileLock, StateKeyProvider,
-    StateProtection, UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    ExitNode, MembershipCertificate, MembershipClaims, MembershipRefreshRequest,
+    MembershipRefreshResponse, NetworkAuthorizationManifest, NetworkId, NetworkKey,
+    NetworkPolicyManifest, PlanetManifest, PlanetRelay, PlanetRoot, PolicyRoute,
+    ServiceIdentityPolicy, StateFileLock, StateKeyProvider, StateProtection, UpsertNetworkRequest,
+    VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -174,6 +175,8 @@ struct ManagedPolicy {
     #[serde(default)]
     routes: Vec<ManagedPolicyRoute>,
     #[serde(default)]
+    exit_nodes: Vec<ManagedExitNode>,
+    #[serde(default)]
     dns: DnsPolicy,
 }
 
@@ -183,10 +186,19 @@ struct ManagedPolicyRoute {
     gateway_device_id: DeviceId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedExitNode {
+    gateway_device_id: DeviceId,
+    supports_ipv4: bool,
+    supports_ipv6: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct PolicyUpdateRequest {
     #[serde(default)]
     routes: Vec<ManagedPolicyRoute>,
+    #[serde(default)]
+    exit_nodes: Vec<ManagedExitNode>,
     #[serde(default)]
     dns: DnsPolicy,
 }
@@ -627,11 +639,18 @@ impl Controller {
                 .insert(certificate_id, now());
         }
         let previous_route_count = network.policy.routes.len();
+        let previous_exit_count = network.policy.exit_nodes.len();
         network
             .policy
             .routes
             .retain(|route| route.gateway_device_id != device_id);
-        if network.policy.routes.len() != previous_route_count {
+        network
+            .policy
+            .exit_nodes
+            .retain(|exit_node| exit_node.gateway_device_id != device_id);
+        if network.policy.routes.len() != previous_route_count
+            || network.policy.exit_nodes.len() != previous_exit_count
+        {
             network.policy_epoch = network.policy_epoch.saturating_add(1).max(1);
         }
         network.network_key = NetworkKey::generate()
@@ -682,6 +701,7 @@ impl Controller {
             .ok_or_else(|| ApiError::not_found("network does not exist"))?;
         let mut candidate = network.clone();
         candidate.policy.routes = request.routes;
+        candidate.policy.exit_nodes = request.exit_nodes;
         candidate.policy.dns = request.dns;
         candidate.policy_epoch = candidate.policy_epoch.saturating_add(1).max(1);
         let manifest = sign_policy(&candidate, &signing_key).map_err(ApiError::bad_request)?;
@@ -691,6 +711,15 @@ impl Controller {
             .map(|route| ManagedPolicyRoute {
                 prefix: route.prefix.clone(),
                 gateway_device_id: route.gateway_certificate.claims.device_id,
+            })
+            .collect();
+        candidate.policy.exit_nodes = manifest
+            .exit_nodes
+            .iter()
+            .map(|exit_node| ManagedExitNode {
+                gateway_device_id: exit_node.gateway_certificate.claims.device_id,
+                supports_ipv4: exit_node.supports_ipv4,
+                supports_ipv6: exit_node.supports_ipv6,
             })
             .collect();
         candidate.policy.dns = manifest.dns.clone();
@@ -1028,10 +1057,42 @@ fn sign_policy(
             gateway_certificate: certificate,
         });
     }
-    NetworkPolicyManifest::sign(
+    let mut exit_nodes = Vec::with_capacity(network.policy.exit_nodes.len());
+    for exit_node in &network.policy.exit_nodes {
+        let claims = network
+            .members
+            .get(&exit_node.gateway_device_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exit gateway {} is not an active member",
+                    exit_node.gateway_device_id.0
+                )
+            })?;
+        let certificate_id = network
+            .member_certificate_ids
+            .get(&exit_node.gateway_device_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("exit gateway certificate is missing"))?;
+        let mut exit_claims = claims.clone();
+        exit_claims.issued_at_unix_seconds = now();
+        exit_claims.expires_at_unix_seconds = Some(now() + 86_400);
+        let certificate = MembershipCertificate::sign_authorized(
+            exit_claims,
+            certificate_id,
+            network.network_key_epoch,
+            signing_key,
+        )?;
+        exit_nodes.push(ExitNode {
+            gateway_certificate: certificate,
+            supports_ipv4: exit_node.supports_ipv4,
+            supports_ipv6: exit_node.supports_ipv6,
+        });
+    }
+    NetworkPolicyManifest::sign_with_exit_nodes(
         network.network.id,
         network.policy_epoch,
         routes,
+        exit_nodes,
         network.policy.dns.clone(),
         now(),
         now() + 90,
@@ -2500,6 +2561,11 @@ mod tests {
                     prefix: "10.61.0.0/16".into(),
                     gateway_device_id: gateway,
                 }],
+                exit_nodes: vec![ManagedExitNode {
+                    gateway_device_id: gateway,
+                    supports_ipv4: true,
+                    supports_ipv6: true,
+                }],
                 dns: DnsPolicy {
                     servers: vec!["10.61.0.53".parse().unwrap()],
                     search_domains: vec!["corp.example".into()],
@@ -2523,6 +2589,13 @@ mod tests {
             .claims
             .allowed_routes
             .contains(&"10.61.0.0/16".into()));
+        assert_eq!(policy.exit_nodes.len(), 1);
+        assert_eq!(
+            policy.exit_nodes[0].gateway_certificate.claims.device_id,
+            gateway
+        );
+        assert!(policy.exit_nodes[0].supports_ipv4);
+        assert!(policy.exit_nodes[0].supports_ipv6);
     }
 
     #[test]
@@ -2561,6 +2634,7 @@ mod tests {
                     prefix: "10.64.0.0/16".into(),
                     gateway_device_id: gateway,
                 }],
+                exit_nodes: vec![],
                 dns: DnsPolicy::default(),
             },
         };
