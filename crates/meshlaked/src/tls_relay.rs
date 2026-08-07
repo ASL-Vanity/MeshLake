@@ -473,7 +473,10 @@ fn trace_tls_relay(message: impl fmt::Display) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
     use sha2::{Digest, Sha256};
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_rustls::TlsAcceptor;
     use uuid::Uuid;
 
     fn relay(pin: Vec<u8>) -> PlanetTlsRelay {
@@ -497,5 +500,72 @@ mod tests {
     #[test]
     fn rejects_an_invalid_pin_length_before_tls_validation() {
         assert!(verify_leaf_certificate_pin(&relay(vec![0; 31]), b"certificate").is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_tls_transport_forwards_only_framed_ciphertext() {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_address = server.local_addr().unwrap();
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (stream, _) = server.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let mut buffer = Vec::new();
+            let frame = read_tcp_frame(&mut reader, &mut buffer)
+                .await
+                .unwrap()
+                .unwrap();
+            write_tcp_frame(&mut writer, frame).await.unwrap();
+        });
+        let logical_endpoint: SocketAddr = "127.0.0.1:51999".parse().unwrap();
+        let relay = PlanetTlsRelay {
+            relay_id: Uuid::from_u128(7),
+            endpoint: server_address,
+            server_name: "relay.test".into(),
+            certificate_sha256: Sha256::digest(cert.der().as_ref()).to_vec(),
+            priority: 0,
+        };
+        let telemetry = Arc::new(TlsRelayTelemetry::default());
+        let mut transport = TlsRelayTransport::start(
+            vec![TlsRelayRoute {
+                relay,
+                relay_endpoint: logical_endpoint,
+            }],
+            telemetry.clone(),
+        )
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while telemetry.snapshot().connected != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pinned TLS transport did not connect");
+        let encrypted_frame = vec![0x4d, 0x4c, 0x52, 0x31, 12, 7, 8, 9];
+        assert!(transport.try_send(logical_endpoint, &encrypted_frame));
+        let inbound = timeout(Duration::from_secs(2), transport.receive())
+            .await
+            .expect("pinned TLS transport did not return a frame")
+            .unwrap();
+        assert_eq!(inbound.relay_endpoint, logical_endpoint);
+        assert_eq!(inbound.packet, encrypted_frame);
+        assert_eq!(telemetry.snapshot().frames_sent, 1);
+        assert_eq!(telemetry.snapshot().frames_received, 1);
+        relay_task.await.unwrap();
     }
 }

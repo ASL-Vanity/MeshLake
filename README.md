@@ -17,7 +17,7 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - `meshlaked`：Windows/Linux 无界面后台代理，提供仅监听本机回环地址的管理 API，可持久化设备身份并加入多个网络；Windows 支持以 SYSTEM 权限随系统启动，Linux 支持 systemd。
 - `meshlake-cli`：无图形界面的命令行客户端，可查询状态、管理网络及控制虚拟网卡会话。
 - `meshlake-controller`：自托管控制器，可创建双栈网络、发放一次性入网令牌、分配虚拟 IPv4/IPv6 地址，并使用 Ed25519 签发成员证书；支持直接加载 PEM 证书和私钥提供原生 HTTPS。
-- `meshlake-relay`：可选 UDP 协调与中继服务。成员先用控制器签发的证书注册；服务会交换经验证成员的观察到的 UDP 地址以协助打洞，并仅按网络与设备标识转发密文，不持有任何虚拟网络密钥。
+- `meshlake-relay`：可选 UDP 协调与中继服务，并可把同一套已认证密文 Relay 帧封装进受控制器证书指纹钉扎的 TCP/TLS 流；服务会交换经验证成员的观察到的 UDP 地址以协助打洞，并仅按网络与设备标识转发密文，不持有任何虚拟网络密钥。
 - `meshlake-core`：共享的数据模型、Ed25519/X25519/HKDF/XChaCha20-Poly1305 会话协议、成员证书校验和 UDP 中继帧定义。
 - `MeshLake`：原生 Windows 图形管理端，与同一个后台代理协作，可查看状态、控制网卡及安全加入控制器网络。
 - Wintun：代理可动态加载签名的 `wintun.dll`，创建/关闭虚拟网卡会话，且已具备官方 API 的 IP 数据包读写封装。
@@ -35,12 +35,14 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - 安全状态备份：agent 与 controller 可用隐藏口令交互导出跨 Windows/Linux、可跨机器恢复的备份包；格式使用 Argon2id 派生密钥和 XChaCha20-Poly1305 认证加密，错误口令、篡改、截断、类型混用和保留路径别名都会失败关闭。恢复后 Windows 重新写入 DPAPI，Linux 保持 `0600`。
 - 签名 DNS 与自定义路由：控制器发布 Ed25519 签名的 `NetworkPolicyManifest`；非默认 IPv4/IPv6 路由必须由当前成员证书的 `allowed_routes` 明确覆盖，客户端联合验证钉扎控制器、授权清单和网关证书后才应用。Windows/Linux 平台配置采用事务更新，回滚无法确认时会停用虚拟网卡数据面。详见 [`docs/network-policy.md`](docs/network-policy.md)。
 - 会话可观测性：本机 `GET /v1/sessions` 与 `meshlake-cli sessions [--json]` 提供按网络隔离的 pending/established/expired、直连/中继路径、队列和安全计数，不暴露密钥、握手包、端点或数据内容。另有不连接外部主机的 Windows/Linux 系统测试计划框架，详见 [`docs/session-observability.md`](docs/session-observability.md)。
+- 出口节点与默认路由：控制器只能签发候选资格，成员必须在本机显式选择 IPv4/IPv6 出口；Windows/Linux 都会事务性安装默认路由、签名 DNS 和受控转发/NAT，失败或回滚不完整时停用虚拟适配器。
+- 出口防泄漏：Linux 使用 MeshLake 专属 `iptables`/`ip6tables` 规则；Windows 使用 MeshLake 专属、持久化的 WFP 子层与过滤器，允许虚拟接口、回环和仅限 `meshlaked` 进程的精确 Controller/Planet/Root/Relay/STUN/TLS Relay 端点，其余物理出口阻断。Windows 在已选择出口且有签名 DNS 时还会安装 MeshLake 专属 NRPT `.` 规则，防止物理网卡 DNS 回退。
+- 受限网络回退：Planet V4 可签发 TLS Relay 的服务 ID、TCP 端点、SNI 和叶证书 SHA-256 指纹。客户端先尝试 UDP 直连与已认证 UDP Relay；UDP 未健康时才回退到长度帧 TLS Relay，且不使用系统根证书。状态/API 只报告 TLS Relay 的脱敏连接、失败和帧计数；详见 [`docs/tls-relay.md`](docs/tls-relay.md)。
 
 尚未实现，因此当前版本**不能作为正式虚拟局域网产品使用**：
 
-- 默认路由/出口节点、网关主机自动开启 IP forwarding、防火墙或 NAT；
 - macOS、Android、iOS 客户端，以及 Linux Secret Service/TPM 等更强的平台密钥库集成；
-- 提权真实 Windows/Linux 主机上的路由、DNS、双栈、故障切换与吊销跨主机验收。
+- 提权真实 Windows/Linux 主机上的路由、DNS、双栈、WFP、故障切换与吊销跨主机验收；当前代码和离线测试不能替代该验收。
 
 ## 架构
 

@@ -1,8 +1,8 @@
-# MeshLake Planet（V3）
+# MeshLake Planet（V4）
 
 Planet 是由控制器 Ed25519 私钥签名的**每网络**引导清单，而不是数据中继。它发布控制器 URL、Root、Relay 与可选 STUN，并把这些服务与该网络已钉扎的控制器公钥绑定。客户端先验证 Planet 签名与控制器 URL，再把经验证的配置原子保存到该网络控制面；不同 Planet 的网络绝不共享信任或健康结论。
 
-Planet V3 在 V2 的多 Root/多 Relay 排序基础上，强制为每个 Root、Relay 发布稳定的服务 ID 和服务身份策略。V3 缺少服务身份、服务 ID 不匹配、签名不完整、已撤销密钥或轮换窗口无效，均失败关闭。
+Planet V3 在 V2 的多 Root/多 Relay 排序基础上，强制为每个 Root、Relay 发布稳定的服务 ID 和服务身份策略。Planet V4 在此基础上可发布 TLS Relay：每项绑定既有 Relay 的 `service_id`、数值 TCP 端点、SNI 与叶证书 DER 的 SHA-256 指纹。V3/V4 缺少服务身份、服务 ID 不匹配、签名不完整、已撤销密钥或轮换窗口无效，均失败关闭。
 
 > MeshLake 保持无 GUI 优先：正常加入可通过一次性 join link；Planet 的手工设置命令仅适用于迁移或受控运维。
 
@@ -10,7 +10,7 @@ Planet V3 在 V2 的多 Root/多 Relay 排序基础上，强制为每个 Root、
 
 - 客户端仅信任入网材料或本地显式配置中已钉扎的控制器公钥；Planet 自称的公钥不是信任来源。
 - 每个已加入网络约每 **60 秒**刷新一次 Planet，使用该网络保存的控制器 URL、私有 CA（如有）和钉扎公钥。
-- 刷新前验证签名、有效期、控制器 URL、V3 服务身份以及版本、`issued_at` 与语义摘要的单调性。拒绝版本回退、`issued_at` 回退，或相同版本/时间却改变语义的清单。
+- 刷新前验证签名、有效期、控制器 URL、V3/V4 服务身份、TLS Relay 证书指纹以及版本、`issued_at` 与语义摘要的单调性。拒绝版本回退、`issued_at` 回退，或相同版本/时间却改变语义的清单。
 - 下载、验证或受保护状态落盘失败时，保留最后一次已验证的配置，不把候选配置部分写入内存或磁盘。
 - 若最后一次已验证的 Planet 到期，该网络的 Root、Relay 和 Planet STUN 配置会被移出传输配置；已接受过 Planet 的网络不会回退使用旧全局/手工端点。
 
