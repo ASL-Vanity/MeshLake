@@ -25,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, UdpSocket},
 };
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -733,6 +733,7 @@ mod tests {
         NetworkKey, ReplayWindow,
     };
     use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use tokio::net::TcpStream;
 
     fn test_relay_identity() -> RelayIdentity {
         RelayIdentity {
