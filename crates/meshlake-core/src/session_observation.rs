@@ -43,6 +43,9 @@ pub enum SessionPath {
     Unknown,
     Direct,
     Relay,
+    /// TLS-framed transport through a controller-pinned MeshLake Relay.
+    /// The overlay packet remains pairwise encrypted end to end.
+    TlsRelay,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

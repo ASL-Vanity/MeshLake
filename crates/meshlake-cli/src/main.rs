@@ -1436,6 +1436,7 @@ fn render_session(session: &SessionObservation) -> String {
         SessionPath::Unknown => "unknown",
         SessionPath::Direct => "direct",
         SessionPath::Relay => "relay",
+        SessionPath::TlsRelay => "tls_relay",
     };
     format!(
         "  network {}  peer {}  {} via {}  age={}ms  queue={}/{} dropped={}  security={{attempts:{}, retries:{}, tx:{}, rx_auth:{}, rx_rejected:{}}}\n",

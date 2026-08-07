@@ -2993,10 +2993,13 @@ dependencies = [
  "meshlake-core",
  "reqwest",
  "rpassword",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "uuid",
  "zeroize",
 ]

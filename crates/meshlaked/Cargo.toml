@@ -21,11 +21,14 @@ libloading.workspace = true
 meshlake-core = { path = "../meshlake-core" }
 reqwest.workspace = true
 rpassword.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 uuid.workspace = true
+webpki.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]

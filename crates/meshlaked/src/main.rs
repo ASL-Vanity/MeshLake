@@ -64,6 +64,7 @@ use transport_health::{
     select_relay_endpoint, EndpointHealthTable, RegistrationSchedule, RegistrationServiceKind,
     RegistrationTarget,
 };
+use tls_relay::{TlsRelayRoute, TlsRelayTransport};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -299,6 +300,7 @@ struct Agent {
 struct NetworkTransportConfiguration {
     relay_endpoints: Vec<SocketAddr>,
     relay_identities: HashMap<SocketAddr, ServiceIdentityPolicy>,
+    tls_relays: Vec<TlsRelayRoute>,
     planet_manifest_version: Option<u8>,
     planet_expires_at_unix_seconds: Option<u64>,
     root_servers: Vec<PlanetRoot>,
@@ -390,6 +392,24 @@ impl TransportConfiguration {
             .get(&network_id)?
             .relay_identities
             .get(&endpoint)
+    }
+
+    fn tls_relays_for(&self, network_id: NetworkId) -> &[TlsRelayRoute] {
+        self.networks
+            .get(&network_id)
+            .map(|network| network.tls_relays.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn all_tls_relays(&self) -> Vec<TlsRelayRoute> {
+        let mut routes = self
+            .networks
+            .values()
+            .flat_map(|network| network.tls_relays.iter().cloned())
+            .collect::<Vec<_>>();
+        routes.sort_by_key(|route| (route.relay.priority, route.relay_endpoint));
+        routes.dedup_by_key(|route| route.relay_endpoint);
+        routes
     }
 
     fn planet_manifest_version_for(&self, network_id: NetworkId) -> Option<u8> {
@@ -2837,6 +2857,29 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
             .iter()
             .filter_map(|relay| Some((relay.endpoint, relay.identity.clone()?)))
             .collect::<HashMap<_, _>>();
+        let mut tls_relays = if planet_expired {
+            Vec::new()
+        } else {
+            joined.control_plane.verified_tls_relays.clone()
+        };
+        tls_relays.sort_by_key(|relay| relay.priority);
+        let tls_relays = tls_relays
+            .into_iter()
+            .filter_map(|relay| {
+                relays
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.service_id == relay.relay_id)
+                    })
+                    .map(|candidate| TlsRelayRoute {
+                        relay,
+                        relay_endpoint: candidate.endpoint,
+                    })
+            })
+            .collect::<Vec<_>>();
         let mut relay_endpoints = relays
             .iter()
             .map(|relay| relay.endpoint)
@@ -2888,6 +2931,7 @@ fn transport_configuration_from_state(state: &PersistedState) -> TransportConfig
             NetworkTransportConfiguration {
                 relay_endpoints,
                 relay_identities,
+                tls_relays,
                 planet_manifest_version: joined.control_plane.planet_manifest_version,
                 planet_expires_at_unix_seconds: (!planet_expired)
                     .then_some(joined.control_plane.planet_expires_at_unix_seconds)
@@ -4050,6 +4094,8 @@ fn prepare_outbound_peer_packet(
 async fn send_peer_routed_packet(
     sockets: &TransportSockets,
     relay_endpoints: &[SocketAddr],
+    tls_relays: &[TlsRelayRoute],
+    tls_relay_transport: &TlsRelayTransport,
     endpoint_health: &EndpointHealthTable,
     network: &JoinedNetwork,
     route: &PeerRoute,
@@ -4071,23 +4117,69 @@ async fn send_peer_routed_packet(
     if matches!(network.network.relay_policy, RelayPolicy::Disabled) {
         return None;
     }
-    let Some(relay_endpoint) = select_relay_endpoint(
+    let relay_endpoint = select_relay_endpoint(
         network.network.id,
         relay_endpoints,
         endpoint_health,
         Instant::now(),
-        network.control_plane.planet_manifest_version == Some(3),
-    ) else {
-        return None;
-    };
-    if sockets.send_to(packet, relay_endpoint).await {
-        trace_transport(format!(
-            "sent {description} for member {} through relay {relay_endpoint}",
-            target_device.0
-        ));
-        return Some(SessionPath::Relay);
+        network.control_plane.planet_manifest_version.is_some_and(|version| version >= 3),
+    );
+    if let Some(relay_endpoint) = relay_endpoint {
+        if sockets.send_to(packet, relay_endpoint).await {
+            trace_transport(format!(
+                "sent {description} for member {} through relay {relay_endpoint}",
+                target_device.0
+            ));
+            return Some(SessionPath::Relay);
+        }
+    }
+    for route in tls_relays {
+        if tls_relay_transport.try_send(route.relay_endpoint, packet) {
+            trace_transport(format!(
+                "sent {description} for member {} through controller-pinned TLS relay",
+                target_device.0
+            ));
+            return Some(SessionPath::TlsRelay);
+        }
     }
     None
+}
+
+fn session_path_for(
+    remote: SocketAddr,
+    relay_endpoints: &[SocketAddr],
+    via_tls_relay: bool,
+) -> SessionPath {
+    if via_tls_relay && relay_endpoints.contains(&remote) {
+        SessionPath::TlsRelay
+    } else if relay_endpoints.contains(&remote) {
+        SessionPath::Relay
+    } else {
+        SessionPath::Direct
+    }
+}
+
+fn session_path_description(path: SessionPath) -> &'static str {
+    match path {
+        SessionPath::Unknown => "unknown path",
+        SessionPath::Direct => "direct path",
+        SessionPath::Relay => "relay",
+        SessionPath::TlsRelay => "controller-pinned TLS relay",
+    }
+}
+
+async fn send_to_inbound_path(
+    sockets: &TransportSockets,
+    tls_relay_transport: &TlsRelayTransport,
+    remote: SocketAddr,
+    packet: &[u8],
+    via_tls_relay: bool,
+) -> bool {
+    if via_tls_relay {
+        tls_relay_transport.try_send(remote, packet)
+    } else {
+        sockets.send_to(packet, remote).await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4118,7 +4210,7 @@ fn sign_registration_for_planet_service(
     signing_key: &SigningKey,
 ) -> std::result::Result<Option<RootRegistration>, meshlake_core::RootProtocolError> {
     match planet_manifest_version {
-        Some(3) => {
+        Some(3 | 4) => {
             let Some(identity) = service_identity else {
                 return Ok(None);
             };
@@ -4232,6 +4324,7 @@ async fn run_relay_worker(
             .relay_endpoints
             .retain(|endpoint| sockets.supports(*endpoint));
     }
+    let mut tls_relay_transport = TlsRelayTransport::start(configuration.all_tls_relays())?;
     let relay_endpoints = configuration.relay_endpoints.clone();
     let root_servers = configuration.root_servers.clone();
     trace_transport(format!(
@@ -4332,6 +4425,8 @@ async fn run_relay_worker(
                     &mut advertised_candidates,
                     &mut endpoint_health,
                     &mut registration_schedules,
+                    &tls_relay_transport,
+                    false,
                 ).await?;
             }
             received = receive_optional(sockets.ipv6.as_ref(), &mut incoming_ipv6) => {
@@ -4353,6 +4448,31 @@ async fn run_relay_worker(
                     &mut advertised_candidates,
                     &mut endpoint_health,
                     &mut registration_schedules,
+                    &tls_relay_transport,
+                    false,
+                ).await?;
+            }
+            received = tls_relay_transport.receive() => {
+                let Some(received) = received else { continue; };
+                receive_udp_packet(
+                    &agent,
+                    &sockets,
+                    &configuration,
+                    configuration_revision,
+                    received.relay_endpoint,
+                    &received.packet,
+                    &mut peers,
+                    &mut sessions,
+                    &mut seen_handshakes,
+                    &identity,
+                    &mut stun_transactions,
+                    &mut root_transactions,
+                    &mut relay_registration_transactions,
+                    &mut advertised_candidates,
+                    &mut endpoint_health,
+                    &mut registration_schedules,
+                    &tls_relay_transport,
+                    true,
                 ).await?;
             }
             _ = tick.tick() => {
@@ -4458,6 +4578,8 @@ async fn run_relay_worker(
                         if let Some(path) = send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network_id),
+                            configuration.tls_relays_for(network_id),
+                            &tls_relay_transport,
                             &endpoint_health,
                             network,
                             route,
@@ -4586,8 +4708,8 @@ async fn run_relay_worker(
                             )?
                             else {
                                 trace_transport(match manifest_version {
-                                    Some(3) => format!(
-                                        "skipped V3 Relay registration without a pinned service identity for network {}",
+                                    Some(3 | 4) => format!(
+                                        "skipped signed Planet Relay registration without a pinned service identity for network {}",
                                         certificate.claims.network_id.0
                                     ),
                                     Some(version) => format!(
@@ -4602,7 +4724,13 @@ async fn run_relay_worker(
                             let mut registration = Vec::from(RELAY_MAGIC);
                             registration.push(RELAY_REGISTER_SIGNED);
                             registration.extend_from_slice(&serde_json::to_vec(&signed)?);
-                            if sockets.send_to(&registration, *relay_endpoint).await {
+                            let udp_sent = sockets.send_to(&registration, *relay_endpoint).await;
+                            let tls_sent = configuration
+                                .tls_relays_for(certificate.claims.network_id)
+                                .iter()
+                                .filter(|route| route.relay_endpoint == *relay_endpoint)
+                                .any(|route| tls_relay_transport.try_send(route.relay_endpoint, &registration));
+                            if udp_sent || tls_sent {
                                 schedule.mark_sent(schedule_time);
                                 relay_registration_transactions.insert(
                                     nonce,
@@ -4773,6 +4901,8 @@ async fn run_relay_worker(
                         let selected_path = send_peer_routed_packet(
                             &sockets,
                             configuration.relay_endpoints_for(network.network.id),
+                            configuration.tls_relays_for(network.network.id),
+                            &tls_relay_transport,
                             &endpoint_health,
                             network,
                             &route,
@@ -4818,6 +4948,8 @@ async fn receive_udp_packet(
     advertised_candidates: &mut Vec<SocketAddr>,
     endpoint_health: &mut EndpointHealthTable,
     registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
+    tls_relay_transport: &TlsRelayTransport,
+    via_tls_relay: bool,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     if let Some((transaction_id, candidate)) = parse_stun_binding_success(packet) {
@@ -5071,6 +5203,8 @@ async fn receive_udp_packet(
                 seen_handshakes,
                 identity,
                 configuration_revision,
+                tls_relay_transport,
+                via_tls_relay,
             )
             .await?;
         }
@@ -5084,6 +5218,8 @@ async fn receive_udp_packet(
                 peers,
                 sessions,
                 configuration_revision,
+                tls_relay_transport,
+                via_tls_relay,
             )
             .await?;
         }
@@ -5096,6 +5232,7 @@ async fn receive_udp_packet(
                 peers,
                 sessions,
                 configuration_revision,
+                via_tls_relay,
             )
             .await?;
         }
@@ -5274,6 +5411,8 @@ async fn receive_session_init(
     seen_handshakes: &mut HashMap<(PeerKey, [u8; 16]), Instant>,
     identity: &SigningKey,
     configuration_revision: u64,
+    tls_relay_transport: &TlsRelayTransport,
+    via_tls_relay: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_INIT)
@@ -5318,14 +5457,17 @@ async fn receive_session_init(
     });
     if let Some(response) = cached_response {
         if let Some(session) = sessions.get_mut(&peer_key) {
-            session.set_path(if relay_endpoints.contains(&remote) {
-                SessionPath::Relay
-            } else {
-                SessionPath::Direct
-            });
+            session.set_path(session_path_for(remote, relay_endpoints, via_tls_relay));
             publish_session(agent, configuration_revision, peer_key, session);
         }
-        sockets.send_to(&response, remote).await;
+        send_to_inbound_path(
+            sockets,
+            tls_relay_transport,
+            remote,
+            &response,
+            via_tls_relay,
+        )
+        .await;
         return Ok(());
     }
     if matches!(
@@ -5398,11 +5540,7 @@ async fn receive_session_init(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: Some(response.clone()),
-            path: if relay_endpoints.contains(&remote) {
-                SessionPath::Relay
-            } else {
-                SessionPath::Direct
-            },
+            path: session_path_for(remote, relay_endpoints, via_tls_relay),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5411,10 +5549,26 @@ async fn receive_session_init(
             rejected_packets_received: rejected_packets,
         },
     );
-    sockets.send_to(&response, remote).await;
+    send_to_inbound_path(
+        sockets,
+        tls_relay_transport,
+        remote,
+        &response,
+        via_tls_relay,
+    )
+    .await;
     let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
     for encrypted in queued_encrypted {
-        queued_send_results.push(sockets.send_to(&encrypted, remote).await);
+        queued_send_results.push(
+            send_to_inbound_path(
+                sockets,
+                tls_relay_transport,
+                remote,
+                &encrypted,
+                via_tls_relay,
+            )
+            .await,
+        );
     }
     if let Some(session) = sessions.get_mut(&peer_key) {
         session.record_encrypted_send_results(queued_send_results);
@@ -5424,11 +5578,7 @@ async fn receive_session_init(
         "accepted pairwise session {} from member {} via {}",
         Uuid::from_bytes(session_id),
         source.0,
-        if relay_endpoints.contains(&remote) {
-            "relay"
-        } else {
-            "direct path"
-        }
+        session_path_description(session_path_for(remote, relay_endpoints, via_tls_relay))
     ));
     Ok(())
 }
@@ -5442,6 +5592,8 @@ async fn receive_session_response(
     peers: &HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     configuration_revision: u64,
+    tls_relay_transport: &TlsRelayTransport,
+    via_tls_relay: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_RESPONSE)
@@ -5524,11 +5676,7 @@ async fn receive_session_response(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: None,
-            path: if relay_endpoints.contains(&remote) {
-                SessionPath::Relay
-            } else {
-                SessionPath::Direct
-            },
+            path: session_path_for(remote, relay_endpoints, via_tls_relay),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5539,7 +5687,16 @@ async fn receive_session_response(
     );
     let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
     for encrypted in queued_encrypted {
-        queued_send_results.push(sockets.send_to(&encrypted, remote).await);
+        queued_send_results.push(
+            send_to_inbound_path(
+                sockets,
+                tls_relay_transport,
+                remote,
+                &encrypted,
+                via_tls_relay,
+            )
+            .await,
+        );
     }
     if let Some(session) = sessions.get_mut(&peer_key) {
         session.record_encrypted_send_results(queued_send_results);
@@ -5561,6 +5718,7 @@ async fn receive_session_data(
     peers: &mut HashMap<PeerKey, PeerRoute>,
     sessions: &mut HashMap<PeerKey, PeerSessionState>,
     configuration_revision: u64,
+    via_tls_relay: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_DATA)
@@ -5593,11 +5751,7 @@ async fn receive_session_data(
     };
     if let Some(session) = sessions.get_mut(&peer_key) {
         session.record_authenticated_packet();
-        session.set_path(if relay_endpoints.contains(&remote) {
-            SessionPath::Relay
-        } else {
-            SessionPath::Direct
-        });
+        session.set_path(session_path_for(remote, relay_endpoints, via_tls_relay));
         publish_session(agent, configuration_revision, peer_key, session);
     }
     if opened.network_id != network_id
@@ -6458,7 +6612,7 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert!(sign_registration_for_planet_service(
+        let v4_root = sign_registration_for_planet_service(
             Some(4),
             RootRegistrationServiceKind::Root,
             Some(&root_identity),
@@ -6471,7 +6625,14 @@ mod tests {
             &device_identity,
         )
         .unwrap()
-        .is_none());
+        .unwrap();
+        assert_eq!(
+            v4_root.payload.target,
+            Some(meshlake_core::RootRegistrationTarget {
+                service_kind: RootRegistrationServiceKind::Root,
+                service_id: root_identity.service_id,
+            })
+        );
     }
 
     fn refresh_target(network: &JoinedNetwork) -> AuthorizationRefreshTarget {
