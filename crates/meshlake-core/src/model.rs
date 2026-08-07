@@ -41,7 +41,28 @@ pub struct Membership {
     pub allowed_routes: Vec<String>,
 }
 
-/// Verified control-plane data owned by one joined virtual network.
+/// A local, user-controlled exit selection. Controller policy can advertise
+/// candidates, but cannot populate this preference or force a default route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitNodeSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_gateway: Option<DeviceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_gateway: Option<DeviceId>,
+    /// When enabled, platform policy must block non-exempt physical-network
+    /// traffic if the selected exit cannot be applied safely.
+    #[serde(default)]
+    pub kill_switch: bool,
+}
+
+impl ExitNodeSelection {
+    pub fn is_empty(&self) -> bool {
+        self.ipv4_gateway.is_none() && self.ipv6_gateway.is_none() && !self.kill_switch
+    }
+}
+
+/// Verified control-plane data and local network preferences owned by one
+/// joined virtual network.
 ///
 /// This deliberately lives with the network instead of in device-global
 /// state: one MeshLake agent may join networks that use different controllers
@@ -91,6 +112,11 @@ pub struct NetworkControlPlane {
     /// Latest verified controller-signed custom route and DNS policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_manifest: Option<crate::policy::NetworkPolicyManifest>,
+    /// Local opt-in exit-node preference. This value is never supplied by the
+    /// controller and is effective only when the selected candidate is present
+    /// in a current, verified policy manifest.
+    #[serde(default, skip_serializing_if = "ExitNodeSelection::is_empty")]
+    pub exit_node_selection: ExitNodeSelection,
 }
 
 impl NetworkControlPlane {
@@ -109,6 +135,7 @@ impl NetworkControlPlane {
             && self.verified_stun_servers.is_empty()
             && self.authorization_manifest.is_none()
             && self.policy_manifest.is_none()
+            && self.exit_node_selection.is_empty()
     }
 }
 
@@ -369,6 +396,7 @@ mod tests {
                     epoch_hint: None,
                 }),
                 policy_manifest: None,
+                exit_node_selection: ExitNodeSelection::default(),
             },
         };
 
@@ -385,6 +413,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("BEGIN CERTIFICATE"));
+        assert!(serialized["control_plane"]
+            .get("exit_node_selection")
+            .is_none());
         assert_eq!(
             serialized["control_plane"]["authorization_manifest"]["authorization_epoch"],
             3

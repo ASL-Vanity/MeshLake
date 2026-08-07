@@ -1434,6 +1434,17 @@ fn same_policy_semantics(left: &NetworkPolicyManifest, right: &NetworkPolicyMani
                 && left.gateway_certificate.claims.device_id
                     == right.gateway_certificate.claims.device_id
         })
+        && left.exit_nodes.len() == right.exit_nodes.len()
+        && left
+            .exit_nodes
+            .iter()
+            .zip(&right.exit_nodes)
+            .all(|(left, right)| {
+                left.gateway_certificate.claims.device_id
+                    == right.gateway_certificate.claims.device_id
+                    && left.supports_ipv4 == right.supports_ipv4
+                    && left.supports_ipv6 == right.supports_ipv6
+            })
 }
 
 fn activate_adapter_transaction<E>(
