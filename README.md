@@ -202,4 +202,4 @@ meshlake-cli network join `
 
 阶段 3“生产化验收与运维安全”的代码与离线安全护栏已完成：秘密输入、受控系统测试执行器、Planet V3 Root/Relay 身份轮换、授权 epoch 收敛、刷新与失败关闭均已合并。**真实跨主机验收尚未执行**：只有用户明确授权后，才会连接指定的可丢弃 Windows/Linux 测试主机进行跨主机、故障注入和路由/DNS 回滚验证。任务拆分、合并顺序与完成记录见 [`docs/stage3-development-plan.md`](docs/stage3-development-plan.md) 和 [`docs/stage3-parallel-development.md`](docs/stage3-parallel-development.md)。
 
-出口节点、默认路由、自动 IP forwarding/NAT 和 TURN 数据面推迟到阶段 4；移动客户端和完整 GUI 产品化推迟到阶段 5。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。阶段 2 的合并记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。
+出口节点、默认路由、自动 IP forwarding/NAT 和 TURN 数据面在[阶段 4 开发计划](docs/stage4-development-plan.md)中按显式授权、默认失败关闭和统一验收的顺序推进；移动客户端和完整 GUI 产品化推迟到阶段 5。即使不安装 GUI，`meshlaked` 与 `meshlake-cli` 仍可独立运行。阶段 2 的合并记录见 [`docs/stage2-parallel-development.md`](docs/stage2-parallel-development.md)。
