@@ -12,10 +12,10 @@ TLS Relay 是 MeshLake 在 UDP 被封锁或严重受限时的**受控加密回�
 ## 路径选择
 
 ```text
-UDP 直连 -> Planet V5 UDP TURN（如已配置） -> 已认证 UDP Relay -> Planet V4 TLS Relay
+UDP 直连 -> Planet V5 UDP TURN（如已配置） -> Planet V5 TLS TURN（如已配置） -> 已认证 UDP Relay -> Planet V4 TLS Relay
 ```
 
-`RelayPolicy::Disabled` 禁止所有 TURN/Relay 回退；`RelayPolicy::Required` 跳过直连。对于 V3/V4/V5 Relay，只有收到对应网络、服务身份和 nonce 的已验证注册确认后，UDP Relay 才会被视为健康；UDP 未健康而 TLS Relay 已完成指纹钉扎连接时，客户端才把加密帧写入 TLS 流。TURN 的部署和凭据边界见 [`turn.md`](turn.md)。
+`RelayPolicy::Disabled` 禁止所有 TURN/Relay 回退；`RelayPolicy::Required` 跳过直连。标准 UDP TURN 与 TLS TURN 优先于 MeshLake Relay；明文 TCP TURN 因会暴露短期凭据而始终失败关闭。对于 V3/V4/V5 Relay，只有收到对应网络、服务身份和 nonce 的已验证注册确认后，UDP Relay 才会被视为健康；UDP 未健康且 TURN 不可用而 TLS Relay 已完成指纹钉扎连接时，客户端才把加密帧写入 TLS 流。TURN 的部署和凭据边界见 [`turn.md`](turn.md)。
 
 ## 服务端与控制器配置
 

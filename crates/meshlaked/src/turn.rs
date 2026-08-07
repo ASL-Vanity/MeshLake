@@ -6,6 +6,7 @@
 //! credentials supplied by the controller.  Credentials are held only in the
 //! owning route and are never formatted into errors or telemetry.
 
+use crate::tls_relay::connect_pinned_tls;
 use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use meshlake_core::{NetworkId, PlanetTurnServer, TurnCredential, TurnTransport};
@@ -21,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UdpSocket,
     sync::{mpsc, watch},
     time::timeout,
@@ -147,9 +149,8 @@ struct OutboundRoute {
     allocated: Arc<AtomicBool>,
 }
 
-/// Bounded reconnecting UDP TURN allocations. Only public UDP TURN servers
-/// appear here; TCP/TLS server descriptors remain signed Planet metadata but
-/// are intentionally not silently downgraded to UDP.
+/// Bounded reconnecting UDP TURN allocations. Plain TCP TURN is never silently
+/// enabled because it would disclose the temporary credential in transit.
 pub(crate) struct TurnUdpTransport {
     routes: HashMap<RouteKey, OutboundRoute>,
     incoming: mpsc::Receiver<TurnInbound>,
@@ -163,7 +164,6 @@ impl TurnUdpTransport {
             .into_iter()
             .filter(|route| matches!(route.server.transport, TurnTransport::Udp))
             .collect::<Vec<_>>();
-        telemetry.reset(routes.len());
         let (incoming_tx, incoming) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let mut configured = HashMap::new();
@@ -227,6 +227,221 @@ impl TurnUdpTransport {
 impl Drop for TurnUdpTransport {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+    }
+}
+
+/// Bounded reconnecting TURN-over-TLS allocations. TLS server identity is
+/// verified using the exact leaf-certificate SHA-256 value carried by Planet;
+/// platform root stores and plaintext TCP are never substituted.
+pub(crate) struct TurnTlsTransport {
+    routes: HashMap<RouteKey, OutboundRoute>,
+    incoming: mpsc::Receiver<TurnInbound>,
+    shutdown: watch::Sender<bool>,
+    telemetry: Arc<TurnTelemetry>,
+}
+
+impl TurnTlsTransport {
+    pub(crate) fn start(routes: Vec<TurnUdpRoute>, telemetry: Arc<TurnTelemetry>) -> Result<Self> {
+        let routes = routes
+            .into_iter()
+            .filter(|route| matches!(route.server.transport, TurnTransport::Tls))
+            .collect::<Vec<_>>();
+        let (incoming_tx, incoming) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut configured = HashMap::new();
+        for route in routes {
+            let key = RouteKey::from(&route);
+            if configured.contains_key(&key) {
+                continue;
+            }
+            let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+            let allocated = Arc::new(AtomicBool::new(false));
+            tokio::spawn(run_tls_route(
+                route,
+                receiver,
+                incoming_tx.clone(),
+                allocated.clone(),
+                shutdown_rx.clone(),
+                provider.clone(),
+                telemetry.clone(),
+            ));
+            configured.insert(key, OutboundRoute { sender, allocated });
+        }
+        Ok(Self {
+            routes: configured,
+            incoming,
+            shutdown,
+            telemetry,
+        })
+    }
+
+    pub(crate) fn try_send_any(&self, relay_endpoint: SocketAddr, packet: &[u8]) -> bool {
+        if packet.is_empty() || packet.len() > MAX_MESSAGE_LEN {
+            return false;
+        }
+        for outbound in self.routes.values() {
+            if !outbound.allocated.load(Ordering::Acquire) {
+                continue;
+            }
+            if outbound
+                .sender
+                .try_send(TurnOutbound {
+                    peer: relay_endpoint,
+                    packet: packet.to_vec(),
+                })
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        self.telemetry.queue_drops.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    pub(crate) async fn receive(&mut self) -> Option<TurnInbound> {
+        self.incoming.recv().await
+    }
+}
+
+impl Drop for TurnTlsTransport {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+async fn run_tls_route(
+    route: TurnUdpRoute,
+    mut outbound: mpsc::Receiver<TurnOutbound>,
+    incoming: mpsc::Sender<TurnInbound>,
+    allocated: Arc<AtomicBool>,
+    mut shutdown: watch::Receiver<bool>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    telemetry: Arc<TurnTelemetry>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let result = connect_and_forward_tls(
+            &route,
+            &mut outbound,
+            &incoming,
+            &allocated,
+            &mut shutdown,
+            provider.clone(),
+            telemetry.clone(),
+        )
+        .await;
+        if allocated.swap(false, Ordering::AcqRel) {
+            telemetry.allocated.fetch_sub(1, Ordering::Relaxed);
+        }
+        if *shutdown.borrow() || outbound.is_closed() {
+            return;
+        }
+        telemetry
+            .allocation_failures
+            .fetch_add(1, Ordering::Relaxed);
+        trace_turn(format!(
+            "TURN-over-TLS allocation changed state: {}",
+            result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "closed".into())
+        ));
+        tokio::select! {
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
+        }
+    }
+}
+
+async fn connect_and_forward_tls(
+    route: &TurnUdpRoute,
+    outbound: &mut mpsc::Receiver<TurnOutbound>,
+    incoming: &mpsc::Sender<TurnInbound>,
+    allocated: &AtomicBool,
+    shutdown: &mut watch::Receiver<bool>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    telemetry: Arc<TurnTelemetry>,
+) -> Result<()> {
+    if !matches!(route.server.transport, TurnTransport::Tls) {
+        bail!("TURN TLS transport received a non-TLS server route");
+    }
+    let server_name = route
+        .server
+        .server_name
+        .as_deref()
+        .context("controller-signed TURN TLS server name is missing")?;
+    let stream = connect_pinned_tls(
+        route.server.endpoint,
+        server_name,
+        &route.server.certificate_sha256,
+        provider,
+    )
+    .await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut authentication = allocate_stream(&mut reader, &mut writer, route).await?;
+    if !allocated.swap(true, Ordering::AcqRel) {
+        telemetry.allocated.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut permissions = HashMap::<SocketAddr, Instant>::new();
+    let mut refresh_deadline =
+        tokio::time::Instant::from_std(Instant::now() + authentication.lifetime / 2);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+            }
+            outbound_packet = outbound.recv() => {
+                let Some(outbound_packet) = outbound_packet else { return Ok(()); };
+                let permission_due = permissions
+                    .get(&outbound_packet.peer)
+                    .is_none_or(|expiry| *expiry <= Instant::now() + Duration::from_secs(30));
+                if permission_due {
+                    create_permission_stream(
+                        &mut reader,
+                        &mut writer,
+                        route,
+                        &authentication,
+                        outbound_packet.peer,
+                    ).await?;
+                    permissions.insert(outbound_packet.peer, Instant::now() + Duration::from_secs(240));
+                }
+                let bytes = encode_authenticated(
+                    SEND_INDICATION,
+                    new_transaction_id()?,
+                    vec![
+                        (ATTR_XOR_PEER_ADDRESS, encode_xor_address(outbound_packet.peer)?),
+                        (ATTR_DATA, outbound_packet.packet),
+                    ],
+                    &route.credential,
+                    &authentication,
+                )?;
+                write_turn_stream_message(&mut writer, &bytes).await?;
+                telemetry.frames_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            received = read_turn_stream_message(&mut reader) => {
+                let message = parse_message(&received?)?;
+                if message.message_type != DATA_INDICATION { continue; }
+                let Some(peer) = message.xor_peer_address()? else { continue; };
+                let Some(packet) = message.attribute(ATTR_DATA) else { continue; };
+                if packet.is_empty() { continue; }
+                if incoming.send(TurnInbound {
+                    relay_endpoint: peer,
+                    packet: packet.to_vec(),
+                }).await.is_err() {
+                    return Ok(());
+                }
+                telemetry.frames_received.fetch_add(1, Ordering::Relaxed);
+            }
+            _ = tokio::time::sleep_until(refresh_deadline) => {
+                authentication = refresh_stream(&mut reader, &mut writer, route, &authentication).await?;
+                refresh_deadline = tokio::time::Instant::from_std(Instant::now() + authentication.lifetime / 2);
+            }
+        }
     }
 }
 
@@ -417,6 +632,75 @@ async fn allocate_authenticated(
     bail!("TURN server repeatedly rejected the authentication nonce")
 }
 
+async fn allocate_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    route: &TurnUdpRoute,
+) -> Result<Authentication>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let transaction = new_transaction_id()?;
+    let initial = encode_message(
+        ALLOCATE_REQUEST,
+        transaction,
+        vec![(ATTR_REQUESTED_TRANSPORT, vec![17, 0, 0, 0])],
+        None,
+    )?;
+    write_turn_stream_message(writer, &initial).await?;
+    let response = receive_stream_response(reader, transaction).await?;
+    let authentication = match response.message_type {
+        ALLOCATE_ERROR => authentication_from_challenge(&response)?,
+        ALLOCATE_SUCCESS => {
+            return Err(anyhow::anyhow!(
+                "TURN server accepted unauthenticated allocation"
+            ))
+        }
+        _ => bail!("TURN server returned an unexpected Allocate response"),
+    };
+    allocate_authenticated_stream(reader, writer, route, authentication).await
+}
+
+async fn allocate_authenticated_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    route: &TurnUdpRoute,
+    mut authentication: Authentication,
+) -> Result<Authentication>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    for _ in 0..2 {
+        let transaction = new_transaction_id()?;
+        let bytes = encode_authenticated(
+            ALLOCATE_REQUEST,
+            transaction,
+            vec![(ATTR_REQUESTED_TRANSPORT, vec![17, 0, 0, 0])],
+            &route.credential,
+            &authentication,
+        )?;
+        write_turn_stream_message(writer, &bytes).await?;
+        let response = receive_stream_response(reader, transaction).await?;
+        match response.message_type {
+            ALLOCATE_SUCCESS => {
+                authentication.lifetime = response
+                    .lifetime()
+                    .unwrap_or(DEFAULT_LIFETIME)
+                    .clamp(Duration::from_secs(60), DEFAULT_LIFETIME);
+                return Ok(authentication);
+            }
+            ALLOCATE_ERROR if response.error_code() == Some(438) => {
+                authentication = authentication_from_challenge(&response)?;
+            }
+            ALLOCATE_ERROR => bail!("TURN Allocate request was rejected"),
+            _ => bail!("TURN server returned an unexpected Allocate response"),
+        }
+    }
+    bail!("TURN server repeatedly rejected the authentication nonce")
+}
+
 async fn create_permission(
     socket: &UdpSocket,
     route: &TurnUdpRoute,
@@ -433,6 +717,33 @@ async fn create_permission(
     )?;
     socket.send_to(&bytes, route.server.endpoint).await?;
     let response = receive_response(socket, route.server.endpoint, transaction).await?;
+    if response.message_type != CREATE_PERMISSION_SUCCESS {
+        bail!("TURN CreatePermission request was rejected");
+    }
+    Ok(())
+}
+
+async fn create_permission_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    route: &TurnUdpRoute,
+    authentication: &Authentication,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let transaction = new_transaction_id()?;
+    let bytes = encode_authenticated(
+        CREATE_PERMISSION_REQUEST,
+        transaction,
+        vec![(ATTR_XOR_PEER_ADDRESS, encode_xor_address(peer)?)],
+        &route.credential,
+        authentication,
+    )?;
+    write_turn_stream_message(writer, &bytes).await?;
+    let response = receive_stream_response(reader, transaction).await?;
     if response.message_type != CREATE_PERMISSION_SUCCESS {
         bail!("TURN CreatePermission request was rejected");
     }
@@ -468,6 +779,40 @@ async fn refresh(
     Ok(next)
 }
 
+async fn refresh_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    route: &TurnUdpRoute,
+    authentication: &Authentication,
+) -> Result<Authentication>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let transaction = new_transaction_id()?;
+    let bytes = encode_authenticated(
+        REFRESH_REQUEST,
+        transaction,
+        vec![(
+            ATTR_LIFETIME,
+            (DEFAULT_LIFETIME.as_secs() as u32).to_be_bytes().to_vec(),
+        )],
+        &route.credential,
+        authentication,
+    )?;
+    write_turn_stream_message(writer, &bytes).await?;
+    let response = receive_stream_response(reader, transaction).await?;
+    if response.message_type != REFRESH_SUCCESS {
+        bail!("TURN Refresh request was rejected");
+    }
+    let mut next = authentication.clone();
+    next.lifetime = response
+        .lifetime()
+        .unwrap_or(DEFAULT_LIFETIME)
+        .clamp(Duration::from_secs(60), DEFAULT_LIFETIME);
+    Ok(next)
+}
+
 async fn receive_response(
     socket: &UdpSocket,
     server: SocketAddr,
@@ -488,6 +833,56 @@ async fn receive_response(
     })
     .await
     .context("TURN response timed out")?
+}
+
+async fn receive_stream_response<R>(reader: &mut R, transaction: [u8; 12]) -> Result<Message>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(ALLOCATION_TIMEOUT, async {
+        loop {
+            let message = parse_message(&read_turn_stream_message(reader).await?)?;
+            if message.transaction == transaction {
+                return Ok(message);
+            }
+        }
+    })
+    .await
+    .context("TURN stream response timed out")?
+}
+
+async fn read_turn_stream_message<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; HEADER_LEN];
+    reader
+        .read_exact(&mut header)
+        .await
+        .context("TURN TLS stream closed while reading a message header")?;
+    let body_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+    if body_len % 4 != 0 || body_len + HEADER_LEN > MAX_MESSAGE_LEN {
+        bail!("TURN stream message length is invalid");
+    }
+    let mut message = header.to_vec();
+    message.resize(HEADER_LEN + body_len, 0);
+    reader
+        .read_exact(&mut message[HEADER_LEN..])
+        .await
+        .context("TURN TLS stream closed while reading a message body")?;
+    Ok(message)
+}
+
+async fn write_turn_stream_message<W>(writer: &mut W, message: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    parse_message(message)?;
+    writer
+        .write_all(message)
+        .await
+        .context("cannot write TURN TLS stream message")?;
+    writer.flush().await.context("cannot flush TURN TLS stream")
 }
 
 fn authentication_from_challenge(message: &Message) -> Result<Authentication> {
@@ -711,7 +1106,13 @@ fn trace_turn(message: impl fmt::Display) {
 mod tests {
     use super::*;
     use meshlake_core::{DeviceId, TurnTransport};
-    use tokio::{net::UdpSocket, time::timeout};
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use sha2::{Digest, Sha256};
+    use tokio::{
+        net::{TcpListener, UdpSocket},
+        time::timeout,
+    };
+    use tokio_rustls::TlsAcceptor;
     use uuid::Uuid;
 
     #[test]
@@ -887,6 +1288,138 @@ mod tests {
         let inbound = timeout(Duration::from_secs(2), transport.receive())
             .await
             .expect("TURN data indication did not arrive")
+            .unwrap();
+        assert_eq!(inbound.relay_endpoint, relay_endpoint);
+        assert_eq!(inbound.packet, encrypted_frame);
+        assert_eq!(telemetry.snapshot().frames_sent, 1);
+        assert_eq!(telemetry.snapshot().frames_received, 1);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_transport_pins_the_certificate_and_forwards_data() {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["turn.test".into()]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_endpoint = listener.local_addr().unwrap();
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .unwrap();
+        let relay_endpoint: SocketAddr = "198.51.100.71:51820".parse().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            let allocate =
+                parse_message(&read_turn_stream_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(allocate.message_type, ALLOCATE_REQUEST);
+            let challenge = encode_message(
+                ALLOCATE_ERROR,
+                allocate.transaction,
+                vec![
+                    (ATTR_ERROR_CODE, vec![0, 0, 4, 1]),
+                    (ATTR_REALM, b"turn.test".to_vec()),
+                    (ATTR_NONCE, b"nonce-2".to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+            write_turn_stream_message(&mut writer, &challenge)
+                .await
+                .unwrap();
+
+            let allocate =
+                parse_message(&read_turn_stream_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(allocate.message_type, ALLOCATE_REQUEST);
+            assert!(allocate.attribute(ATTR_MESSAGE_INTEGRITY).is_some());
+            let success = encode_message(
+                ALLOCATE_SUCCESS,
+                allocate.transaction,
+                vec![(ATTR_LIFETIME, 120_u32.to_be_bytes().to_vec())],
+                None,
+            )
+            .unwrap();
+            write_turn_stream_message(&mut writer, &success)
+                .await
+                .unwrap();
+
+            let permission =
+                parse_message(&read_turn_stream_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(permission.message_type, CREATE_PERMISSION_REQUEST);
+            let permission_success = encode_message(
+                CREATE_PERMISSION_SUCCESS,
+                permission.transaction,
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+            write_turn_stream_message(&mut writer, &permission_success)
+                .await
+                .unwrap();
+
+            let send =
+                parse_message(&read_turn_stream_message(&mut reader).await.unwrap()).unwrap();
+            assert_eq!(send.message_type, SEND_INDICATION);
+            assert_eq!(send.xor_peer_address().unwrap(), Some(relay_endpoint));
+            let indication = encode_message(
+                DATA_INDICATION,
+                [10; 12],
+                vec![
+                    (
+                        ATTR_XOR_PEER_ADDRESS,
+                        encode_xor_address(relay_endpoint).unwrap(),
+                    ),
+                    (ATTR_DATA, send.attribute(ATTR_DATA).unwrap().to_vec()),
+                ],
+                None,
+            )
+            .unwrap();
+            write_turn_stream_message(&mut writer, &indication)
+                .await
+                .unwrap();
+        });
+        let route = TurnUdpRoute {
+            network_id: NetworkId(Uuid::from_u128(13)),
+            server: PlanetTurnServer {
+                endpoint: server_endpoint,
+                transport: TurnTransport::Tls,
+                server_name: Some("turn.test".into()),
+                certificate_sha256: Sha256::digest(cert.der().as_ref()).to_vec(),
+                priority: 0,
+            },
+            credential: TurnCredential {
+                version: 1,
+                username: "120:tls-device".into(),
+                password: "test-password".into(),
+                expires_at_unix_seconds: 120,
+            },
+        };
+        let telemetry = Arc::new(TurnTelemetry::default());
+        telemetry.reset(1);
+        let mut transport = TurnTlsTransport::start(vec![route], telemetry.clone()).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while telemetry.snapshot().allocated != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TURN-over-TLS allocation did not complete");
+        let encrypted_frame = vec![0x4d, 0x4c, 0x52, 0x31, 9, 8, 7];
+        assert!(transport.try_send_any(relay_endpoint, &encrypted_frame));
+        let inbound = timeout(Duration::from_secs(2), transport.receive())
+            .await
+            .expect("TURN-over-TLS data indication did not arrive")
             .unwrap();
         assert_eq!(inbound.relay_endpoint, relay_endpoint);
         assert_eq!(inbound.packet, encrypted_frame);

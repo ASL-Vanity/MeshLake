@@ -225,24 +225,13 @@ async fn connect_and_forward(
     provider: Arc<CryptoProvider>,
     telemetry: Arc<TlsRelayTelemetry>,
 ) -> Result<()> {
-    let server_name = ServerName::try_from(route.relay.server_name.clone())
-        .map_err(|_| anyhow!("controller-signed TLS relay server name is invalid"))?;
-    let verifier = Arc::new(PinnedCertificateVerifier {
-        certificate_sha256: route.relay.certificate_sha256.clone(),
-    });
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-    let stream = TcpStream::connect(route.relay.endpoint)
-        .await
-        .context("cannot establish TLS relay TCP connection")?;
-    let stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("TLS relay certificate pin verification failed")?;
+    let stream = connect_pinned_tls(
+        route.relay.endpoint,
+        &route.relay.server_name,
+        &route.relay.certificate_sha256,
+        provider,
+    )
+    .await?;
     if !connected.swap(true, Ordering::AcqRel) {
         telemetry.connected.fetch_add(1, Ordering::Relaxed);
     }
@@ -270,6 +259,35 @@ async fn connect_and_forward(
             }
         }
     }
+}
+
+/// Opens one TLS stream using an exact controller-signed leaf-certificate
+/// fingerprint. This is shared by MeshLake's custom TLS Relay and standard
+/// TURN-over-TLS transport; neither path consults the platform trust store.
+pub(crate) async fn connect_pinned_tls(
+    endpoint: SocketAddr,
+    server_name: &str,
+    certificate_sha256: &[u8],
+    provider: Arc<CryptoProvider>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let server_name = ServerName::try_from(server_name.to_owned())
+        .map_err(|_| anyhow!("controller-signed TLS server name is invalid"))?;
+    let verifier = Arc::new(PinnedCertificateVerifier {
+        certificate_sha256: certificate_sha256.to_vec(),
+    });
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let stream = TcpStream::connect(endpoint)
+        .await
+        .context("cannot establish controller-pinned TLS TCP connection")?;
+    connector
+        .connect(server_name, stream)
+        .await
+        .context("TLS leaf certificate pin verification failed")
 }
 
 async fn read_tcp_frame<'a>(

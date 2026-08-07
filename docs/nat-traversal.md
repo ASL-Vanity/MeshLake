@@ -48,9 +48,9 @@ Windows 往往把 Wintun 识别为“未识别的公用网络”。代理启用�
 
 ## coturn / 标准 TURN
 
-标准 TURN（RFC 8656）适合对称 NAT、运营商级 NAT 与严格企业网络；推荐在公网服务器上部署 coturn，并优先开放 UDP 3478，同时保留 TCP/TLS 443 作为受限网络的最后回退。
+标准 TURN（RFC 8656）适合对称 NAT、运营商级 NAT 与严格企业网络；推荐在公网服务器上部署 coturn，并优先开放 UDP 3478，同时配置一个 TLS TURN 监听端口（常用 443 或 5349）作为受限网络回退。明文 TCP TURN 不进入 MeshLake 数据面，因为它会暴露短期 REST 凭据。
 
-Planet V5 已将 coturn 的标准 UDP TURN 客户端接入数据面：客户端使用短期 REST 凭据建立 `Allocate`、`CreatePermission`、`Send Indication`、`Data Indication` 与 `Refresh`，并仅转运已端到端加密的 MeshLake Relay 帧。不要把 coturn 地址填入“UDP 协调/中继地址”；那里仍只接受 MeshLake Relay 的 `主机:端口`。TURN 端点应由控制器以 `--planet-turn-server` 发布，详细配置见 [`turn.md`](turn.md)。
+Planet V5 已将 coturn 的标准 UDP TURN 与 TLS TURN 客户端接入数据面：客户端使用短期 REST 凭据建立 `Allocate`、`CreatePermission`、`Send Indication`、`Data Indication` 与 `Refresh`，并仅转运已端到端加密的 MeshLake Relay 帧。TLS TURN 必须提供 Planet 签名的 SNI 和精确叶证书 SHA-256 指纹，且不依赖系统根证书。不要把 coturn 地址填入“UDP 协调/中继地址”；那里仍只接受 MeshLake Relay 的 `主机:端口`。TURN 端点应由控制器以 `--planet-turn-server` 发布，详细配置见 [`turn.md`](turn.md)。
 
 最小化的 coturn 配置示例（Linux `/etc/turnserver.conf`）：
 
@@ -68,7 +68,7 @@ no-loopback-peers
 no-multicast-peers
 ```
 
-防火墙需开放：UDP 3478、TCP 3478、TCP 5349（配置 TLS 时）以及中继端口范围 `49160-49200` 的 UDP。生产环境还应配置正式 TLS 证书、日志轮转和长期凭据/REST API 凭据轮换。
+防火墙需开放：UDP 3478、配置 TLS TURN 时的 TLS 监听 TCP 端口（示例为 TCP 5349）以及中继端口范围 `49160-49200` 的 UDP。生产环境还应配置正式 TLS 证书、日志轮转和 REST 静态认证密钥轮换。
 
 ## IPv6
 

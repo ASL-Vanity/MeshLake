@@ -67,7 +67,7 @@ use transport_health::{
     select_relay_endpoint, EndpointHealthTable, RegistrationSchedule, RegistrationServiceKind,
     RegistrationTarget,
 };
-use turn::{TurnTelemetry, TurnUdpRoute, TurnUdpTransport};
+use turn::{TurnTelemetry, TurnTlsTransport, TurnUdpRoute, TurnUdpTransport};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -941,7 +941,10 @@ impl Agent {
                 continue;
             }
             for server in &network.turn_servers {
-                if matches!(server.transport, meshlake_core::TurnTransport::Udp) {
+                if matches!(
+                    server.transport,
+                    meshlake_core::TurnTransport::Udp | meshlake_core::TurnTransport::Tls
+                ) {
                     configuration.turn_routes.push(TurnUdpRoute {
                         network_id: *network_id,
                         server: server.clone(),
@@ -4272,6 +4275,7 @@ async fn send_peer_routed_packet(
     tls_relays: &[TlsRelayRoute],
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
+    turn_tls_transport: &TurnTlsTransport,
     endpoint_health: &EndpointHealthTable,
     network: &JoinedNetwork,
     route: &PeerRoute,
@@ -4297,6 +4301,13 @@ async fn send_peer_routed_packet(
         if turn_transport.try_send_any(relay_endpoint, packet) {
             trace_transport(format!(
                 "sent {description} for member {} through authenticated UDP TURN",
+                target_device.0
+            ));
+            return Some(SessionPath::Turn);
+        }
+        if turn_tls_transport.try_send_any(relay_endpoint, packet) {
+            trace_transport(format!(
+                "sent {description} for member {} through controller-pinned TURN-over-TLS",
                 target_device.0
             ));
             return Some(SessionPath::Turn);
@@ -4355,7 +4366,7 @@ fn session_path_description(path: SessionPath) -> &'static str {
         SessionPath::Unknown => "unknown path",
         SessionPath::Direct => "direct path",
         SessionPath::Relay => "relay",
-        SessionPath::Turn => "authenticated UDP TURN",
+        SessionPath::Turn => "authenticated TURN",
         SessionPath::TlsRelay => "controller-pinned TLS relay",
     }
 }
@@ -4364,13 +4375,17 @@ async fn send_to_inbound_path(
     sockets: &TransportSockets,
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
+    turn_tls_transport: &TurnTlsTransport,
     remote: SocketAddr,
     packet: &[u8],
     via_tls_relay: bool,
     via_turn: bool,
+    via_tls_turn: bool,
 ) -> bool {
     if via_tls_relay {
         tls_relay_transport.try_send(remote, packet)
+    } else if via_tls_turn {
+        turn_tls_transport.try_send_any(remote, packet)
     } else if via_turn {
         turn_transport.try_send_any(remote, packet)
     } else {
@@ -4524,7 +4539,22 @@ async fn run_relay_worker(
         configuration.all_tls_relays(),
         Arc::clone(&agent.tls_relay_telemetry),
     )?;
+    let configured_turn_routes = configuration
+        .turn_routes
+        .iter()
+        .filter(|route| {
+            matches!(
+                route.server.transport,
+                meshlake_core::TurnTransport::Udp | meshlake_core::TurnTransport::Tls
+            )
+        })
+        .count();
+    agent.turn_telemetry.reset(configured_turn_routes);
     let mut turn_transport = TurnUdpTransport::start(
+        configuration.turn_routes.clone(),
+        Arc::clone(&agent.turn_telemetry),
+    )?;
+    let mut turn_tls_transport = TurnTlsTransport::start(
         configuration.turn_routes.clone(),
         Arc::clone(&agent.turn_telemetry),
     )?;
@@ -4630,6 +4660,8 @@ async fn run_relay_worker(
                     &mut registration_schedules,
                     &tls_relay_transport,
                     &turn_transport,
+                    &turn_tls_transport,
+                    false,
                     false,
                     false,
                 ).await?;
@@ -4655,6 +4687,8 @@ async fn run_relay_worker(
                     &mut registration_schedules,
                     &tls_relay_transport,
                     &turn_transport,
+                    &turn_tls_transport,
+                    false,
                     false,
                     false,
                 ).await?;
@@ -4680,7 +4714,9 @@ async fn run_relay_worker(
                     &mut registration_schedules,
                     &tls_relay_transport,
                     &turn_transport,
+                    &turn_tls_transport,
                     true,
+                    false,
                     false,
                 ).await?;
             }
@@ -4705,6 +4741,35 @@ async fn run_relay_worker(
                     &mut registration_schedules,
                     &tls_relay_transport,
                     &turn_transport,
+                    &turn_tls_transport,
+                    false,
+                    true,
+                    false,
+                ).await?;
+            }
+            received = turn_tls_transport.receive() => {
+                let Some(received) = received else { continue; };
+                receive_udp_packet(
+                    &agent,
+                    &sockets,
+                    &configuration,
+                    configuration_revision,
+                    received.relay_endpoint,
+                    &received.packet,
+                    &mut peers,
+                    &mut sessions,
+                    &mut seen_handshakes,
+                    &identity,
+                    &mut stun_transactions,
+                    &mut root_transactions,
+                    &mut relay_registration_transactions,
+                    &mut advertised_candidates,
+                    &mut endpoint_health,
+                    &mut registration_schedules,
+                    &tls_relay_transport,
+                    &turn_transport,
+                    &turn_tls_transport,
+                    false,
                     false,
                     true,
                 ).await?;
@@ -4815,6 +4880,7 @@ async fn run_relay_worker(
                             configuration.tls_relays_for(network_id),
                             &tls_relay_transport,
                             &turn_transport,
+                            &turn_tls_transport,
                             &endpoint_health,
                             network,
                             route,
@@ -5140,6 +5206,7 @@ async fn run_relay_worker(
                             configuration.tls_relays_for(network.network.id),
                             &tls_relay_transport,
                             &turn_transport,
+                            &turn_tls_transport,
                             &endpoint_health,
                             network,
                             &route,
@@ -5187,8 +5254,10 @@ async fn receive_udp_packet(
     registration_schedules: &mut HashMap<RegistrationTarget, RegistrationSchedule>,
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
+    turn_tls_transport: &TurnTlsTransport,
     via_tls_relay: bool,
     via_turn: bool,
+    via_tls_turn: bool,
 ) -> Result<()> {
     let relay_endpoints = configuration.relay_endpoints.as_slice();
     if let Some((transaction_id, candidate)) = parse_stun_binding_success(packet) {
@@ -5444,8 +5513,10 @@ async fn receive_udp_packet(
                 configuration_revision,
                 tls_relay_transport,
                 turn_transport,
+                turn_tls_transport,
                 via_tls_relay,
                 via_turn,
+                via_tls_turn,
             )
             .await?;
         }
@@ -5461,8 +5532,10 @@ async fn receive_udp_packet(
                 configuration_revision,
                 tls_relay_transport,
                 turn_transport,
+                turn_tls_transport,
                 via_tls_relay,
                 via_turn,
+                via_tls_turn,
             )
             .await?;
         }
@@ -5476,7 +5549,7 @@ async fn receive_udp_packet(
                 sessions,
                 configuration_revision,
                 via_tls_relay,
-                via_turn,
+                via_turn || via_tls_turn,
             )
             .await?;
         }
@@ -5657,8 +5730,10 @@ async fn receive_session_init(
     configuration_revision: u64,
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
+    turn_tls_transport: &TurnTlsTransport,
     via_tls_relay: bool,
     via_turn: bool,
+    via_tls_turn: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_INIT)
@@ -5707,7 +5782,7 @@ async fn receive_session_init(
                 remote,
                 relay_endpoints,
                 via_tls_relay,
-                via_turn,
+                via_turn || via_tls_turn,
             ));
             publish_session(agent, configuration_revision, peer_key, session);
         }
@@ -5715,10 +5790,12 @@ async fn receive_session_init(
             sockets,
             tls_relay_transport,
             turn_transport,
+            turn_tls_transport,
             remote,
             &response,
             via_tls_relay,
             via_turn,
+            via_tls_turn,
         )
         .await;
         return Ok(());
@@ -5793,7 +5870,12 @@ async fn receive_session_init(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: Some(response.clone()),
-            path: session_path_for(remote, relay_endpoints, via_tls_relay, via_turn),
+            path: session_path_for(
+                remote,
+                relay_endpoints,
+                via_tls_relay,
+                via_turn || via_tls_turn,
+            ),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5806,10 +5888,12 @@ async fn receive_session_init(
         sockets,
         tls_relay_transport,
         turn_transport,
+        turn_tls_transport,
         remote,
         &response,
         via_tls_relay,
         via_turn,
+        via_tls_turn,
     )
     .await;
     let mut queued_send_results = Vec::with_capacity(queued_encrypted.len());
@@ -5819,10 +5903,12 @@ async fn receive_session_init(
                 sockets,
                 tls_relay_transport,
                 turn_transport,
+                turn_tls_transport,
                 remote,
                 &encrypted,
                 via_tls_relay,
                 via_turn,
+                via_tls_turn,
             )
             .await,
         );
@@ -5839,7 +5925,7 @@ async fn receive_session_init(
             remote,
             relay_endpoints,
             via_tls_relay,
-            via_turn,
+            via_turn || via_tls_turn,
         ))
     ));
     Ok(())
@@ -5856,8 +5942,10 @@ async fn receive_session_response(
     configuration_revision: u64,
     tls_relay_transport: &TlsRelayTransport,
     turn_transport: &TurnUdpTransport,
+    turn_tls_transport: &TurnTlsTransport,
     via_tls_relay: bool,
     via_turn: bool,
+    via_tls_turn: bool,
 ) -> Result<()> {
     let Ok((network_id, source, destination)) =
         parse_session_routing_header(packet, RELAY_SESSION_RESPONSE)
@@ -5940,7 +6028,12 @@ async fn receive_session_response(
             replay_window: ReplayWindow::default(),
             established_at: Instant::now(),
             cached_response: None,
-            path: session_path_for(remote, relay_endpoints, via_tls_relay, via_turn),
+            path: session_path_for(
+                remote,
+                relay_endpoints,
+                via_tls_relay,
+                via_turn || via_tls_turn,
+            ),
             dropped_packets,
             handshake_attempts,
             handshake_retries,
@@ -5956,10 +6049,12 @@ async fn receive_session_response(
                 sockets,
                 tls_relay_transport,
                 turn_transport,
+                turn_tls_transport,
                 remote,
                 &encrypted,
                 via_tls_relay,
                 via_turn,
+                via_tls_turn,
             )
             .await,
         );

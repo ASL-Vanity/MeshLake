@@ -37,8 +37,8 @@ MeshLake 是一个可自托管的加密虚拟局域网项目：让一台设备�
 - 会话可观测性：本机 `GET /v1/sessions` 与 `meshlake-cli sessions [--json]` 提供按网络隔离的 pending/established/expired、直连/中继路径、队列和安全计数，不暴露密钥、握手包、端点或数据内容。另有不连接外部主机的 Windows/Linux 系统测试计划框架，详见 [`docs/session-observability.md`](docs/session-observability.md)。
 - 出口节点与默认路由：控制器只能签发候选资格，成员必须在本机显式选择 IPv4/IPv6 出口；Windows/Linux 都会事务性安装默认路由、签名 DNS 和受控转发/NAT，失败或回滚不完整时停用虚拟适配器。
 - 出口防泄漏：Linux 使用 MeshLake 专属 `iptables`/`ip6tables` 规则；Windows 使用 MeshLake 专属、持久化的 WFP 子层与过滤器，允许虚拟接口、回环和仅限 `meshlaked` 进程的精确 Controller/Planet/Root/Relay/STUN/TLS Relay 端点，其余物理出口阻断。Windows 在已选择出口且有签名 DNS 时还会安装 MeshLake 专属 NRPT `.` 规则，防止物理网卡 DNS 回退。
-- 受限网络回退：Planet V4 可签发 TLS Relay 的服务 ID、TCP 端点、SNI 和叶证书 SHA-256 指纹。客户端先尝试 UDP 直连与已认证 UDP Relay；UDP 未健康时才回退到长度帧 TLS Relay，且不使用系统根证书。状态/API 只报告 TLS Relay 的脱敏连接、失败和帧计数；详见 [`docs/tls-relay.md`](docs/tls-relay.md)。
-- 标准 TURN 回退：Planet V5 可签发 UDP/TCP/TLS TURN 端点；当前客户端实现标准 UDP TURN 的 `Allocate`、`CreatePermission`、`Send Indication`、`Data Indication` 与 `Refresh`，并通过控制器 HTTPS 响应取得仅驻留内存的短期 coturn REST 凭据。TURN 只转运端到端加密的 MeshLake Relay 帧；详见 [`docs/turn.md`](docs/turn.md)。
+- 受限网络回退：Planet V4 可签发 TLS Relay 的服务 ID、TCP 端点、SNI 和叶证书 SHA-256 指纹。路径按 UDP 直连、UDP TURN、TLS TURN、已认证 MeshLake UDP Relay、已钉扎 MeshLake TLS Relay 依次回退；TLS 路径均不使用系统根证书。状态/API 只报告脱敏的连接、失败和帧计数；详见 [`docs/tls-relay.md`](docs/tls-relay.md)。
+- 标准 TURN 回退：Planet V5 可签发 UDP/TCP/TLS TURN 端点；客户端实现 UDP TURN 与钉扎证书的 TLS TURN 的 `Allocate`、`CreatePermission`、`Send Indication`、`Data Indication` 与 `Refresh`，并通过控制器 HTTPS 响应取得仅驻留内存的短期 coturn REST 凭据。明文 TCP TURN 会失败关闭，以避免暴露凭据；TURN 只转运端到端加密的 MeshLake Relay 帧；详见 [`docs/turn.md`](docs/turn.md)。
 
 尚未实现，因此当前版本**不能作为正式虚拟局域网产品使用**：
 
