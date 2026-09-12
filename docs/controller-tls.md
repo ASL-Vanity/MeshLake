@@ -6,13 +6,16 @@
 
 `meshlake-controller` 可以直接加载 PEM 格式的证书链和私钥：
 
+以下启动示例按首次创建 Controller 状态编写。先准备仅服务账户和管理员可访问的状态、TLS 与秘密目录；`--initial-admin-token-file` 必须指向尚不存在的新文件。后续启动保留原状态路径，可去掉首次令牌输出参数，继续使用已交付的管理员令牌。只执行与自己部署方式对应的一组示例。
+
 ```powershell
 meshlake-controller.exe `
   --bind 0.0.0.0:51822 `
   --state-file C:\MeshLake\controller.json `
+  --initial-admin-token-file C:\MeshLakeSecrets\administrator.token `
   --tls-certificate C:\MeshLake\tls\fullchain.pem `
   --tls-private-key C:\MeshLake\tls\private-key.pem `
-  --planet-controller-url https://planet.example.com `
+  --planet-controller-url https://planet.example.com:51822 `
   --planet-relay-endpoint 203.0.113.10:51820
 ```
 
@@ -31,10 +34,12 @@ meshlake-controller.exe `
 ```powershell
 meshlake-controller.exe `
   --bind 0.0.0.0:51822 `
+  --state-file C:\MeshLake\controller.json `
+  --initial-admin-token-file C:\MeshLakeSecrets\administrator.token `
   --tls-certificate C:\MeshLake\tls\server-fullchain.pem `
   --tls-private-key C:\MeshLake\tls\server-private-key.pem `
   --tls-client-ca-certificate C:\MeshLake\tls\root-ca.pem `
-  --planet-controller-url https://planet.example.internal `
+  --planet-controller-url https://planet.example.internal:51822 `
   --planet-relay-endpoint 192.0.2.10:51820
 ```
 
@@ -56,7 +61,7 @@ meshlake-controller.exe `
 meshlake-cli.exe `
   --tls-ca-certificate C:\MeshLake\tls\root-ca.pem `
   controller invite `
-  --controller https://planet.example.internal `
+  --controller https://planet.example.internal:51822 `
   --network <网络ID> `
   --admin-token-file C:\MeshLake\secrets\administrator.token `
   --invite-link-file C:\MeshLake\secrets\member.invite
@@ -73,6 +78,8 @@ meshlake-cli.exe `
 ```powershell
 meshlake-controller.exe `
   --bind 127.0.0.1:51822 `
+  --state-file C:\MeshLake\controller.json `
+  --initial-admin-token-file C:\MeshLakeSecrets\administrator.token `
   --planet-controller-url https://planet.example.com `
   --planet-relay-endpoint 203.0.113.10:51820
 ```
@@ -117,6 +124,8 @@ WantedBy=multi-user.target
 ```powershell
 meshlake-controller.exe `
   --bind 192.168.1.10:51822 `
+  --state-file C:\MeshLake\controller.json `
+  --initial-admin-token-file C:\MeshLakeSecrets\administrator.token `
   --allow-insecure-public-http
 ```
 

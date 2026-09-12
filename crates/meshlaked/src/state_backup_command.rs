@@ -7,6 +7,7 @@ use meshlake_core::{
     StateProtection, AGENT_STATE_PROTECTION_PURPOSE,
 };
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
@@ -41,6 +42,14 @@ pub(crate) enum StateCommand {
         /// Replace an existing agent state file after full validation.
         #[arg(long)]
         force: bool,
+    },
+    /// Remove only locally persisted networks whose traffic key is malformed.
+    /// This recovers state written by older agent builds.
+    RepairInvalidNetworks {
+        /// Required acknowledgement because affected local network records and
+        /// their local authorization/exit configuration are removed.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -80,8 +89,66 @@ pub(crate) fn run(
             )?;
             println!("Agent state restored to {}", state_path.display());
         }
+        StateCommand::RepairInvalidNetworks { yes } => {
+            if !yes {
+                anyhow::bail!(
+                    "refusing to modify agent state; rerun with --yes after reviewing the affected local networks"
+                );
+            }
+            let removed = repair_invalid_networks_with_protection(state_path, protection)?;
+            println!(
+                "Removed {removed} persisted network record(s) with malformed traffic keys from {}",
+                state_path.display()
+            );
+        }
     }
     Ok(())
+}
+
+/// Repairs only the legacy failure mode where an agent persisted an empty or
+/// malformed network traffic key. The state stays platform-protected during the
+/// whole operation, including Windows DPAPI LocalMachine state.
+fn repair_invalid_networks_with_protection(
+    state_path: &Path,
+    protection: &StateProtection,
+) -> Result<usize> {
+    let _state_lock = StateFileLock::acquire(state_path)?;
+    recover_protected_state_file(state_path)?;
+    if !state_path.exists() {
+        anyhow::bail!("agent state file does not exist: {}", state_path.display());
+    }
+    restrict_state_file_permissions(state_path)?;
+    let bytes = fs::read(state_path)
+        .with_context(|| format!("cannot read agent state {}", state_path.display()))?;
+    let decoded = decode_protected_state_with(&bytes, AGENT_STATE_PROTECTION_PURPOSE, protection)
+        .with_context(|| {
+        format!("invalid or unreadable agent state {}", state_path.display())
+    })?;
+    let mut state: PersistedState = decoded.value;
+    let invalid_network_ids: HashSet<_> = state
+        .networks
+        .iter()
+        .filter(|network| meshlake_core::NetworkKey::from_slice(&network.network_key).is_err())
+        .map(|network| network.network.id)
+        .collect();
+    if invalid_network_ids.is_empty() {
+        return Ok(0);
+    }
+    state
+        .networks
+        .retain(|network| !invalid_network_ids.contains(&network.network.id));
+    state
+        .authorizations
+        .retain(|network_id, _| !invalid_network_ids.contains(network_id));
+    state
+        .exit_gateways
+        .retain(|gateway| !invalid_network_ids.contains(&gateway.network_id));
+    // Validation after removal intentionally fails closed on every unrelated
+    // corruption; this command never silently repairs or discards other data.
+    migrate_and_validate_agent_state(&mut state)?;
+    write_state_with_protection(state_path, &state, protection)?;
+    cleanup_stale_state_backup(state_path)?;
+    Ok(invalid_network_ids.len())
 }
 
 #[cfg(test)]
@@ -294,6 +361,74 @@ mod tests {
         fs::write(&backup, invalid).unwrap();
         assert!(restore_with_password(&restored, &backup, b"right", true).is_err());
         assert_eq!(fs::read(&restored).unwrap(), before);
+    }
+
+    #[test]
+    fn repair_invalid_networks_removes_only_malformed_records_and_associations() {
+        let directory = TestDirectory::new("repair-invalid-networks");
+        let state_path = directory.file("agent.json");
+        let mut state = PersistedState::new();
+        let valid_id = meshlake_core::NetworkId(Uuid::from_u128(90));
+        let invalid_id = meshlake_core::NetworkId(Uuid::from_u128(91));
+        let valid = meshlake_core::JoinedNetwork {
+            network: meshlake_core::VirtualNetwork {
+                id: valid_id,
+                name: "valid".into(),
+                ipv4_prefix: "100.64.90.0/24".into(),
+                ipv6_prefix: None,
+                relay_policy: meshlake_core::RelayPolicy::Disabled,
+            },
+            assigned_addresses: Vec::new(),
+            certificate: None,
+            network_key: vec![7; 32],
+            control_plane: meshlake_core::NetworkControlPlane::default(),
+        };
+        let mut invalid = valid.clone();
+        invalid.network.id = invalid_id;
+        invalid.network_key.clear();
+        state.networks = vec![valid, invalid];
+        state.authorizations.insert(
+            invalid_id,
+            meshlake_core::NetworkAuthorizationManifest {
+                version: 1,
+                network_id: invalid_id,
+                authorization_epoch: 1,
+                network_key_epoch: 1,
+                active_members: Vec::new(),
+                revoked_certificate_ids: Vec::new(),
+                issued_at_unix_seconds: 0,
+                expires_at_unix_seconds: 1,
+                controller_public_key: vec![0; 32],
+                signature: vec![0; 64],
+                epoch_hint: None,
+            },
+        );
+        state.exit_gateways.push(super::super::ExitGatewayConfig {
+            network_id: invalid_id,
+            egress_interface: "test-egress".into(),
+            enable_ipv4: true,
+            enable_ipv6: false,
+        });
+        write_state(&state_path, &state).unwrap();
+
+        assert_eq!(
+            repair_invalid_networks_with_protection(
+                &state_path,
+                &StateProtection::platform_default(),
+            )
+            .unwrap(),
+            1
+        );
+        let repaired: PersistedState = decode_protected_state(
+            &fs::read(&state_path).unwrap(),
+            AGENT_STATE_PROTECTION_PURPOSE,
+        )
+        .unwrap()
+        .value;
+        assert_eq!(repaired.networks.len(), 1);
+        assert_eq!(repaired.networks[0].network.id, valid_id);
+        assert!(!repaired.authorizations.contains_key(&invalid_id));
+        assert!(repaired.exit_gateways.is_empty());
     }
 
     #[test]

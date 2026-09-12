@@ -41,29 +41,15 @@ jobs:
       - name: Package Windows binaries
         shell: pwsh
         run: |
-          $package = "ci-artifacts/MeshLake-Windows-x64"
-          New-Item -ItemType Directory -Force -Path $package | Out-Null
-          Copy-Item target/release/MeshLake.exe $package
-          Copy-Item target/release/meshlaked.exe $package
-          Copy-Item target/release/meshlake-cli.exe $package
-          Copy-Item target/release/meshlake-controller.exe $package
-          Copy-Item target/release/meshlake-root.exe $package
-          Copy-Item target/release/meshlake-relay.exe $package
-          Copy-Item third_party/wintun/wintun.dll $package
-          Copy-Item third_party/wintun/LICENSE.txt "$package/WINTUN-LICENSE.txt"
-          Copy-Item LICENSE $package
-          Copy-Item README.md $package
-          Copy-Item THIRD_PARTY_NOTICES.md $package
-          Copy-Item SECURITY.md $package
-          Copy-Item CONTRIBUTING.md $package
-          Copy-Item docs $package -Recurse
-          Compress-Archive -Path "$package/*" -DestinationPath "ci-artifacts/MeshLake-Windows-x64.zip"
+          ./scripts/release/New-MeshLakePackage.ps1 -Platform Windows -BinaryDirectory target/release -OutputDirectory ci-artifacts
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: MeshLake-Windows-x64
-          path: ci-artifacts/MeshLake-Windows-x64.zip
+          path: |
+            ci-artifacts/MeshLake-Windows-x64.zip
+            ci-artifacts/MeshLake-Windows-x64.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -97,21 +83,16 @@ jobs:
           -p meshlaked
 
       - name: Package Linux binaries
+        shell: pwsh
         run: |
-          mkdir -p ci-artifacts/MeshLake-Linux-x64
-          cp target/release/meshlaked ci-artifacts/MeshLake-Linux-x64/
-          cp target/release/meshlake-cli ci-artifacts/MeshLake-Linux-x64/
-          cp target/release/meshlake-controller ci-artifacts/MeshLake-Linux-x64/
-          cp target/release/meshlake-root ci-artifacts/MeshLake-Linux-x64/
-          cp target/release/meshlake-relay ci-artifacts/MeshLake-Linux-x64/
-          cp LICENSE README.md THIRD_PARTY_NOTICES.md SECURITY.md CONTRIBUTING.md ci-artifacts/MeshLake-Linux-x64/
-          cp -r docs ci-artifacts/MeshLake-Linux-x64/
-          tar -czf ci-artifacts/MeshLake-Linux-x64.tar.gz -C ci-artifacts MeshLake-Linux-x64
+          ./scripts/release/New-MeshLakePackage.ps1 -Platform Linux -BinaryDirectory target/release -OutputDirectory ci-artifacts
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
           name: MeshLake-Linux-x64
-          path: ci-artifacts/MeshLake-Linux-x64.tar.gz
+          path: |
+            ci-artifacts/MeshLake-Linux-x64.tar.gz
+            ci-artifacts/MeshLake-Linux-x64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14

@@ -16,6 +16,7 @@ meshlake-core = { path = "../meshlake-core" }
 reqwest.workspace = true
 rpassword.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true

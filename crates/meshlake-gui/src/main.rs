@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use eframe::egui;
 use meshlake_core::{
     decode_protected_state, AgentStatus, EnrollmentResponse, MembershipClaims, RelayPolicy,
-    UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
+    SessionList, UpsertNetworkRequest, VirtualNetwork, CONTROLLER_STATE_PROTECTION_PURPOSE,
 };
 use reqwest::{blocking::Client, Certificate};
 use serde::{Deserialize, Serialize};
@@ -23,26 +23,63 @@ use windows_sys::Win32::{
     Foundation::CloseHandle,
     Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
     System::Threading::{GetCurrentProcess, OpenProcessToken},
-    UI::{
-        Shell::ShellExecuteW,
-        WindowsAndMessaging::{
-            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOWNORMAL,
-        },
-    },
+    UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
 };
 
 const LOCAL_API: &str = "http://127.0.0.1:51821/v1";
 
-fn main() {
-    #[cfg(target_os = "windows")]
-    match relaunch_with_administrator_rights() {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(error) => {
-            write_startup_error(&error);
-            return;
+fn exit_selection_body(
+    ipv4: &str,
+    ipv6: &str,
+    kill_switch: bool,
+) -> Result<serde_json::Value, String> {
+    fn optional_id(value: &str) -> Result<Option<Uuid>, String> {
+        if value.trim().is_empty() {
+            return Ok(None);
         }
+        Uuid::parse_str(value.trim())
+            .map(Some)
+            .map_err(|_| "网关设备 ID 必须是 UUID。".into())
     }
+    Ok(
+        json!({"ipv4_gateway": optional_id(ipv4)?, "ipv6_gateway": optional_id(ipv6)?, "kill_switch": kill_switch}),
+    )
+}
+
+fn local_action_result(
+    result: Result<reqwest::blocking::Response, reqwest::Error>,
+    success: &str,
+    language: Language,
+) -> String {
+    match result {
+        Ok(response) if response.status().is_success() => success.into(),
+        Ok(response) => format!(
+            "{} HTTP {}",
+            if language == Language::Chinese {
+                "操作失败。"
+            } else {
+                "Operation failed."
+            },
+            response.status()
+        ),
+        Err(error) => format!(
+            "{}: {error}",
+            if language == Language::Chinese {
+                "无法联系后台服务"
+            } else {
+                "Could not connect to the agent"
+            }
+        ),
+    }
+}
+
+fn http_failure(response: reqwest::blocking::Response, operation: &str) -> String {
+    // Error bodies can reflect submitted enrollment/admin credentials. Status is
+    // sufficient to report the failure without copying untrusted secret-bearing text.
+    format!("{operation} HTTP {}", response.status())
+}
+
+fn main() {
     if let Err(error) = run_gui() {
         write_startup_error(&format!("{error:#}"));
     }
@@ -56,8 +93,7 @@ fn write_startup_error(error: &str) {
     let _ = fs::write(path, error);
 }
 
-/// Wintun adapter creation requires an elevated token.  Relaunch before any
-/// background process is started so `meshlaked` inherits the same token.
+/// Elevation is an explicit maintenance action; opening the GUI never requires it.
 #[cfg(target_os = "windows")]
 fn relaunch_with_administrator_rights() -> Result<bool, String> {
     if process_is_elevated() {
@@ -120,22 +156,68 @@ fn process_is_elevated() -> bool {
 }
 
 fn run_gui() -> eframe::Result<()> {
+    // The native window is created before App::new can send viewport commands.
+    // Use one settings snapshot for its initial icon and the application theme.
+    let settings = load_settings();
     eframe::run_native(
         "MeshLake",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([940.0, 640.0]),
+            viewport: egui::ViewportBuilder::default()
+                .with_icon(icons::application_icon(64, settings.accent.color(false)))
+                .with_inner_size([1200.0, 820.0])
+                .with_min_inner_size([760.0, 520.0]),
             ..Default::default()
         },
-        Box::new(|context| Ok(Box::new(App::new(context)))),
+        Box::new(move |context| Ok(Box::new(App::new(context, settings)))),
     )
 }
 
+use pages::Page;
+#[cfg(test)]
+mod api_tests;
+mod confirmation;
+mod controller_exit;
+mod controller_policy;
+mod design;
+mod diagnostics;
+mod file_io;
+mod file_picker;
+mod icons;
+mod jobs;
+mod lifecycle;
+mod maintenance;
+#[cfg(all(test, target_os = "windows"))]
+mod native_tests;
+mod pages;
+mod services;
+use confirmation::PendingAction;
+
 struct App {
+    services: services::Services,
+    diagnostics: diagnostics::DiagnosticFields,
+    request_timeout: u64,
+    policy_editor: controller_policy::PolicyEditor,
+    maintenance: maintenance::MaintenanceFields,
+    process_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    files: file_io::FileFields,
+    generated_invite: String,
+    controller_document: String,
+    pending_action: Option<PendingAction>,
+    job: Option<jobs::JobReceiver>,
+    page: Page,
     client: Client,
+    api_base: String,
     status: Option<AgentStatus>,
     message: String,
     name: String,
+    managed_create_id: String,
     prefix: String,
+    ipv6_prefix: String,
+    network_relay_policy: RelayPolicy,
+    invite_lifetime: u64,
+    candidate_device: String,
+    candidate_ipv4: bool,
+    candidate_ipv6: bool,
     controller: String,
     network_id: String,
     token: String,
@@ -153,13 +235,24 @@ struct App {
     managed_networks: Vec<VirtualNetwork>,
     selected_network: Option<Uuid>,
     members: Vec<MembershipClaims>,
+    sessions: Option<SessionList>,
     issued_token: String,
     invite_link: String,
     settings: Settings,
     show_settings: bool,
     show_close_confirmation: bool,
+    tray_exit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dont_ask_again: bool,
     tray: Option<Tray>,
+    cli_command: String,
+    cli_output: String,
+    exit_network_id: String,
+    ipv4_gateway: String,
+    ipv6_gateway: String,
+    exit_kill_switch: bool,
+    egress_interface: String,
+    enable_ipv4_gateway: bool,
+    enable_ipv6_gateway: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,8 +261,13 @@ enum Language {
     English,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
+    theme: design::Theme,
+    accent: design::Accent,
+    reduced_motion: bool,
+    zoom: f32,
     language: Language,
     minimize_on_close: bool,
     ask_on_close: bool,
@@ -178,6 +276,10 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: design::Theme::System,
+            accent: design::Accent::default(),
+            reduced_motion: false,
+            zoom: 1.0,
             language: Language::Chinese,
             minimize_on_close: false,
             ask_on_close: true,
@@ -219,14 +321,36 @@ struct Tray {
 impl Default for App {
     fn default() -> Self {
         Self {
+            services: Default::default(),
+            diagnostics: Default::default(),
+            request_timeout: 30,
             client: Client::builder()
-                .timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            pending_action: None,
+            files: Default::default(),
+            generated_invite: String::new(),
+            controller_document: String::new(),
+            maintenance: Default::default(),
+            policy_editor: Default::default(),
+            process_cancel: None,
+            job: None,
+            page: Page::Overview,
+            api_base: LOCAL_API.into(),
             status: None,
             message: "点击“刷新状态”以连接本机 meshlaked 服务。".into(),
             name: String::new(),
+            managed_create_id: String::new(),
             prefix: "100.64.10.0/24".into(),
+            ipv6_prefix: String::new(),
+            network_relay_policy: RelayPolicy::Preferred,
+            invite_lifetime: 900,
+            candidate_device: String::new(),
+            candidate_ipv4: true,
+            candidate_ipv6: false,
             controller: "http://127.0.0.1:51822".into(),
             network_id: String::new(),
             token: String::new(),
@@ -244,98 +368,393 @@ impl Default for App {
             managed_networks: Vec::new(),
             selected_network: None,
             members: Vec::new(),
+            sessions: None,
             issued_token: String::new(),
-            invite_link: std::env::args()
-                .nth(1)
-                .filter(|value| value.starts_with("meshlake://"))
-                .unwrap_or_default(),
-            settings: load_settings(),
+            invite_link: String::new(),
+            settings: Settings::default(),
             show_settings: false,
             show_close_confirmation: false,
+            tray_exit_requested: Default::default(),
             dont_ask_again: false,
             tray: None,
+            cli_command: "status".into(),
+            cli_output: String::new(),
+            exit_network_id: String::new(),
+            ipv4_gateway: String::new(),
+            ipv6_gateway: String::new(),
+            exit_kill_switch: false,
+            egress_interface: String::new(),
+            enable_ipv4_gateway: false,
+            enable_ipv6_gateway: false,
         }
     }
 }
 
 impl App {
-    fn new(context: &eframe::CreationContext<'_>) -> Self {
-        install_chinese_font(&context.egui_ctx);
-        ensure_agent_running();
-        ensure_local_controller_running();
+    fn run_cli_command_sync(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let args = self
+            .cli_command
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            self.cli_output = "请输入 meshlake-cli 子命令。".into();
+            return;
+        }
+        let daemon_commands = ["print-state-path"];
+        let binary_name = if daemon_commands.contains(&args[0]) {
+            if cfg!(windows) {
+                "meshlaked.exe"
+            } else {
+                "meshlaked"
+            }
+        } else if cfg!(windows) {
+            "meshlake-cli.exe"
+        } else {
+            "meshlake-cli"
+        };
+        let Some(executable) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(binary_name)))
+        else {
+            self.cli_output = "无法定位当前程序目录。".into();
+            return;
+        };
+        if !executable.is_file() {
+            self.cli_output = format!("未找到同目录 CLI：{}", executable.display());
+            return;
+        }
+        let arguments = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        match maintenance::execute_process(
+            &executable,
+            &arguments,
+            Vec::new(),
+            cancel,
+            Duration::from_secs(120),
+        ) {
+            Ok((success, output)) => {
+                self.cli_output = output;
+                self.message = if success {
+                    "执行成功。 / Command succeeded."
+                } else {
+                    "执行失败，请查看结果。 / Command failed; inspect output."
+                }
+                .into();
+            }
+            Err(error) => {
+                self.cli_output = error.clone();
+                self.message = error;
+            }
+        }
+    }
+    fn new(context: &eframe::CreationContext<'_>, settings: Settings) -> Self {
         let mut app = Self::default();
+        app.settings = settings;
+        app.invite_link = std::env::args()
+            .nth(1)
+            .filter(|value| value.starts_with("meshlake://"))
+            .unwrap_or_default();
+        design::apply_theme(&context.egui_ctx, &app.settings);
         app.admin_token = load_local_admin_token().unwrap_or_default();
         app.admin_token_bound_value = app.admin_token.clone();
         if !app.admin_token.is_empty() {
             app.admin_token_controller = Some(app.controller.clone());
         }
-        app.refresh_controller_public_key(false);
-        if !app.controller_public_key.is_empty() {
-            app.public_key = app.controller_public_key.clone();
-        }
-        app.tray = create_tray(&context.egui_ctx);
+        app.refresh();
+        app.tray = create_tray(
+            &context.egui_ctx,
+            app.settings.language,
+            app.settings.accent,
+            app.tray_exit_requested.clone(),
+        );
         app
     }
 
-    fn refresh(&mut self) {
-        match self.client.get(format!("{LOCAL_API}/status")).send() {
+    fn refresh_sync(&mut self) {
+        self.status = None;
+        self.sessions = None;
+        match self.client.get(format!("{}/status", self.api_base)).send() {
             Ok(response) if response.status().is_success() => match response.json() {
                 Ok(status) => {
                     self.status = Some(status);
-                    self.message = "已连接到本机 MeshLake 后台服务。".into();
+                    self.message = self
+                        .t(
+                            "已连接到本机 MeshLake 后台服务。",
+                            "Connected to the local MeshLake agent.",
+                        )
+                        .into();
                 }
-                Err(error) => self.message = format!("后台响应格式无效：{error}"),
+                Err(_) => {
+                    self.message = self
+                        .t("后台响应格式无效。", "Invalid agent response.")
+                        .into()
+                }
             },
-            Ok(response) => self.message = format!("后台服务返回：{}", response.status()),
+            Ok(response) => {
+                self.message = http_failure(
+                    response,
+                    self.t("后台服务返回错误。", "Agent request failed."),
+                )
+            }
             Err(_) => {
                 self.status = None;
-                self.message = "未检测到 meshlaked。请先启动 meshlaked.exe run。".into();
+                self.message = self.t("未连接到后台。请在维护页检查连接设置或启动服务。", "Agent unavailable. Check connection settings or start the service in Maintenance.").into();
             }
         }
     }
 
-    fn adapter(&mut self, start: bool) {
+    fn refresh_sessions_sync(&mut self) {
+        self.sessions = None;
+        match self
+            .client
+            .get(format!("{}/sessions", self.api_base))
+            .send()
+        {
+            Ok(response) if response.status().is_success() => match response.json() {
+                Ok(sessions) => self.sessions = Some(sessions),
+                Err(_) => {
+                    self.message = self
+                        .t("会话响应格式无效。", "Invalid sessions response.")
+                        .into()
+                }
+            },
+            Ok(response) => {
+                self.message = http_failure(
+                    response,
+                    self.t("读取会话失败。", "Could not read sessions."),
+                )
+            }
+            Err(_) => {
+                self.message = self
+                    .t(
+                        "无法连接后台读取会话。",
+                        "Could not connect to the agent to read sessions.",
+                    )
+                    .into()
+            }
+        }
+    }
+
+    fn adapter_sync(&mut self, start: bool) {
         let request = if start {
-            self.client.post(format!("{LOCAL_API}/adapter"))
+            self.client.post(format!("{}/adapter", self.api_base))
         } else {
-            self.client.delete(format!("{LOCAL_API}/adapter"))
+            self.client.delete(format!("{}/adapter", self.api_base))
         };
         match request.send() {
             Ok(response) if response.status().is_success() => {
                 self.message = if start {
-                    "网卡已启动并已同步已分配的 IPv4 地址。".into()
+                    self.t("网卡已启动。", "Adapter started.").into()
                 } else {
-                    "网卡会话已停止。".into()
+                    self.t("网卡会话已停止。", "Adapter stopped.").into()
                 };
-                self.refresh();
+                let action_message = self.message.clone();
+                self.refresh_sync();
+                if self.status.is_some() {
+                    self.message = action_message;
+                }
+                self.refresh_sessions_sync();
             }
             Ok(response) => {
-                self.message = response.text().unwrap_or_else(|_| "网卡操作失败。".into())
+                self.message = http_failure(
+                    response,
+                    self.t("网卡操作失败。", "Adapter operation failed."),
+                )
             }
-            Err(error) => self.message = format!("无法联系后台服务：{error}"),
+            Err(error) => {
+                self.message = format!(
+                    "{}: {error}",
+                    self.t("无法联系后台服务", "Could not connect to the agent")
+                )
+            }
         }
     }
 
-    fn join_network(&mut self, planet_manifest_url: Option<String>) {
-        ensure_local_controller_running();
-        let network_id = match Uuid::parse_str(self.network_id.trim()) {
-            Ok(id) => id,
-            Err(_) => {
-                self.message = "网络 ID 必须是 UUID。".into();
+    fn leave_network_sync(&mut self, id: Uuid) {
+        match self
+            .client
+            .delete(format!("{}/networks/{id}", self.api_base))
+            .send()
+        {
+            Ok(response) if response.status().is_success() => {
+                self.message = self.t("已离开网络。", "Left the network.").into();
+                let action_message = self.message.clone();
+                self.refresh_sync();
+                if self.status.is_some() {
+                    self.message = action_message;
+                }
+            }
+            Ok(response) => {
+                self.message = http_failure(
+                    response,
+                    self.t("离开网络失败。", "Could not leave the network."),
+                )
+            }
+            Err(error) => {
+                self.message = format!(
+                    "{}: {error}",
+                    self.t("无法联系后台服务", "Could not connect to the agent")
+                )
+            }
+        }
+    }
+
+    fn apply_exit_selection_sync(&mut self) {
+        let Ok(network) = Uuid::parse_str(self.exit_network_id.trim()) else {
+            self.message = self
+                .t(
+                    "出口网络 ID 必须是 UUID。",
+                    "Exit network ID must be a UUID.",
+                )
+                .into();
+            return;
+        };
+        let body = match exit_selection_body(
+            &self.ipv4_gateway,
+            &self.ipv6_gateway,
+            self.exit_kill_switch,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                self.message = error;
                 return;
             }
         };
-        let (device_id, device_public_key) = match &self.status {
-            Some(status) => (status.device_id.0, status.identity_public_key.clone()),
-            None => {
-                self.message = "请先刷新状态。".into();
+        match self
+            .client
+            .post(format!(
+                "{}/networks/{network}/exit-selection",
+                self.api_base
+            ))
+            .json(&body)
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {
+                self.message = self
+                    .t("出口节点选择已应用。", "Exit selection applied.")
+                    .into()
+            }
+            Ok(r) => self.message = http_failure(r, "出口节点选择失败。"),
+            Err(e) => {
+                self.message = format!(
+                    "{}: {e}",
+                    self.t("无法联系后台服务", "Could not connect to the agent")
+                )
+            }
+        }
+    }
+
+    fn apply_exit_gateway_sync(&mut self) {
+        let Ok(network) = Uuid::parse_str(self.exit_network_id.trim()) else {
+            self.message = self
+                .t(
+                    "出口网络 ID 必须是 UUID。",
+                    "Exit network ID must be a UUID.",
+                )
+                .into();
+            return;
+        };
+        let body = json!({ "egress_interface": self.egress_interface.trim(), "enable_ipv4": self.enable_ipv4_gateway, "enable_ipv6": self.enable_ipv6_gateway });
+        match self
+            .client
+            .post(format!("{}/networks/{network}/exit-gateway", self.api_base))
+            .json(&body)
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {
+                self.message = self.t("出口网关已应用。", "Exit gateway applied.").into()
+            }
+            Ok(r) => self.message = http_failure(r, "出口网关配置失败。"),
+            Err(e) => {
+                self.message = format!(
+                    "{}: {e}",
+                    self.t("无法联系后台服务", "Could not connect to the agent")
+                )
+            }
+        }
+    }
+
+    fn remove_exit_gateway_sync(&mut self) {
+        let Ok(network) = Uuid::parse_str(self.exit_network_id.trim()) else {
+            self.message = self
+                .t(
+                    "出口网络 ID 必须是 UUID。",
+                    "Exit network ID must be a UUID.",
+                )
+                .into();
+            return;
+        };
+        self.message = local_action_result(
+            self.client
+                .delete(format!("{}/networks/{network}/exit-gateway", self.api_base))
+                .send(),
+            self.t("出口网关已停用。", "Exit gateway disabled."),
+            self.settings.language,
+        );
+    }
+
+    fn clear_exit_selection_sync(&mut self) {
+        let Ok(network) = Uuid::parse_str(self.exit_network_id.trim()) else {
+            self.message = self
+                .t(
+                    "出口网络 ID 必须是 UUID。",
+                    "Exit network ID must be a UUID.",
+                )
+                .into();
+            return;
+        };
+        self.message = local_action_result(
+            self.client
+                .post(format!(
+                    "{}/networks/{network}/exit-selection",
+                    self.api_base
+                ))
+                .json(&json!({"ipv4_gateway": null, "ipv6_gateway": null, "kill_switch": false}))
+                .send(),
+            self.t("出口节点选择已清除。", "Exit selection cleared."),
+            self.settings.language,
+        );
+    }
+
+    fn stop_agent_sync(&mut self) {
+        let result = self
+            .client
+            .post(format!("{}/shutdown", self.api_base))
+            .send();
+        if result.as_ref().is_ok_and(|r| r.status().is_success()) {
+            self.status = None;
+            self.sessions = None;
+        }
+        self.message = local_action_result(
+            result,
+            self.t(
+                "后台已停止，GUI 保持打开。",
+                "Agent stopped. The GUI stays open.",
+            ),
+            self.settings.language,
+        );
+    }
+
+    fn join_network_sync(&mut self, planet_manifest_url: Option<String>) {
+        let network_id = match Uuid::parse_str(self.network_id.trim()) {
+            Ok(id) => id,
+            Err(_) => {
+                self.message = self
+                    .t("网络 ID 必须是 UUID。", "Network ID must be a UUID.")
+                    .into();
                 return;
             }
         };
         let key = match STANDARD.decode(self.public_key.trim()) {
             Ok(key) if key.len() == 32 => key,
             _ => {
-                self.message = "控制器公钥必须是 32 字节 Base64 值。".into();
+                self.message = self
+                    .t(
+                        "控制器公钥必须是 32 字节 Base64 值。",
+                        "Controller public key must be a 32-byte Base64 value.",
+                    )
+                    .into();
                 return;
             }
         };
@@ -371,24 +790,62 @@ impl App {
             self.message = error;
             return;
         }
-        let enrollment_client = match controller_http_client(tls_ca_pem.as_deref()) {
+        let enrollment_client = match configured_http_client(
+            tls_ca_pem.as_deref(),
+            Duration::from_secs(self.request_timeout),
+            false,
+        ) {
             Ok(client) => client,
             Err(error) => {
                 self.message = format!("无法创建安全控制器连接：{error}");
                 return;
             }
         };
+        // Resolve the current agent identity before binding a one-time token.
+        // A cached status may belong to an agent restarted with another state file.
+        let current_status: AgentStatus = match self
+            .client
+            .get(format!("{}/status", self.api_base))
+            .send()
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<AgentStatus>() {
+                    Ok(status) if status.identity_public_key.len() == 32 => status,
+                    _ => {
+                        self.message = self.t("后台身份响应无效，尚未提交入网令牌。", "Invalid agent identity response; enrollment token was not submitted.").into();
+                        return;
+                    }
+                }
+            }
+            Ok(response) => {
+                self.message = format!(
+                    "{}: HTTP {}",
+                    self.t(
+                        "读取当前后台身份失败，尚未提交入网令牌",
+                        "Could not read current agent identity; enrollment token was not submitted"
+                    ),
+                    response.status()
+                );
+                return;
+            }
+            Err(_) => {
+                self.message = self.t("无法读取当前后台身份，尚未提交入网令牌。", "Could not read current agent identity; enrollment token was not submitted.").into();
+                return;
+            }
+        };
+        let device_id = current_status.device_id.0;
+        let device_public_key = current_status.identity_public_key;
         let enrollment: EnrollmentResponse = match enrollment_client.post(format!("{controller}/v1/enroll")).json(&json!({"network_id": network_id, "device_id": device_id, "device_public_key": device_public_key, "token": self.token.trim()})).send() {
             Ok(response) if response.status().is_success() => match response.json() {
                 Ok(value) => value,
-                Err(error) => { self.message = format!("控制器返回格式无效：{error}"); return; }
+                Err(_) => { self.message = self.t("控制器返回格式无效。", "Invalid controller response.").into(); return; }
             },
-            Ok(response) => { self.message = response.text().unwrap_or_else(|_| "控制器拒绝入网。".into()); return; }
+            Ok(response) => { self.message = http_failure(response, "控制器拒绝入网。"); return; }
             Err(error) => { self.message = format!("无法联系控制器：{error}"); return; }
         };
         match self
             .client
-            .post(format!("{LOCAL_API}/networks/enroll"))
+            .post(format!("{}/networks/enroll", self.api_base))
             .json(&json!({
                 "enrollment": enrollment,
                 "controller_public_key": key,
@@ -401,20 +858,39 @@ impl App {
             .send()
         {
             Ok(response) if response.status().is_success() => {
-                self.message = "已安全加入控制器网络。".into();
+                self.message = self
+                    .t(
+                        "已安全加入控制器网络。",
+                        "Joined the controller network securely.",
+                    )
+                    .into();
                 self.token.clear();
-                self.refresh();
+                let action_message = self.message.clone();
+                self.refresh_sync();
+                if self.status.is_some() {
+                    self.message = action_message;
+                }
             }
-            Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "后台拒绝入网记录。".into())
+            Ok(response) => self.message = http_failure(response, "后台拒绝入网记录。"),
+            Err(error) => {
+                self.message = format!(
+                    "{}: {error}",
+                    self.t("无法联系后台服务", "Could not connect to the agent")
+                )
             }
-            Err(error) => self.message = format!("无法联系后台服务：{error}"),
         }
     }
 
-    fn join_invite_link(&mut self) {
+    fn join_invite_link_sync(&mut self) {
+        if self.invite_link.trim().is_empty() {
+            self.message = self
+                .t(
+                    "请先粘贴或导入邀请链接。",
+                    "Paste or import an invitation link first.",
+                )
+                .into();
+            return;
+        }
         let invitation = match parse_invite_link(self.invite_link.trim()) {
             Ok(invitation) => invitation,
             Err(error) => {
@@ -451,13 +927,13 @@ impl App {
         self.public_key = invitation.public_key.clone();
         self.controller_public_key = invitation.public_key;
         self.controller_tls_ca_pem = effective_tls_ca.unwrap_or_default();
-        self.join_network(invitation.planet_manifest_url);
+        self.join_network_sync(invitation.planet_manifest_url);
     }
 
-    fn configure_relay(&mut self) {
+    fn configure_relay_sync(&mut self) {
         match self
             .client
-            .post(format!("{LOCAL_API}/relay"))
+            .post(format!("{}/relay", self.api_base))
             .json(&json!({
                 "endpoint": self.relay_endpoint.trim(),
                 "enable_upnp": self.upnp_enabled,
@@ -466,18 +942,16 @@ impl App {
             .send()
         {
             Ok(response) if response.status().is_success() => {
-                self.message = "中继地址已保存并自动应用。".into();
+                self.message = self.t("中继地址已保存并自动应用。", "Relay endpoint saved and applied.").into();
             }
             Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "保存中继地址失败。".into())
+                self.message = http_failure(response, "保存中继地址失败。")
             }
-            Err(error) => self.message = format!("无法联系后台服务：{error}"),
+            Err(error) => self.message = format!("{}: {error}", self.t("无法联系后台服务", "Could not connect to the agent")),
         }
     }
 
-    fn configure_planet(&mut self) {
+    fn configure_planet_sync(&mut self) {
         let tls_ca_pem = match normalize_optional_tls_ca(&self.controller_tls_ca_pem) {
             Ok(value) => value,
             Err(error) => {
@@ -499,7 +973,7 @@ impl App {
         }
         match self
             .client
-            .post(format!("{LOCAL_API}/planet"))
+            .post(format!("{}/planet", self.api_base))
             .json(&json!({
                 "manifest_url": manifest_url,
                 "controller_public_key_base64": self.planet_public_key.trim(),
@@ -510,11 +984,7 @@ impl App {
             Ok(response) if response.status().is_success() => {
                 self.message = "行星服务器配置已验证、保存并自动应用。".into();
             }
-            Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "保存行星服务器配置失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "保存行星服务器配置失败。"),
             Err(error) => self.message = format!("无法联系本机后台服务：{error}"),
         }
     }
@@ -528,7 +998,9 @@ impl App {
         let tls_ca_pem = normalize_optional_tls_ca(&self.controller_tls_ca_pem)?;
         let controller = controller_base_url(&self.controller, tls_ca_pem.is_some())?;
         let client = controller_http_client(tls_ca_pem.as_deref())?;
-        let request = client.request(method, format!("{controller}{path}"));
+        let request = client
+            .request(method, format!("{controller}{path}"))
+            .timeout(Duration::from_secs(self.request_timeout));
         if !requires_admin {
             return Ok(request);
         }
@@ -561,11 +1033,22 @@ impl App {
             self.selected_network = None;
             self.members.clear();
             self.issued_token.clear();
+            self.generated_invite.clear();
+            self.controller_document.clear();
+            self.policy_editor = Default::default();
         }
         self.controller = controller;
     }
 
-    fn refresh_controller_public_key(&mut self, show_message: bool) {
+    fn controller_address_ui(&mut self, ui: &mut egui::Ui) {
+        let mut address = self.controller.clone();
+        if ui.add(design::input(&mut address)).changed() {
+            self.switch_controller_context(address);
+        }
+    }
+
+    fn refresh_controller_public_key_sync(&mut self, show_message: bool) {
+        self.controller_public_key.clear();
         let request =
             match self.controller_request(reqwest::Method::GET, "/v1/public-key".into(), false) {
                 Ok(request) => request,
@@ -587,16 +1070,19 @@ impl App {
                                 .into();
                         }
                     }
-                    Err(error) if show_message => {
-                        self.message = format!("控制器公钥响应无效：{error}");
+                    Err(_) if show_message => {
+                        self.message = self
+                            .t(
+                                "控制器公钥响应无效。",
+                                "Invalid controller public key response.",
+                            )
+                            .into();
                     }
                     Err(_) => {}
                 }
             }
             Ok(response) if show_message => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "读取控制器公钥失败。".into());
+                self.message = http_failure(response, "读取控制器公钥失败。");
             }
             Err(error) if show_message => {
                 self.message = format!("无法联系控制器：{error}");
@@ -605,8 +1091,7 @@ impl App {
         }
     }
 
-    fn refresh_managed_networks(&mut self) {
-        ensure_local_controller_running();
+    fn refresh_managed_networks_sync(&mut self) {
         let request =
             match self.controller_request(reqwest::Method::GET, "/v1/networks".into(), false) {
                 Ok(request) => request,
@@ -623,25 +1108,38 @@ impl App {
                         .t("控制器网络列表已更新。", "Controller network list updated.")
                         .into();
                 }
-                Err(error) => self.message = format!("控制器响应格式无效：{error}"),
+                Err(_) => {
+                    self.message = self
+                        .t("控制器响应格式无效。", "Invalid controller response.")
+                        .into()
+                }
             },
-            Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "读取控制器网络失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "读取控制器网络失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
 
-    fn create_managed_network(&mut self) {
-        ensure_local_controller_running();
+    fn create_managed_network_sync(&mut self) {
+        let id = if self.managed_create_id.trim().is_empty() {
+            None
+        } else {
+            match Uuid::parse_str(self.managed_create_id.trim()) {
+                Ok(id) => Some(meshlake_core::NetworkId(id)),
+                Err(_) => {
+                    self.message = self
+                        .t("新网络 ID 必须是 UUID。", "New network ID must be a UUID.")
+                        .into();
+                    return;
+                }
+            }
+        };
         let network_request = UpsertNetworkRequest {
-            id: None,
+            id,
             name: self.name.trim().to_owned(),
             ipv4_prefix: self.prefix.trim().to_owned(),
-            ipv6_prefix: None,
-            relay_policy: RelayPolicy::Preferred,
+            ipv6_prefix: (!self.ipv6_prefix.trim().is_empty())
+                .then(|| self.ipv6_prefix.trim().to_owned()),
+            relay_policy: self.network_relay_policy.clone(),
         };
         let controller_request =
             match self.controller_request(reqwest::Method::POST, "/v1/networks".into(), true) {
@@ -657,18 +1155,54 @@ impl App {
                     .t("控制器网络已创建。", "Controller network created.")
                     .into();
                 self.name.clear();
-                self.refresh_managed_networks();
+                self.refresh_managed_networks_sync();
             }
-            Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "创建控制器网络失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "创建控制器网络失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
 
-    fn delete_managed_network(&mut self, id: Uuid) {
+    fn create_local_network_sync(&mut self) {
+        let id = if self.network_id.trim().is_empty() {
+            None
+        } else {
+            match Uuid::parse_str(self.network_id.trim()) {
+                Ok(id) => Some(meshlake_core::NetworkId(id)),
+                Err(_) => {
+                    self.message =
+                        "网络 ID 必须为空或 UUID。 / Network ID must be empty or a UUID.".into();
+                    return;
+                }
+            }
+        };
+        let request = UpsertNetworkRequest {
+            id,
+            name: self.name.trim().into(),
+            ipv4_prefix: self.prefix.trim().into(),
+            ipv6_prefix: (!self.ipv6_prefix.trim().is_empty())
+                .then(|| self.ipv6_prefix.trim().into()),
+            relay_policy: self.network_relay_policy.clone(),
+        };
+        let result = self
+            .client
+            .post(format!("{}/networks", self.api_base))
+            .json(&request)
+            .send();
+        let success = result
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success());
+        let message = local_action_result(
+            result,
+            self.t("本地网络已创建。", "Local network created."),
+            self.settings.language,
+        );
+        if success {
+            self.refresh_sync();
+        }
+        self.message = message;
+    }
+
+    fn delete_managed_network_sync(&mut self, id: Uuid) {
         let request = match self.controller_request(
             reqwest::Method::DELETE,
             format!("/v1/networks/{id}"),
@@ -686,18 +1220,17 @@ impl App {
                     .t("网络已从控制器删除。", "Network deleted from controller.")
                     .into();
                 self.members.clear();
-                self.refresh_managed_networks();
+                self.refresh_managed_networks_sync();
             }
-            Ok(response) => {
-                self.message = response.text().unwrap_or_else(|_| "删除网络失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "删除网络失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
 
-    fn issue_enrollment_token(&mut self, id: Uuid) {
-        ensure_local_controller_running();
-        self.refresh_controller_public_key(false);
+    fn issue_enrollment_token_sync(&mut self, id: Uuid) {
+        self.generated_invite.clear();
+        self.issued_token.clear();
+        self.refresh_controller_public_key_sync(false);
         if self.controller_public_key.is_empty() {
             self.message = self
                 .t(
@@ -712,7 +1245,7 @@ impl App {
             format!("/v1/networks/{id}/enrollment-tokens"),
             true,
         ) {
-            Ok(request) => request.json(&json!({"expires_in_seconds": 900})),
+            Ok(request) => request.json(&json!({"expires_in_seconds": self.invite_lifetime})),
             Err(error) => {
                 self.message = format!("控制器配置无效：{error}");
                 return;
@@ -723,7 +1256,7 @@ impl App {
                 match response.json::<IssuedToken>() {
                     Ok(token) => {
                         self.issued_token = token.token;
-                        self.invite_link = match token.invite_link {
+                        self.generated_invite = match token.invite_link {
                             Some(link) if !link.trim().is_empty() => match parse_invite_link(&link)
                             {
                                 Ok(_) => link,
@@ -749,27 +1282,30 @@ impl App {
                                 }
                             },
                         };
-                        self.message = self
-                            .t(
-                                "已生成 15 分钟有效的一次性入网令牌。",
-                                "A 15-minute invitation link was created.",
-                            )
-                            .into();
+                        self.message = format!(
+                            "{} {} {}",
+                            self.t(
+                                "已生成一次性邀请，有效期",
+                                "One-time invitation created; valid for"
+                            ),
+                            self.invite_lifetime,
+                            self.t("秒。", "seconds.")
+                        );
                     }
-                    Err(error) => self.message = format!("令牌响应格式无效：{error}"),
+                    Err(_) => {
+                        self.message = self
+                            .t("令牌响应格式无效。", "Invalid enrollment token response.")
+                            .into()
+                    }
                 }
             }
-            Ok(response) => {
-                self.message = response
-                    .text()
-                    .unwrap_or_else(|_| "生成入网令牌失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "生成入网令牌失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
 
-    fn load_members(&mut self, id: Uuid) {
-        ensure_local_controller_running();
+    fn load_members_sync(&mut self, id: Uuid) {
+        self.members.clear();
         let request = match self.controller_request(
             reqwest::Method::GET,
             format!("/v1/networks/{id}/members"),
@@ -787,17 +1323,18 @@ impl App {
                     self.selected_network = Some(id);
                     self.members = members;
                 }
-                Err(error) => self.message = format!("成员响应格式无效：{error}"),
+                Err(_) => {
+                    self.message = self
+                        .t("成员响应格式无效。", "Invalid membership response.")
+                        .into()
+                }
             },
-            Ok(response) => {
-                self.message = response.text().unwrap_or_else(|_| "读取成员失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "读取成员失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
 
-    fn remove_member(&mut self, network_id: Uuid, device_id: Uuid) {
-        ensure_local_controller_running();
+    fn remove_member_sync(&mut self, network_id: Uuid, device_id: Uuid) {
         let request = match self.controller_request(
             reqwest::Method::DELETE,
             format!("/v1/networks/{network_id}/members/{device_id}"),
@@ -817,11 +1354,9 @@ impl App {
                         "Member removed from controller records.",
                     )
                     .into();
-                self.load_members(network_id);
+                self.load_members_sync(network_id);
             }
-            Ok(response) => {
-                self.message = response.text().unwrap_or_else(|_| "移除成员失败。".into())
-            }
+            Ok(response) => self.message = http_failure(response, "移除成员失败。"),
             Err(error) => self.message = format!("无法联系控制器：{error}"),
         }
     }
@@ -1091,9 +1626,20 @@ fn normalize_tls_ca_pem(pem: &str) -> Result<String, String> {
 }
 
 fn controller_http_client(tls_ca_pem: Option<&str>) -> Result<Client, String> {
+    configured_http_client(tls_ca_pem, Duration::from_secs(30), false)
+}
+
+fn configured_http_client(
+    tls_ca_pem: Option<&str>,
+    timeout: Duration,
+    local: bool,
+) -> Result<Client, String> {
     let mut builder = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none());
+    if local {
+        builder = builder.no_proxy();
+    }
     if let Some(tls_ca_pem) = tls_ca_pem {
         let certificates = tls_certificate_der_bundle(tls_ca_pem)?;
         builder = builder.tls_built_in_root_certs(false);
@@ -1132,286 +1678,19 @@ fn make_invite_link(
 
 impl eframe::App for App {
     fn update(&mut self, context: &egui::Context, _: &mut eframe::Frame) {
-        if context.input(|input| input.viewport().close_requested()) {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.settings.minimize_on_close {
-                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else if self.settings.ask_on_close {
-                self.show_close_confirmation = true;
-            } else {
-                shutdown_all_meshlake_and_exit();
-            }
-        }
-        egui::TopBottomPanel::top("top").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("MeshLake");
-                ui.label(self.t(
-                    "连接万物的湖泊 · Windows 管理端",
-                    "Lake of Connecting Everything · Windows Manager",
-                ));
-                if ui.button(self.t("刷新状态", "Refresh")).clicked() {
-                    self.refresh();
-                }
-                if ui.button(self.t("设置", "Settings")).clicked() {
-                    self.show_settings = true;
-                }
-            });
-        });
-        egui::CentralPanel::default().show(context, |ui| {
-            ui.label(&self.message);
-            ui.separator();
-            ui.heading("本机后台与虚拟网卡");
-            if let Some(status) = self.status.clone() {
-                ui.label(format!("设备 ID：{}", status.device_id.0));
-                ui.label(format!("网卡状态：{}", status.adapter_state));
-                ui.horizontal(|ui| {
-                    if ui.button("启动网卡").clicked() {
-                        self.adapter(true);
-                    }
-                    if ui.button("停止网卡").clicked() {
-                        self.adapter(false);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("UDP 协调 / 中继地址");
-                    ui.text_edit_singleline(&mut self.relay_endpoint);
-                    if ui.button("保存中继").clicked() {
-                        self.configure_relay();
-                    }
-                });
-                ui.checkbox(&mut self.upnp_enabled, "启用 UPnP 自动映射 UDP 端口");
-                ui.horizontal(|ui| {
-                    ui.label("STUN 服务器（可选，逗号分隔）");
-                    ui.text_edit_singleline(&mut self.stun_servers);
-                });
-                ui.small("例如 stun.example.com:3478。用于发现公网 UDP 候选；无法直连时仍自动使用中继。");
-                ui.collapsing("行星服务器（推荐）", |ui| {
-                    ui.label("受签名的 Planet 清单会自动配置控制器、中继和 STUN 节点。");
-                    ui.horizontal(|ui| {
-                        ui.label("清单 URL");
-                        ui.text_edit_singleline(&mut self.planet_manifest);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("控制器公钥（Base64）");
-                        ui.text_edit_singleline(&mut self.planet_public_key);
-                        if ui.button("保存行星配置").clicked() {
-                            self.configure_planet();
-                        }
-                    });
-                    ui.small("公钥必须由服务器管理员通过可信渠道提供；不要只相信网页返回的公钥。");
-                });
-                ui.separator();
-                ui.heading(format!("已加入网络（{}）", status.networks.len()));
-                for network in &status.networks {
-                    ui.label(format!(
-                        "{} · {} · 地址：{}",
-                        network.network.name,
-                        network.network.ipv4_prefix,
-                        network
-                            .assigned_addresses
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-            } else {
-                ui.label("GUI 关闭不会停止正在运行的后台服务。");
-            }
-            ui.collapsing(
-                self.t(
-                    "私有控制器 / Planet CA（高级）",
-                    "Private controller / Planet CA (advanced)",
-                ),
-                |ui| {
-                    ui.label(self.t(
-                        "仅在控制器使用私有 CA 签发 HTTPS 证书时粘贴 PEM。邀请链接中的 CA 会自动填入这里，并按网络保存到后台。",
-                        "Paste PEM only when the controller HTTPS certificate is issued by a private CA. An invitation CA is filled here automatically and stored per network by the agent.",
-                    ));
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.controller_tls_ca_pem)
-                            .desired_rows(4)
-                            .desired_width(780.0)
-                            .hint_text("-----BEGIN CERTIFICATE-----"),
-                    );
-                },
-            );
-            ui.separator();
-            ui.collapsing(
-                self.t("控制器网络管理", "Controller network management"),
-                |ui| {
-                    ui.label(self.t(
-                        "管理员令牌仅保存在本次 GUI 运行内。",
-                        "The administrator token is kept only for this GUI session.",
-                    ));
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        self.t(
-                            "注意：移除成员会轮换网络密钥并更新签名授权清单。正常在线客户端通常在约 20 秒内停用该成员；拒绝刷新客户端的最坏窗口由 90 秒授权租约限定。",
-                            "Removing a member rotates the network key and updates the signed authorization manifest. Normal online clients usually enforce it within about 20 seconds; the worst case for a non-refreshing client is bounded by the 90-second authorization lease.",
-                        ),
-                    );
-                    egui::Grid::new("controller-admin")
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            ui.label(self.t("控制器 URL", "Controller URL"));
-                            ui.text_edit_singleline(&mut self.controller);
-                            ui.end_row();
-                            ui.label(self.t("管理员令牌", "Administrator token"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.admin_token).password(true),
-                            );
-                            ui.end_row();
-                        });
-                    ui.horizontal(|ui| {
-                        ui.label(self.t("控制器公钥 (Base64)", "Controller public key (Base64)"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.controller_public_key)
-                                .desired_width(430.0)
-                                .interactive(false),
-                        );
-                        if ui.button(self.t("读取公钥", "Load key")).clicked() {
-                            self.refresh_controller_public_key(true);
-                        }
-                        if ui.button(self.t("复制", "Copy")).clicked()
-                            && !self.controller_public_key.is_empty()
-                        {
-                            context.copy_text(self.controller_public_key.clone());
-                            self.message = self.t("控制器公钥已复制到剪贴板。", "Controller public key copied to clipboard.").into();
-                        }
-                    });
-                    ui.small(self.t(
-                        "设备会先尝试 UDP 打洞直连；遇到对称 NAT 或受限网络时，自动经此中继转发。",
-                        "MeshLake tries UDP hole punching first and automatically falls back to this relay for symmetric NATs or restrictive networks.",
-                    ));
-                    ui.small(self.t(
-                        "这是可公开分发的验证公钥；不要分享管理员令牌或 controller.json 文件。",
-                        "This verification key may be shared. Never share the administrator token or controller.json file.",
-                    ));
-                    if ui.button(self.t("将此公钥填入“加入网络”", "Use this key for joining")).clicked()
-                        && !self.controller_public_key.is_empty()
-                    {
-                        self.public_key = self.controller_public_key.clone();
-                    }
-                    if ui
-                        .button(self.t("刷新控制器网络", "Refresh controller networks"))
-                        .clicked()
-                    {
-                        self.refresh_managed_networks();
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(self.t("新网络名称", "New network name"));
-                        ui.text_edit_singleline(&mut self.name);
-                        ui.label(self.t("IPv4 前缀", "IPv4 prefix"));
-                        ui.text_edit_singleline(&mut self.prefix);
-                        if ui
-                            .button(self.t("在控制器创建", "Create on controller"))
-                            .clicked()
-                        {
-                            self.create_managed_network();
-                        }
-                    });
-                    for network in self.managed_networks.clone() {
-                        ui.group(|ui| {
-                            ui.label(format!(
-                                "{} · {} · {}",
-                                network.name, network.id.0, network.ipv4_prefix
-                            ));
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .button(self.t("生成邀请链接", "Create invitation link"))
-                                    .clicked()
-                                {
-                                    self.issue_enrollment_token(network.id.0);
-                                }
-                                if ui.button(self.t("查看成员", "View members")).clicked() {
-                                    self.load_members(network.id.0);
-                                }
-                                if ui.button(self.t("删除网络", "Delete network")).clicked() {
-                                    self.delete_managed_network(network.id.0);
-                                }
-                            });
-                        });
-                    }
-                    if !self.invite_link.is_empty() {
-                        ui.label(self.t(
-                            "最新邀请链接（15 分钟有效，仅供一台设备使用）：",
-                            "Latest invitation link (valid for 15 minutes, for one device only):",
-                        ));
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.invite_link)
-                                    .desired_width(620.0)
-                                    .interactive(false),
-                            );
-                            if ui.button(self.t("复制链接", "Copy link")).clicked() {
-                                context.copy_text(self.invite_link.clone());
-                                self.message = self.t("邀请链接已复制到剪贴板。", "Invitation link copied to clipboard.").into();
-                            }
-                        });
-                    }
-                    if let Some(network_id) = self.selected_network {
-                        ui.label(format!("{} {network_id}", self.t("成员列表：", "Members:")));
-                        for member in self.members.clone() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!(
-                                    "{} · {}",
-                                    member.device_id.0,
-                                    member
-                                        .assigned_addresses
-                                        .iter()
-                                        .map(ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ));
-                                if ui.button(self.t("移除成员", "Remove member")).clicked() {
-                                    self.remove_member(network_id, member.device_id.0);
-                                }
-                            });
-                        }
-                    }
-                },
-            );
-            ui.separator();
-            ui.heading("加入控制器网络");
-            ui.label(self.t(
-                "推荐：粘贴管理员发来的邀请链接，软件会自动读取控制器、网络、公钥和一次性令牌。",
-                "Recommended: paste an invitation link from the administrator. MeshLake reads the controller, network, public key, and token automatically.",
-            ));
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.invite_link).desired_width(680.0));
-                if ui.button(self.t("通过链接加入", "Join from link")).clicked() {
-                    self.join_invite_link();
-                }
-            });
-            ui.small(self.t(
-                "邀请链接相当于一次性入网凭据，请只通过可信渠道发送；它只能由首个使用的设备重试。",
-                "An invitation link is a one-time enrollment credential. Send it only through a trusted channel; it can be retried only by the first device that uses it.",
-            ));
-            ui.separator();
-            ui.collapsing(self.t("手动加入（高级）", "Manual join (advanced)"), |ui| {
-            ui.label("控制器公钥必须由管理员通过可信渠道提供。不要信任未核验网页给出的公钥。");
-            egui::Grid::new("join").num_columns(2).show(ui, |ui| {
-                ui.label("控制器 URL");
-                ui.text_edit_singleline(&mut self.controller);
-                ui.end_row();
-                ui.label("网络 ID");
-                ui.text_edit_singleline(&mut self.network_id);
-                ui.end_row();
-                ui.label("一次性令牌");
-                ui.add(egui::TextEdit::singleline(&mut self.token).password(true));
-                ui.end_row();
-                ui.label("控制器公钥 (Base64)");
-                ui.add(egui::TextEdit::singleline(&mut self.public_key).password(true));
-                ui.end_row();
-            });
-            if ui.button("安全加入网络").clicked() {
-                self.join_network(None);
-            }
-            });
-        });
+        self.poll_services(context);
+        self.poll_job(context);
 
-        if self.show_settings {
+        let explicit_exit = self
+            .tray_exit_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if explicit_exit || context.input(|input| input.viewport().close_requested()) {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_close(context, explicit_exit);
+        }
+        self.render_shell(context);
+        self.confirmation_ui(context);
+        if self.show_settings && self.pending_action.is_none() && !self.show_close_confirmation {
             let mut open = self.show_settings;
             let before = self.settings.clone();
             let minimize_label = self.t(
@@ -1419,61 +1698,60 @@ impl eframe::App for App {
                 "Minimize to tray when closing the window",
             );
             let ask_label = self.t("关闭时询问", "Ask when closing");
-            egui::Window::new(self.t("设置", "Settings"))
-                .open(&mut open)
-                .resizable(false)
-                .show(context, |ui| {
-                    ui.heading(self.t("语言", "Language"));
+            design::preferences_window(context, self.t("设置", "Settings"), &mut open).show(
+                context,
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(self.t("MeshLake 设置", "MeshLake Settings"))
+                            .size(20.0)
+                            .strong()
+                            .color(ui.visuals().hyperlink_color),
+                    );
+                    ui.separator();
+                    ui.label(egui::RichText::new(self.t("语言", "Language")).strong());
                     ui.selectable_value(&mut self.settings.language, Language::Chinese, "简体中文");
                     ui.selectable_value(&mut self.settings.language, Language::English, "English");
                     ui.separator();
+                    self.appearance_settings_ui(ui);
+                    ui.separator();
                     ui.checkbox(&mut self.settings.minimize_on_close, minimize_label);
                     ui.checkbox(&mut self.settings.ask_on_close, ask_label);
-                });
+                    ui.separator();
+                    ui.small(self.t(
+                        "本软件使用 MiSans 字体 · © 小米科技有限责任公司",
+                        "Uses MiSans fonts · © Xiaomi Inc.",
+                    ));
+                    ui.collapsing(self.t("字体许可", "Font license"), |ui| {
+                        ui.label(include_str!("../assets/fonts/NOTICE.txt"));
+                    });
+                },
+            );
             self.show_settings = open;
-            if before.language != self.settings.language
-                || before.minimize_on_close != self.settings.minimize_on_close
-                || before.ask_on_close != self.settings.ask_on_close
-            {
+            if before != self.settings {
+                if before.language != self.settings.language
+                    || before.accent != self.settings.accent
+                {
+                    self.tray = create_tray(
+                        context,
+                        self.settings.language,
+                        self.settings.accent,
+                        self.tray_exit_requested.clone(),
+                    );
+                }
+                design::apply_theme(context, &self.settings);
+                if before.accent != self.settings.accent {
+                    context.send_viewport_cmd(egui::ViewportCommand::Icon(Some(
+                        std::sync::Arc::new(icons::application_icon(
+                            64,
+                            self.settings.accent.color(false),
+                        )),
+                    )));
+                }
                 save_settings(&self.settings);
             }
         }
 
-        if self.show_close_confirmation {
-            let (title, text, minimize, exit, never) = match self.settings.language {
-                Language::Chinese => ("关闭 MeshLake", "请选择最小化到系统托盘，或完全退出 MeshLake 并结束后台网络服务。", "最小化到托盘", "完全退出 MeshLake", "不再询问"),
-                Language::English => ("Close MeshLake", "Minimize to the system tray, or fully exit MeshLake and stop its background network services.", "Minimize to tray", "Fully exit MeshLake", "Don't ask again"),
-            };
-            let mut action = None;
-            egui::Window::new(title)
-                .collapsible(false)
-                .resizable(false)
-                .show(context, |ui| {
-                    ui.label(text);
-                    ui.checkbox(&mut self.dont_ask_again, never);
-                    ui.horizontal(|ui| {
-                        if ui.button(minimize).clicked() {
-                            action = Some(true);
-                        }
-                        if ui.button(exit).clicked() {
-                            action = Some(false);
-                        }
-                    });
-                });
-            if let Some(minimize) = action {
-                self.show_close_confirmation = false;
-                if self.dont_ask_again {
-                    self.settings.minimize_on_close = minimize;
-                    self.settings.ask_on_close = false;
-                    save_settings(&self.settings);
-                }
-                if minimize {
-                    context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                } else {
-                    shutdown_all_meshlake_and_exit();
-                }
-            }
-        }
+        self.close_confirmation_ui(context);
     }
 }
 
@@ -1503,95 +1781,31 @@ fn save_settings(settings: &Settings) {
     );
 }
 
-fn install_chinese_font(context: &egui::Context) {
-    let paths = [
-        PathBuf::from(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
-        PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-        PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
-    ];
-    let Some(bytes) = paths.iter().find_map(|path| fs::read(path).ok()) else {
-        return;
-    };
+fn install_ui_fonts(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "meshlake-chinese".into(),
-        egui::FontData::from_owned(bytes).into(),
+        "MiSans".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/MiSans-Regular.ttf")).into(),
     );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "meshlake-chinese".into());
-    }
+    fonts.font_data.insert(
+        "MiSans Medium".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/MiSans-Medium.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "MiSans".into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("MiSans".into());
+    fonts.families.insert(
+        egui::FontFamily::Name("MiSans Medium".into()),
+        vec!["MiSans Medium".into(), "MiSans".into()],
+    );
     context.set_fonts(fonts);
-}
-
-fn ensure_agent_running() {
-    if TcpStream::connect_timeout(
-        &"127.0.0.1:51821".parse().unwrap(),
-        Duration::from_millis(100),
-    )
-    .is_ok()
-    {
-        return;
-    }
-    let Some(executable) = std::env::current_exe().ok() else {
-        return;
-    };
-    let Some(folder) = executable.parent() else {
-        return;
-    };
-    let agent = folder.join("meshlaked.exe");
-    if !agent.is_file() {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    let mut command = Command::new(agent);
-    command.arg("run");
-    #[cfg(target_os = "windows")]
-    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    let _ = command.spawn();
-}
-
-fn ensure_local_controller_running() {
-    if TcpStream::connect_timeout(
-        &"127.0.0.1:51822".parse().unwrap(),
-        Duration::from_millis(100),
-    )
-    .is_ok()
-    {
-        return;
-    }
-    let Some(executable) = std::env::current_exe().ok() else {
-        return;
-    };
-    let Some(folder) = executable.parent() else {
-        return;
-    };
-    let controller = folder.join("meshlake-controller.exe");
-    if !controller.is_file() {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-    let mut command = Command::new(controller);
-    #[cfg(target_os = "windows")]
-    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    if command.spawn().is_ok() {
-        for _ in 0..15 {
-            std::thread::sleep(Duration::from_millis(100));
-            if TcpStream::connect_timeout(
-                &"127.0.0.1:51822".parse().unwrap(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                break;
-            }
-        }
-    }
 }
 
 fn load_local_admin_token() -> Option<String> {
@@ -1609,40 +1823,39 @@ fn decode_local_admin_token(bytes: &[u8]) -> Option<String> {
         .map(|decoded| decoded.value.admin_token)
 }
 
-fn shutdown_all_meshlake_and_exit() {
-    std::thread::spawn(move || {
-        let _ = Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .and_then(|client| client.post(format!("{LOCAL_API}/shutdown")).send());
-        for process in [
-            "meshlaked.exe",
-            "meshlake-controller.exe",
-            "meshlake-root.exe",
-            "meshlake-relay.exe",
-        ] {
-            let mut command = Command::new("taskkill");
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
-            let _ = command.args(["/IM", process, "/T", "/F"]).output();
-        }
-        // Do not rely on a window-close event here: when the main viewport is
-        // hidden, eframe may keep its event loop (and tray icon) alive. Ending
-        // this process explicitly lets Windows remove the icon as well.
-        std::process::exit(0);
-    });
+fn exit_gui() {
+    // The GUI owns no daemon lifetime. Stop the agent explicitly from Maintenance.
+    std::process::exit(0);
 }
-
-fn create_tray(context: &egui::Context) -> Option<Tray> {
+fn create_tray(
+    context: &egui::Context,
+    language: Language,
+    accent: design::Accent,
+    exit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<Tray> {
     let menu = Menu::new();
-    let show = MenuItem::new("显示 MeshLake", true, None);
-    let exit = MenuItem::new("完全退出 MeshLake", true, None);
+    let show = MenuItem::new(
+        if language == Language::Chinese {
+            "显示 MeshLake"
+        } else {
+            "Show MeshLake"
+        },
+        true,
+        None,
+    );
+    let exit = MenuItem::new(
+        if language == Language::Chinese {
+            "退出图形界面"
+        } else {
+            "Exit GUI"
+        },
+        true,
+        None,
+    );
     menu.append(&show).ok()?;
     menu.append(&exit).ok()?;
-    let icon = Icon::from_rgba(vec![30, 144, 255, 255].repeat(32 * 32), 32, 32).ok()?;
+    let image = icons::application_icon(32, accent.color(false));
+    let icon = Icon::from_rgba(image.rgba, image.width, image.height).ok()?;
     let tray = TrayIconBuilder::new()
         .with_tooltip("MeshLake")
         .with_menu(Box::new(menu))
@@ -1654,40 +1867,110 @@ fn create_tray(context: &egui::Context) -> Option<Tray> {
     let context = context.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id == show_id {
-            show_native_window();
             context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
             context.request_repaint();
         } else if event.id == exit_id {
-            shutdown_all_meshlake_and_exit();
+            exit_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            context.request_repaint();
         }
     }));
     Some(Tray { _icon: tray })
 }
 
-#[cfg(target_os = "windows")]
-fn meshlake_window() -> *mut std::ffi::c_void {
-    let title: Vec<u16> = "MeshLake\0".encode_utf16().collect();
-    unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn meshlake_window() -> *mut std::ffi::c_void {
-    std::ptr::null_mut()
-}
-
-fn show_native_window() {
-    let window = meshlake_window();
-    if !window.is_null() {
-        unsafe {
-            ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_gateway_id_cannot_silently_clear_a_selected_exit() {
+        assert!(exit_selection_body("not-a-uuid", "", true).is_err());
+        assert!(exit_selection_body("", "invalid", false).is_err());
+    }
+
+    #[test]
+    fn exit_selection_keeps_independent_families_and_kill_switch() {
+        let id = Uuid::new_v4();
+        let body = exit_selection_body(&format!(" {id} "), "", true).unwrap();
+        assert_eq!(body["ipv4_gateway"], id.to_string());
+        assert!(body["ipv6_gateway"].is_null());
+        assert_eq!(body["kill_switch"], true);
+    }
+
+    #[test]
+    fn every_page_renders_offline_at_minimum_window_size() {
+        let context = egui::Context::default();
+        let mut app = App::default();
+        for language in [Language::Chinese, Language::English] {
+            app.settings.language = language;
+            for page in Page::ALL {
+                app.page = page;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(560.0, 480.0),
+                    )),
+                    ..Default::default()
+                };
+                let output = context.run(input, |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        app.render_page(context, ui);
+                    });
+                });
+                assert!(!output.shapes.is_empty(), "{page:?} has no UI");
+            }
+        }
+    }
+
+    #[test]
+    fn complete_shell_keeps_content_accessible_with_zoom_and_short_windows() {
+        // Logical points: the smallest supported window at 150% UI zoom,
+        // the normal minimum, a short wide window, and a desktop window.
+        for size in [
+            egui::vec2(507.0, 347.0),
+            egui::vec2(760.0, 520.0),
+            egui::vec2(1280.0, 347.0),
+            egui::vec2(1280.0, 800.0),
+        ] {
+            for language in [Language::Chinese, Language::English] {
+                for theme in [design::Theme::Light, design::Theme::Dark] {
+                    let context = egui::Context::default();
+                    let mut app = App::default();
+                    app.settings.language = language;
+                    app.settings.theme = theme;
+                    design::apply_theme(&context, &app.settings);
+                    for page in Page::ALL {
+                        app.page = page;
+                        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let mut content = egui::Rect::NOTHING;
+                        let output = context.run(
+                            egui::RawInput {
+                                screen_rect: Some(viewport),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                content = app.render_shell(ctx);
+                            },
+                        );
+                        assert!(!output.shapes.is_empty());
+                        assert!(
+                            content.width() >= size.x * 0.65,
+                            "{page:?}: {content:?} at {size:?}"
+                        );
+                        assert!(
+                            content.height() >= 120.0,
+                            "{page:?}: {content:?} at {size:?}"
+                        );
+                        assert!(
+                            viewport.expand(1.0).contains_rect(content),
+                            "{page:?}: {content:?} at {size:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn generated_test_ca_pem() -> String {
         let rcgen::CertifiedKey { cert, .. } =
@@ -1869,6 +2152,8 @@ mod tests {
             expires_at_unix_seconds: Some(2),
         });
         app.issued_token = "old-issued-token".into();
+        app.generated_invite = "old-invitation".into();
+        app.controller_document = "old-controller-document".into();
 
         app.switch_controller_context("https://remote.example.com".into());
 
@@ -1882,6 +2167,8 @@ mod tests {
         assert!(app.selected_network.is_none());
         assert!(app.members.is_empty());
         assert!(app.issued_token.is_empty());
+        assert!(app.generated_invite.is_empty());
+        assert!(app.controller_document.is_empty());
     }
 
     #[test]

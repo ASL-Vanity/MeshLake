@@ -18,7 +18,7 @@ serde_json.workspace = true
 tray-icon.workspace = true
 url.workspace = true
 uuid.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [dev-dependencies]
 rcgen = "0.14"

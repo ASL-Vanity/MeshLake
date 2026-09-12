@@ -43,6 +43,11 @@ relay-config.json
 __pycache__/
 *.py[cod]
 
+# Real-lab inventories and sanitized test output
+/tests/lab/inventory.real.json
+/tests/lab/results/
+/tests/lab/run/
+
 # Operating-system files
 Thumbs.db
 Desktop.ini

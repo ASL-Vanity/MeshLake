@@ -1,3 +1,8 @@
+#[cfg(test)]
+mod admin_http_tests;
+mod controller_admin;
+mod diagnostics;
+mod maintenance;
 mod secret_input;
 
 use anyhow::{bail, Context, Result};
@@ -21,9 +26,75 @@ use secret_input::{AdminTokenInputArgs, EnrollmentTokenInputArgs, JoinLinkInputA
 
 const LOCAL_API: &str = "http://127.0.0.1:51821/v1";
 
+fn local_api_url(value: &str) -> Result<String> {
+    let normalized = normalize_http_url(value, "local API URL", true)?;
+    let url = Url::parse(&normalized)?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    anyhow::ensure!(
+        loopback,
+        "the unauthenticated daemon API must use a loopback address"
+    );
+    Ok(normalized.trim_end_matches('/').to_owned())
+}
+
+fn redact_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in [
+                "network_key",
+                "identity_secret_key",
+                "token",
+                "admin_token",
+                "password",
+                "invite_link",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                redact_json(child);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                redact_json(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    redact_json(&mut value);
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn print_message(json: bool, message: &str) {
+    if json {
+        println!("{}", serde_json::json!({"ok":true,"message":message}));
+    } else {
+        println!("{message}");
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "meshlake", about = "MeshLake headless management CLI")]
+#[command(name = "meshlake", version, about = "MeshLake headless management CLI")]
 struct Cli {
+    /// Emit machine-readable JSON for management results.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Loopback daemon API URL, including /v1. Remote unauthenticated API use is rejected.
+    #[arg(long, global = true, default_value = LOCAL_API)]
+    api_url: String,
+    /// Total HTTP request timeout in seconds.
+    #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout_seconds: u64,
     /// PEM CA certificate trusted exclusively for controller HTTPS requests.
     #[arg(long, global = true, value_name = "CA_CERTIFICATE_PEM")]
     tls_ca_certificate: Option<PathBuf>,
@@ -33,13 +104,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect daemon status/sessions and optionally check an explicit TCP target.
+    Diagnose(diagnostics::DiagnoseArgs),
+    /// Export, restore or repair local agent state with the matching daemon.
+    State(maintenance::StateArgs),
+    /// Install, inspect or remove the daemon's native boot registration.
+    Autostart(maintenance::AutostartArgs),
+    /// Run an installed MeshLake service with its complete native option set.
+    Service(maintenance::ServiceArgs),
     Status,
     /// List sanitized pairwise-session state from the local daemon.
-    Sessions {
-        /// Print the versioned /v1/sessions response without lossy reformatting.
-        #[arg(long)]
-        json: bool,
-    },
+    Sessions,
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -69,6 +144,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCommand {
+    /// Run the daemon in the foreground; stop it with Ctrl+C or agent stop.
+    Run(maintenance::DaemonArgs),
+    /// Print the native daemon's resolved state path.
+    StatePath(maintenance::DaemonArgs),
     /// Gracefully stop meshlaked, its virtual adapter session and transport worker.
     Stop,
 }
@@ -81,7 +160,7 @@ enum AdapterCommand {
 
 #[derive(Subcommand)]
 enum RelayCommand {
-    /// Configure the UDP relay used after the next meshlaked restart.
+    /// Configure and immediately reload UDP relay settings.
     Set {
         #[arg(long)]
         endpoint: String,
@@ -108,6 +187,49 @@ enum PlanetCommand {
 
 #[derive(Subcommand)]
 enum ControllerCommand {
+    /// Issue a standalone one-time token, including controllers without a Planet URL.
+    Token {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        network: Uuid,
+        #[command(flatten)]
+        admin_token: AdminTokenInputArgs,
+        /// Write the token to a new restricted file; never print it into logs.
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(60..=86400))]
+        expires_in_seconds: u64,
+    },
+    /// Back up or restore the local controller's encrypted state.
+    State(maintenance::ControllerStateArgs),
+    /// Query controller health.
+    Health {
+        #[arg(long)]
+        controller: String,
+    },
+    /// Fetch the published signed Planet manifest.
+    Planet {
+        #[arg(long)]
+        controller: String,
+    },
+    /// Fetch the signed network authorization manifest.
+    Authorization {
+        #[arg(long)]
+        controller: String,
+        #[arg(long)]
+        network: Uuid,
+    },
+    /// Inspect and revoke members or replace their allowed routes.
+    Member {
+        #[command(subcommand)]
+        command: controller_admin::MemberCommand,
+    },
+    /// Inspect or replace the complete routes, DNS and exit-node policy.
+    Policy {
+        #[command(subcommand)]
+        command: controller_admin::PolicyCommand,
+    },
     /// Manage networks hosted by a self-hosted controller.
     Network {
         #[command(subcommand)]
@@ -200,6 +322,9 @@ impl From<InviteLinkOutputArgs> for InviteLinkOutput {
 #[derive(Subcommand)]
 enum ControllerNetworkCommand {
     Create {
+        /// Optional explicit ID for a NEW network. Existing IDs are rejected.
+        #[arg(long)]
+        id: Option<Uuid>,
         #[arg(long)]
         controller: String,
         #[command(flatten)]
@@ -246,6 +371,19 @@ impl From<RelayPolicyArg> for RelayPolicy {
 
 #[derive(Subcommand)]
 enum NetworkCommand {
+    /// Create a local development network; use join for controller-authenticated membership.
+    Create {
+        #[arg(long)]
+        id: Option<Uuid>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        ipv4_prefix: String,
+        #[arg(long)]
+        ipv6_prefix: Option<String>,
+        #[arg(long, value_enum, default_value = "preferred")]
+        relay_policy: RelayPolicyArg,
+    },
     List,
     /// Join from one invitation URL instead of manually entering controller,
     /// network ID, token and public key.
@@ -293,8 +431,7 @@ enum NetworkExitCommand {
         #[arg(long)]
         ipv6_gateway: Option<Uuid>,
         /// Block physical-network fallback if the selected exit cannot be
-        /// applied. Platform enforcement is introduced in the next stage-4
-        /// increment.
+        /// applied. Requires working platform enforcement in the daemon.
         #[arg(long)]
         kill_switch: bool,
     },
@@ -327,15 +464,166 @@ enum NetworkGatewayCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tls_ca = load_tls_ca_file(cli.tls_ca_certificate.as_deref())?;
-    let client = controller_client(tls_ca.as_ref())?;
-    match cli.command {
-        Command::Status => {
-            print_status(client.get(format!("{LOCAL_API}/status")).send().await?).await?
+    let json = cli.json;
+    if let Err(error) = run(cli).await {
+        if json {
+            eprintln!(
+                "{}",
+                serde_json::json!({"ok":false,"error":format!("{error:#}")})
+            );
+        } else {
+            eprintln!("Error: {error:#}");
         }
-        Command::Sessions { json } => {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let json = cli.json;
+    let local_api = local_api_url(&cli.api_url)?;
+    let tls_ca = load_tls_ca_file(cli.tls_ca_certificate.as_deref())?;
+    let client = controller_client(tls_ca.as_ref(), cli.timeout_seconds)?;
+    match cli.command {
+        Command::Controller {
+            command:
+                ControllerCommand::Token {
+                    controller,
+                    network,
+                    admin_token,
+                    token_file,
+                    expires_in_seconds,
+                },
+        } => {
+            anyhow::ensure!(!token_file.exists(), "token output file already exists");
+            let base = controller_base_url(&controller, tls_ca.is_some())?;
+            let token = SecretInput::from(admin_token).resolve("administrator token")?;
+            let value: serde_json::Value = ensure_sensitive_success(
+                client
+                    .post(format!("{base}/v1/networks/{network}/enrollment-tokens"))
+                    .header("x-meshlake-admin-token", token.as_str())
+                    .json(&serde_json::json!({"expires_in_seconds":expires_in_seconds}))
+                    .send()
+                    .await?,
+                "controller token issuance",
+            )
+            .await?
+            .json()
+            .await?;
+            let secret = value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .context("controller returned no enrollment token")?;
+            create_restricted_secret_file(&token_file, secret.as_bytes())
+                .context("cannot create restricted token file")?;
+            if json {
+                print_json(
+                    &serde_json::json!({"ok":true,"file":token_file,"expires_at_unix_seconds":value.get("expires_at_unix_seconds")}),
+                )?;
+            } else {
+                println!("Enrollment token written to {}", token_file.display());
+            }
+        }
+        Command::Network {
+            command:
+                NetworkCommand::Create {
+                    id,
+                    name,
+                    ipv4_prefix,
+                    ipv6_prefix,
+                    relay_policy,
+                },
+        } => {
+            let request = UpsertNetworkRequest {
+                id: id.map(meshlake_core::NetworkId),
+                name,
+                ipv4_prefix,
+                ipv6_prefix,
+                relay_policy: relay_policy.into(),
+            };
+            request.validate().map_err(anyhow::Error::msg)?;
+            print_network(
+                client
+                    .post(format!("{local_api}/networks"))
+                    .json(&request)
+                    .send()
+                    .await?,
+                json,
+            )
+            .await?;
+        }
+        Command::Diagnose(args) => {
+            if !diagnostics::run(&client, &local_api, cli.timeout_seconds, args).await? {
+                std::process::exit(1);
+            }
+        }
+        Command::State(args) => maintenance::state(args, json).await?,
+        Command::Autostart(args) => maintenance::autostart(args, json).await?,
+        Command::Service(args) => maintenance::service(args, json).await?,
+        Command::Agent {
+            command: AgentCommand::Run(args),
+        } => maintenance::daemon(args, "run", json).await?,
+        Command::Agent {
+            command: AgentCommand::StatePath(args),
+        } => maintenance::daemon(args, "print-state-path", json).await?,
+        Command::Controller {
+            command: ControllerCommand::State(args),
+        } => maintenance::controller_state(args, json).await?,
+        Command::Controller {
+            command: ControllerCommand::Health { controller },
+        } => {
+            controller_admin::read(
+                &client,
+                &controller_base_url(&controller, tls_ca.is_some())?,
+                "/health",
+            )
+            .await?;
+        }
+        Command::Controller {
+            command: ControllerCommand::Planet { controller },
+        } => {
+            controller_admin::read(
+                &client,
+                &controller_base_url(&controller, tls_ca.is_some())?,
+                "/v1/planet",
+            )
+            .await?;
+        }
+        Command::Controller {
+            command:
+                ControllerCommand::Authorization {
+                    controller,
+                    network,
+                },
+        } => {
+            controller_admin::read(
+                &client,
+                &controller_base_url(&controller, tls_ca.is_some())?,
+                &format!("/v1/networks/{network}/authorization"),
+            )
+            .await?;
+        }
+        Command::Controller {
+            command: ControllerCommand::Member { command },
+        } => {
+            controller_admin::member(&client, tls_ca.is_some(), command).await?;
+        }
+        Command::Controller {
+            command: ControllerCommand::Policy { command },
+        } => {
+            controller_admin::policy(&client, tls_ca.is_some(), command).await?;
+        }
+        Command::Status => {
+            print_status(
+                client.get(format!("{local_api}/status")).send().await?,
+                json,
+            )
+            .await?
+        }
+        Command::Sessions => {
             print_sessions(
-                client.get(format!("{LOCAL_API}/sessions")).send().await?,
+                client.get(format!("{local_api}/sessions")).send().await?,
                 json,
             )
             .await?
@@ -343,14 +631,14 @@ async fn main() -> Result<()> {
         Command::Agent {
             command: AgentCommand::Stop,
         } => {
-            ensure_success(client.post(format!("{LOCAL_API}/shutdown")).send().await?).await?;
-            println!("MeshLake agent stopped.");
+            ensure_success(client.post(format!("{local_api}/shutdown")).send().await?).await?;
+            print_message(json, &format!("MeshLake agent stopped."));
         }
         Command::Adapter {
             command: AdapterCommand::Start,
         } => {
-            ensure_success(client.post(format!("{LOCAL_API}/adapter")).send().await?).await?;
-            println!("MeshLake adapter is active.");
+            ensure_success(client.post(format!("{local_api}/adapter")).send().await?).await?;
+            print_message(json, &format!("MeshLake adapter is active."));
         }
         Command::Relay {
             command:
@@ -362,7 +650,7 @@ async fn main() -> Result<()> {
         } => {
             ensure_success(
                 client
-                    .post(format!("{LOCAL_API}/relay"))
+                    .post(format!("{local_api}/relay"))
                     .json(&serde_json::json!({
                         "endpoint": endpoint,
                         "stun_servers": stun_servers,
@@ -372,7 +660,10 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Relay endpoint saved and applied: {endpoint}");
+            print_message(
+                json,
+                &format!("Relay endpoint saved and applied: {endpoint}"),
+            );
         }
         Command::Planet {
             command:
@@ -385,7 +676,7 @@ async fn main() -> Result<()> {
             validate_tls_url_pair(&manifest, None, tls_ca.is_some())?;
             ensure_success(
                 client
-                    .post(format!("{LOCAL_API}/planet"))
+                    .post(format!("{local_api}/planet"))
                     .json(&serde_json::json!({
                         "manifest_url": manifest,
                         "controller_public_key_base64": controller_public_key_base64,
@@ -395,13 +686,17 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Planet settings verified, saved and applied.");
+            print_message(
+                json,
+                &format!("Planet settings verified, saved and applied."),
+            );
         }
         Command::Controller {
             command:
                 ControllerCommand::Network {
                     command:
                         ControllerNetworkCommand::Create {
+                            id,
                             controller,
                             admin_token,
                             name,
@@ -414,7 +709,7 @@ async fn main() -> Result<()> {
             let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
             let request = UpsertNetworkRequest {
-                id: None,
+                id: id.map(meshlake_core::NetworkId),
                 name,
                 ipv4_prefix,
                 ipv6_prefix,
@@ -432,7 +727,11 @@ async fn main() -> Result<()> {
             .await?
             .json()
             .await?;
-            print_controller_network(&network);
+            if json {
+                print_json(&network)?;
+            } else {
+                print_controller_network(&network);
+            }
         }
         Command::Controller {
             command:
@@ -450,8 +749,10 @@ async fn main() -> Result<()> {
             .await?
             .json()
             .await?;
-            if networks.is_empty() {
-                println!("No controller networks.");
+            if json {
+                print_json(&networks)?;
+            } else if networks.is_empty() {
+                print_message(json, &format!("No controller networks."));
             } else {
                 for network in &networks {
                     print_controller_network(network);
@@ -480,7 +781,7 @@ async fn main() -> Result<()> {
                 "controller network deletion",
             )
             .await?;
-            println!("Controller network {network} deleted.");
+            print_message(json, &format!("Controller network {network} deleted."));
         }
         Command::Controller {
             command: ControllerCommand::PublicKey { controller },
@@ -499,7 +800,11 @@ async fn main() -> Result<()> {
                 .get("public_key")
                 .and_then(|value| value.as_str())
                 .context("controller returned no public key")?;
-            println!("{public_key}");
+            if json {
+                print_json(&response)?;
+            } else {
+                println!("{public_key}");
+            }
         }
         Command::Controller {
             command:
@@ -511,6 +816,13 @@ async fn main() -> Result<()> {
                     expires_in_seconds,
                 },
         } => {
+            anyhow::ensure!(
+                !json || !output.claim_invite_link,
+                "JSON invitation output requires --invite-link-file to protect the secret"
+            );
+            if let Some(path) = &output.invite_link_file {
+                anyhow::ensure!(!path.exists(), "invitation output file already exists");
+            }
             let admin_token = SecretInput::from(admin_token).resolve("administrator token")?;
             let controller_url = controller_base_url(&controller, tls_ca.is_some())?;
             let response: serde_json::Value = ensure_sensitive_success(
@@ -543,6 +855,7 @@ async fn main() -> Result<()> {
                 InviteLinkOutput::from(output),
                 attached_terminal,
                 &mut stdout.lock(),
+                json,
             )?;
         }
         Command::Controller {
@@ -573,7 +886,10 @@ async fn main() -> Result<()> {
                 admin_token.as_str(),
             )
             .await?;
-            println!("Exit candidate {device} saved for controller network {network}.");
+            print_message(
+                json,
+                &format!("Exit candidate {device} saved for controller network {network}."),
+            );
         }
         Command::Controller {
             command:
@@ -598,17 +914,26 @@ async fn main() -> Result<()> {
                 admin_token.as_str(),
             )
             .await?;
-            println!("Exit candidate {device} cleared for controller network {network}.");
+            print_message(
+                json,
+                &format!("Exit candidate {device} cleared for controller network {network}."),
+            );
         }
         Command::Adapter {
             command: AdapterCommand::Stop,
         } => {
-            ensure_success(client.delete(format!("{LOCAL_API}/adapter")).send().await?).await?;
-            println!("MeshLake adapter session stopped.");
+            ensure_success(client.delete(format!("{local_api}/adapter")).send().await?).await?;
+            print_message(json, &format!("MeshLake adapter session stopped."));
         }
         Command::Network {
             command: NetworkCommand::List,
-        } => print_networks(client.get(format!("{LOCAL_API}/networks")).send().await?).await?,
+        } => {
+            print_networks(
+                client.get(format!("{local_api}/networks")).send().await?,
+                json,
+            )
+            .await?
+        }
         Command::Network {
             command:
                 NetworkCommand::Exit {
@@ -623,7 +948,7 @@ async fn main() -> Result<()> {
         } => {
             ensure_success(
                 client
-                    .post(format!("{LOCAL_API}/networks/{network}/exit-selection"))
+                    .post(format!("{local_api}/networks/{network}/exit-selection"))
                     .json(&serde_json::json!({
                         "ipv4_gateway": ipv4_gateway,
                         "ipv6_gateway": ipv6_gateway,
@@ -633,7 +958,10 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Local exit selection saved for network {network}.");
+            print_message(
+                json,
+                &format!("Local exit selection saved for network {network}."),
+            );
         }
         Command::Network {
             command:
@@ -643,7 +971,7 @@ async fn main() -> Result<()> {
         } => {
             ensure_success(
                 client
-                    .post(format!("{LOCAL_API}/networks/{network}/exit-selection"))
+                    .post(format!("{local_api}/networks/{network}/exit-selection"))
                     .json(&serde_json::json!({
                         "ipv4_gateway": null,
                         "ipv6_gateway": null,
@@ -653,7 +981,10 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Local exit selection cleared for network {network}.");
+            print_message(
+                json,
+                &format!("Local exit selection cleared for network {network}."),
+            );
         }
         Command::Network {
             command:
@@ -672,7 +1003,7 @@ async fn main() -> Result<()> {
             }
             ensure_success(
                 client
-                    .post(format!("{LOCAL_API}/networks/{network}/exit-gateway"))
+                    .post(format!("{local_api}/networks/{network}/exit-gateway"))
                     .json(&serde_json::json!({
                         "egress_interface": egress_interface,
                         "enable_ipv4": ipv4,
@@ -682,7 +1013,10 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
-            println!("Local exit gateway enabled for network {network}.");
+            print_message(
+                json,
+                &format!("Local exit gateway enabled for network {network}."),
+            );
         }
         Command::Network {
             command:
@@ -692,12 +1026,15 @@ async fn main() -> Result<()> {
         } => {
             ensure_success(
                 client
-                    .delete(format!("{LOCAL_API}/networks/{network}/exit-gateway"))
+                    .delete(format!("{local_api}/networks/{network}/exit-gateway"))
                     .send()
                     .await?,
             )
             .await?;
-            println!("Local exit gateway disabled for network {network}.");
+            print_message(
+                json,
+                &format!("Local exit gateway disabled for network {network}."),
+            );
         }
         Command::Network {
             command: NetworkCommand::JoinLink { link },
@@ -712,7 +1049,8 @@ async fn main() -> Result<()> {
                 effective_tls_ca.is_some(),
             )?;
             let control_plane = invitation.control_plane(effective_tls_ca.as_ref());
-            let enrollment_client = controller_client(effective_tls_ca.as_ref())?;
+            let enrollment_client =
+                controller_client(effective_tls_ca.as_ref(), cli.timeout_seconds)?;
             join_network(
                 &enrollment_client,
                 &invitation.controller,
@@ -720,9 +1058,10 @@ async fn main() -> Result<()> {
                 &invitation.token,
                 &invitation.controller_public_key_base64,
                 Some(control_plane),
+                &local_api,
+                json,
             )
             .await?;
-            println!("Network joined.");
         }
         Command::Network {
             command:
@@ -747,6 +1086,8 @@ async fn main() -> Result<()> {
                 &token,
                 &controller_public_key_base64,
                 Some(control_plane),
+                &local_api,
+                json,
             )
             .await?;
         }
@@ -755,11 +1096,12 @@ async fn main() -> Result<()> {
         } => {
             ensure_success(
                 client
-                    .delete(format!("{LOCAL_API}/networks/{network}"))
+                    .delete(format!("{local_api}/networks/{network}"))
                     .send()
                     .await?,
             )
             .await?;
+            print_message(json, &format!("Left network {network}."));
         }
     }
     Ok(())
@@ -786,52 +1128,11 @@ async fn update_controller_exit_candidate(
     .await?
     .json()
     .await?;
-    let routes = manifest
-        .get("routes")
-        .and_then(serde_json::Value::as_array)
-        .context("controller returned an invalid signed policy route list")?
-        .iter()
-        .map(|route| {
-            let prefix = route
-                .get("prefix")
-                .and_then(serde_json::Value::as_str)
-                .context("controller policy route has no prefix")?;
-            let gateway = route
-                .pointer("/gateway_certificate/claims/device_id")
-                .and_then(serde_json::Value::as_str)
-                .context("controller policy route has no gateway device")?;
-            Ok(serde_json::json!({
-                "prefix": prefix,
-                "gateway_device_id": gateway,
-            }))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut exit_nodes = manifest
-        .get("exit_nodes")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|exit_node| {
-            let gateway = exit_node
-                .pointer("/gateway_certificate/claims/device_id")
-                .and_then(serde_json::Value::as_str)
-                .context("controller exit candidate has no gateway device")?;
-            let supports_ipv4 = exit_node
-                .get("supports_ipv4")
-                .and_then(serde_json::Value::as_bool)
-                .context("controller exit candidate has no IPv4 capability")?;
-            let supports_ipv6 = exit_node
-                .get("supports_ipv6")
-                .and_then(serde_json::Value::as_bool)
-                .context("controller exit candidate has no IPv6 capability")?;
-            Ok(serde_json::json!({
-                "gateway_device_id": gateway,
-                "supports_ipv4": supports_ipv4,
-                "supports_ipv6": supports_ipv6,
-            }))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut policy = controller_admin::editable_policy(manifest)?;
+    let exit_nodes = policy
+        .get_mut("exit_nodes")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("invalid editable exit nodes")?;
     exit_nodes.retain(|exit_node| {
         exit_node
             .get("gateway_device_id")
@@ -850,11 +1151,7 @@ async fn update_controller_exit_candidate(
         client
             .post(format!("{controller_url}/v1/networks/{network}/policy"))
             .header("x-meshlake-admin-token", admin_token)
-            .json(&serde_json::json!({
-                "routes": routes,
-                "exit_nodes": exit_nodes,
-                "dns": manifest.get("dns").cloned().unwrap_or_else(|| serde_json::json!({})),
-            }))
+            .json(&policy)
             .send()
             .await?,
         "controller exit candidate update",
@@ -1027,6 +1324,8 @@ async fn join_network(
     token: &str,
     controller_public_key_base64: &str,
     control_plane: Option<EnrollmentControlPlane>,
+    local_api: &str,
+    json: bool,
 ) -> Result<()> {
     let controller_public_key = STANDARD
         .decode(controller_public_key_base64)
@@ -1035,7 +1334,7 @@ async fn join_network(
         bail!("controller public key must contain exactly 32 bytes");
     }
     let status: AgentStatus =
-        ensure_success(client.get(format!("{LOCAL_API}/status")).send().await?)
+        ensure_success(client.get(format!("{local_api}/status")).send().await?)
             .await?
             .json()
             .await?;
@@ -1060,7 +1359,7 @@ async fn join_network(
         .context("could not serialize controller enrollment for the local agent")?;
     let response = ensure_sensitive_success(
         client
-            .post(format!("{LOCAL_API}/networks/enroll"))
+            .post(format!("{local_api}/networks/enroll"))
             .json(&local_enrollment_request(
                 enrollment,
                 controller_public_key,
@@ -1071,7 +1370,7 @@ async fn join_network(
         "local enrollment persistence",
     )
     .await?;
-    print_network(response).await
+    print_network(response, json).await
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -1107,6 +1406,7 @@ fn deliver_invite_link(
     output: InviteLinkOutput,
     attached_terminal: bool,
     terminal: &mut dyn Write,
+    json: bool,
 ) -> Result<()> {
     match output {
         InviteLinkOutput::AttachedTerminal => {
@@ -1122,7 +1422,10 @@ fn deliver_invite_link(
         InviteLinkOutput::RestrictedFile(path) => {
             create_restricted_secret_file(&path, link.as_bytes())
                 .context("cannot create restricted invitation-link file")?;
-            println!("Invitation link written to {}", path.display());
+            print_message(
+                json,
+                &format!("Invitation link written to {}", path.display()),
+            );
         }
     }
     Ok(())
@@ -1224,8 +1527,10 @@ fn normalize_tls_ca_pem(pem: &str) -> Result<NormalizedTlsCa> {
     })
 }
 
-fn controller_client(tls_ca: Option<&NormalizedTlsCa>) -> Result<Client> {
-    let mut builder = Client::builder().redirect(reqwest::redirect::Policy::none());
+fn controller_client(tls_ca: Option<&NormalizedTlsCa>, timeout_seconds: u64) -> Result<Client> {
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(timeout_seconds));
     if let Some(tls_ca) = tls_ca {
         builder = builder.tls_built_in_root_certs(false);
         for certificate in &tls_ca.certificates_der {
@@ -1321,12 +1626,15 @@ fn controller_base_url(value: &str, has_private_ca: bool) -> Result<String> {
     validate_tls_url_pair(&url, None, has_private_ca)?;
     Ok(url)
 }
-async fn print_status(response: reqwest::Response) -> Result<()> {
+async fn print_status(response: reqwest::Response, json: bool) -> Result<()> {
     let status: AgentStatus = ensure_success(response)
         .await?
         .json()
         .await
         .context("invalid agent response")?;
+    if json {
+        return print_json(&status);
+    }
     println!(
         "Device: {}\nAdapter: {}\nNetworks: {}\nTransport worker: {}",
         status.device_id.0,
@@ -1466,12 +1774,15 @@ fn render_session(session: &SessionObservation) -> String {
     )
 }
 
-async fn print_networks(response: reqwest::Response) -> Result<()> {
-    for network in ensure_success(response)
+async fn print_networks(response: reqwest::Response, json: bool) -> Result<()> {
+    let networks = ensure_success(response)
         .await?
         .json::<Vec<JoinedNetwork>>()
-        .await?
-    {
+        .await?;
+    if json {
+        return print_json(&networks);
+    }
+    for network in networks {
         println!(
             "{}\t{}\tIPv4={}\tIPv6={}",
             network.network.id.0,
@@ -1831,6 +2142,7 @@ mod tests {
             InviteLinkOutput::AttachedTerminal,
             false,
             &mut terminal,
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("attached terminal"));
@@ -1842,6 +2154,7 @@ mod tests {
             InviteLinkOutput::RestrictedFile(path.clone()),
             false,
             &mut terminal,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), secret);
@@ -1850,6 +2163,7 @@ mod tests {
             InviteLinkOutput::RestrictedFile(path.clone()),
             false,
             &mut terminal,
+            false,
         )
         .unwrap_err();
         assert!(error
@@ -1905,7 +2219,7 @@ mod tests {
     #[test]
     fn parses_sessions_json_command() {
         let cli = Cli::try_parse_from(["meshlake", "sessions", "--json"]).unwrap();
-        assert!(matches!(cli.command, Command::Sessions { json: true }));
+        assert!(matches!(cli.command, Command::Sessions));
     }
 
     #[test]
@@ -1966,8 +2280,11 @@ mod tests {
         );
     }
 }
-async fn print_network(response: reqwest::Response) -> Result<()> {
+async fn print_network(response: reqwest::Response, json: bool) -> Result<()> {
     let network: JoinedNetwork = ensure_success(response).await?.json().await?;
+    if json {
+        return print_json(&network);
+    }
     println!(
         "Network enrolled: {} ({})",
         network.network.name, network.network.id.0

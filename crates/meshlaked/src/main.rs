@@ -1681,7 +1681,13 @@ impl Agent {
             },
             assigned_addresses: Vec::new(),
             certificate: None,
-            network_key: Vec::new(),
+            // Locally-created networks still pass through the normal packet
+            // protection path. Persist a real key so the state remains valid
+            // after the agent restarts.
+            network_key: NetworkKey::generate()
+                .map_err(ApiError::internal)?
+                .to_bytes()
+                .to_vec(),
             control_plane: NetworkControlPlane::default(),
         };
         state.networks.push(joined.clone());

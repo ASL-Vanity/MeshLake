@@ -34,15 +34,16 @@ chmod 755 meshlaked meshlake-cli
 sudo ./meshlaked run
 ```
 
-另一个终端中可以查询和管理本机代理：
+另一个终端中可以查询和管理本机代理。先将管理员交付的邀请文件保存为当前用户拥有的 `member.invite`，再执行：
 
 ```bash
 ./meshlake-cli status
-sudo ./meshlake-cli adapter start
-./meshlake-cli network join-link --link 'meshlake://join?...'
+chmod 600 ./member.invite
+./meshlake-cli network join-link --link-file ./member.invite
+./meshlake-cli adapter start
 ```
 
-邀请链接含一次性凭据，不要写入 shell 历史、日志或公开脚本。生产部署应通过受控的临时文件、标准输入或后续安全导入接口传递。
+邀请链接含一次性凭据，不要写入 shell 历史、日志或公开脚本。当前 CLI 支持受限文件 `--link-file`、隐藏提示 `--link-prompt` 和受控标准输入 `--link-stdin`，一次只能选择一种来源；旧 `--link` 明文参数已弃用。完整的 GUI/CLI 用法见 [使用说明](user-guide.md)。
 
 ## systemd
 

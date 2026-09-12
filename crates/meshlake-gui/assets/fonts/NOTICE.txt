@@ -1,0 +1,13 @@
+本软件使用 MiSans 字体。MiSans 字体版权归小米科技有限责任公司所有。
+This software uses MiSans fonts, copyright Xiaomi Inc.
+
+MiSans Regular and Medium are embedded unmodified for the MeshLake interface.
+They are licensed under the MiSans Fonts Intellectual Property License Agreement,
+not the MeshLake source-code license. No subsetting, conversion or modification
+has been performed. Do not redistribute these files as a standalone font product.
+
+Official source: https://hyperos.mi.com/font/
+Original package: https://hyperos.mi.com/font-download/MiSans.zip
+Full license: https://hyperos.mi.com/font-download/MiSans字体知识产权许可协议.pdf
+A copy of the original agreement is included as MiSans-License.pdf.
+Retrieved: 2026-09-11.

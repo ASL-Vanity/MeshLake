@@ -300,6 +300,10 @@ impl AdapterController {
                 }
             }
         }
+        run_policy_scripts(&windows_overlay_route_scripts(
+            networks,
+            PolicyOperation::Apply,
+        ))?;
         // A fresh Wintun interface is normally classified as an unidentified
         // (Public) network. Windows Firewall would then discard traffic after
         // it has been authenticated and injected by the agent. This rule is
@@ -313,24 +317,18 @@ impl AdapterController {
         if !self.is_active() {
             return Ok(());
         }
+        run_policy_scripts(&windows_overlay_route_scripts(
+            std::slice::from_ref(joined),
+            PolicyOperation::Remove,
+        ))?;
         for address in &joined.assigned_addresses {
             match address {
-                std::net::IpAddr::V4(address) => run_netsh(&[
-                    "interface",
-                    "ipv4",
-                    "delete",
-                    "address",
-                    &format!("name={ADAPTER_NAME}"),
-                    &format!("address={address}"),
-                ])?,
-                std::net::IpAddr::V6(address) => run_netsh(&[
-                    "interface",
-                    "ipv6",
-                    "delete",
-                    "address",
-                    &format!("interface={ADAPTER_NAME}"),
-                    &format!("address={address}"),
-                ])?,
+                std::net::IpAddr::V4(address) => {
+                    remove_windows_adapter_address(&std::net::IpAddr::V4(*address))?
+                }
+                std::net::IpAddr::V6(address) => {
+                    remove_windows_adapter_address(&std::net::IpAddr::V6(*address))?
+                }
             }
         }
         Ok(())
@@ -404,15 +402,31 @@ impl AdapterController {
         let previous = current.clone();
         // Always reconcile at least once: persistent WFP filters can survive a
         // crash, while this in-memory controller begins with an empty plan.
-        if let Err(primary) = wfp::reconcile_kill_switch(ADAPTER_NAME, &desired) {
-            if wfp::reconcile_kill_switch(ADAPTER_NAME, &previous).is_err() {
-                drop(current);
-                self.session.lock().expect("adapter lock poisoned").take();
-                bail!(
-                    "Windows WFP kill-switch transaction failed: {primary:#}; previous protected filters could not be restored and the adapter was disabled fail closed"
-                );
+        let reconcile = wfp::reconcile_kill_switch(ADAPTER_NAME, &desired);
+        match reconcile {
+            Ok(wfp::ReconcileOutcome::Applied) => {}
+            Ok(wfp::ReconcileOutcome::Unavailable) => {
+                if desired.enabled || previous.enabled {
+                    bail!(
+                        "Windows WFP is unavailable, so MeshLake cannot safely enable or remove an exit kill-switch"
+                    );
+                }
+                // A normal virtual LAN does not need a physical-egress
+                // kill-switch. Some otherwise usable Windows installations
+                // expose the BFE service but reject FwpmEngineOpen0 with
+                // ERROR_NOT_SUPPORTED; let that non-exit configuration run.
+                return Ok(());
             }
-            bail!("Windows WFP kill-switch transaction failed and the previous filters were restored: {primary:#}");
+            Err(primary) => {
+                if wfp::reconcile_kill_switch(ADAPTER_NAME, &previous).is_err() {
+                    drop(current);
+                    self.session.lock().expect("adapter lock poisoned").take();
+                    bail!(
+                        "Windows WFP kill-switch transaction failed: {primary:#}; previous protected filters could not be restored and the adapter was disabled fail closed"
+                    );
+                }
+                bail!("Windows WFP kill-switch transaction failed and the previous filters were restored: {primary:#}");
+            }
         }
         *current = desired;
         Ok(())
@@ -497,7 +511,13 @@ impl AdapterController {
             .applied_kill_switch
             .lock()
             .expect("kill-switch lock poisoned");
-        wfp::reconcile_kill_switch(ADAPTER_NAME, &KillSwitchPlan::default())?;
+        match wfp::reconcile_kill_switch(ADAPTER_NAME, &KillSwitchPlan::default())? {
+            wfp::ReconcileOutcome::Applied => {}
+            wfp::ReconcileOutcome::Unavailable if current.enabled => bail!(
+                "Windows WFP is unavailable, so MeshLake cannot verify removal of an active exit kill-switch"
+            ),
+            wfp::ReconcileOutcome::Unavailable => {}
+        }
         *current = KillSwitchPlan::default();
         Ok(())
     }
@@ -575,6 +595,36 @@ fn windows_policy_scripts(plan: &PolicyPlan, operation: PolicyOperation) -> Vec<
         }
     }
     scripts
+}
+
+/// Windows does not reliably install an on-link route for every additional
+/// address placed on one Wintun adapter. Install the overlay prefixes
+/// explicitly so packets for a second MeshLake network enter the adapter.
+fn windows_overlay_route_scripts(
+    networks: &[JoinedNetwork],
+    operation: PolicyOperation,
+) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    for network in networks {
+        prefixes.push(network.network.ipv4_prefix.clone());
+        if let Some(prefix) = &network.network.ipv6_prefix {
+            prefixes.push(prefix.clone());
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+        .into_iter()
+        .map(|prefix| match operation {
+            PolicyOperation::Apply => format!(
+                "Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceAlias '{ADAPTER_NAME}' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction Stop; New-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceAlias '{ADAPTER_NAME}' -NextHop '{}' -RouteMetric 5 -ErrorAction Stop | Out-Null",
+                if prefix.contains(':') { "::" } else { "0.0.0.0" }
+            ),
+            PolicyOperation::Remove => format!(
+                "$routes = @(Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix '{prefix}' -InterfaceAlias '{ADAPTER_NAME}' -ErrorAction SilentlyContinue); foreach ($route in $routes) {{ Remove-NetRoute -InputObject $route -Confirm:$false -ErrorAction SilentlyContinue }}"
+            ),
+        })
+        .collect()
 }
 
 /// Removes only NRPT entries with MeshLake's fixed comment. Unlike adapter DNS
@@ -723,6 +773,54 @@ fn run_netsh(arguments: &[&str]) -> Result<()> {
     ))
 }
 
+/// Use the native PowerShell cmdlet for removal. `netsh` has different IPv4
+/// and IPv6 deletion syntax and localized failures, while this API can be
+/// checked before and after the mutation.
+fn remove_windows_adapter_address(address: &std::net::IpAddr) -> Result<()> {
+    if !windows_adapter_has_address(address)? {
+        return Ok(());
+    }
+    let script = format!(
+        "Get-NetIPAddress -InterfaceAlias '{ADAPTER_NAME}' -IPAddress '{address}' -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("cannot start PowerShell to remove a MeshLake adapter address")?;
+    if output.status.success() {
+        if !windows_adapter_has_address(address)? {
+            return Ok(());
+        }
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostic = format!("{stdout}{stderr}");
+    Err(anyhow!(
+        "PowerShell failed while removing a MeshLake adapter address ({})\n{}",
+        output.status,
+        diagnostic
+    ))
+}
+
+fn windows_adapter_has_address(address: &std::net::IpAddr) -> Result<bool> {
+    let script = format!(
+        "$entry=Get-NetIPAddress -InterfaceAlias '{ADAPTER_NAME}' -IPAddress '{address}' -ErrorAction SilentlyContinue; if($null -eq $entry){{exit 2}}; exit 0"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("cannot start PowerShell to inspect MeshLake adapter addresses")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => Err(anyhow!(
+            "cannot inspect MeshLake adapter address {} ({})",
+            address,
+            output.status
+        )),
+    }
+}
+
 fn ensure_virtual_lan_firewall_rule() -> Result<()> {
     const RULE_NAME: &str = "MeshLake.VirtualLan.Inbound";
     const SCRIPT: &str = concat!(
@@ -781,7 +879,6 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn converts_prefix_length_to_mask() {
         assert_eq!(ipv4_mask(24).to_string(), "255.255.255.0");
@@ -813,6 +910,30 @@ mod tests {
         assert!(remove.contains("Remove-NetRoute"));
         assert!(remove.contains("ResetServerAddresses"));
         assert!(remove.contains("Remove-DnsClientNrptRule"));
+    }
+
+    #[test]
+    fn overlay_routes_are_explicit_and_removed_per_network_prefix() {
+        let network = meshlake_core::JoinedNetwork {
+            network: meshlake_core::VirtualNetwork {
+                id: meshlake_core::NetworkId(uuid::Uuid::from_u128(42)),
+                name: "route-test".into(),
+                ipv4_prefix: "10.42.0.0/24".into(),
+                ipv6_prefix: Some("fd42::/64".into()),
+                relay_policy: meshlake_core::RelayPolicy::Preferred,
+            },
+            assigned_addresses: vec![],
+            certificate: None,
+            network_key: vec![],
+            control_plane: meshlake_core::NetworkControlPlane::default(),
+        };
+        let apply =
+            windows_overlay_route_scripts(&[network.clone()], PolicyOperation::Apply).join("\n");
+        let remove = windows_overlay_route_scripts(&[network], PolicyOperation::Remove).join("\n");
+        assert!(apply.contains("DestinationPrefix '10.42.0.0/24'"));
+        assert!(apply.contains("DestinationPrefix 'fd42::/64'"));
+        assert!(apply.contains("New-NetRoute"));
+        assert!(remove.contains("Remove-NetRoute"));
     }
 
     #[test]

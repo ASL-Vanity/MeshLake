@@ -38,6 +38,7 @@ const SUBLAYER_KEY: GUID = GUID::from_u128(0x4d455348_4c414b45_8d59_77e1cc0a0001
 const FILTER_KEY_BASE: u128 = 0x4d455348_4c414b45_8d59_77e1cc0a1000;
 const WFP_ALREADY_EXISTS: u32 = 0x8032_0009;
 const WFP_NO_MORE_ITEMS: u32 = 0x8032_0013;
+const ERROR_NOT_SUPPORTED: u32 = 50;
 const PROTOCOL_TCP: u8 = 6;
 const PROTOCOL_UDP: u8 = 17;
 const PERMIT_WEIGHT: u8 = 0xf0;
@@ -45,8 +46,18 @@ const BLOCK_WEIGHT: u8 = 0x10;
 
 /// Replaces the complete MeshLake WFP set atomically. This function never
 /// edits firewall profiles or filters owned by other applications.
-pub(super) fn reconcile_kill_switch(adapter_alias: &str, plan: &KillSwitchPlan) -> Result<()> {
-    let engine = WfpEngine::open()?;
+pub(super) enum ReconcileOutcome {
+    Applied,
+    Unavailable,
+}
+
+pub(super) fn reconcile_kill_switch(
+    adapter_alias: &str,
+    plan: &KillSwitchPlan,
+) -> Result<ReconcileOutcome> {
+    let Some(engine) = WfpEngine::open()? else {
+        return Ok(ReconcileOutcome::Unavailable);
+    };
     check_wfp(
         unsafe { FwpmTransactionBegin0(engine.handle, 0) },
         "begin transaction",
@@ -62,10 +73,13 @@ pub(super) fn reconcile_kill_switch(adapter_alias: &str, plan: &KillSwitchPlan) 
         Ok(())
     })();
     match result {
-        Ok(()) => check_wfp(
-            unsafe { FwpmTransactionCommit0(engine.handle) },
-            "commit transaction",
-        ),
+        Ok(()) => {
+            check_wfp(
+                unsafe { FwpmTransactionCommit0(engine.handle) },
+                "commit transaction",
+            )?;
+            Ok(ReconcileOutcome::Applied)
+        }
         Err(error) => {
             let _ = unsafe { FwpmTransactionAbort0(engine.handle) };
             Err(error)
@@ -78,16 +92,18 @@ struct WfpEngine {
 }
 
 impl WfpEngine {
-    fn open() -> Result<Self> {
+    fn open() -> Result<Option<Self>> {
         let mut handle = ptr::null_mut();
-        check_wfp(
-            unsafe { FwpmEngineOpen0(ptr::null(), 0, ptr::null(), ptr::null(), &mut handle) },
-            "open WFP engine",
-        )?;
+        let status =
+            unsafe { FwpmEngineOpen0(ptr::null(), 0, ptr::null(), ptr::null(), &mut handle) };
+        if wfp_engine_is_unavailable(status) {
+            return Ok(None);
+        }
+        check_wfp(status, "open WFP engine")?;
         if handle.is_null() {
             bail!("WFP engine returned an invalid handle");
         }
-        Ok(Self { handle })
+        Ok(Some(Self { handle }))
     }
 }
 
@@ -474,6 +490,10 @@ fn wfp_error(operation: &str, status: u32) -> anyhow::Error {
     anyhow!("cannot {operation} (WFP error 0x{status:08x})")
 }
 
+fn wfp_engine_is_unavailable(status: u32) -> bool {
+    status == ERROR_NOT_SUPPORTED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +508,12 @@ mod tests {
     fn protocol_selection_is_explicit() {
         assert_eq!(PROTOCOL_TCP, 6);
         assert_eq!(PROTOCOL_UDP, 17);
+    }
+
+    #[test]
+    fn recognizes_a_windows_wfp_engine_that_is_not_supported() {
+        assert!(wfp_engine_is_unavailable(ERROR_NOT_SUPPORTED));
+        assert!(!wfp_engine_is_unavailable(0));
+        assert!(!wfp_engine_is_unavailable(WFP_ALREADY_EXISTS));
     }
 }
